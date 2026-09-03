@@ -156,6 +156,34 @@ The twin's return value **and** its output buffer are compared, so a twin
 that gets the pixels right but the `Geometry` or the byte count wrong fails
 too.
 
+## A probe the table did not pay for: sharing the chroma in `yuyv_to_rgb888` (host, 2026-09-02, reverted)
+
+The idea: a YUYV pair shares `(u, v)`, and `yuv_to_rgb` was called twice
+per pair, so compute the three chroma terms once per pair (counter: chroma
+computations per pair 2 → 1, same integer arithmetic, byte-identical — the
+moved.rs oracle stayed green). The clock, `share` example built before and
+after, run pinned (mask 4, High) in ABBA order, best-of-31 per kernel:
+
+| run | `yuyv_to_rgb888` | `yuyv_to_rgb565` | null floor |
+|---|---:|---:|---:|
+| before, 1 | 0.357 ms · 4.6 ns/px | 0.080 ms | 17 ‰ |
+| after, 1 | 0.376 ms · 4.9 ns/px | 0.085 ms | 1 ‰ |
+| after, 2 | 0.362 ms · 4.7 ns/px | 0.084 ms | 4 ‰ |
+| before, 2 | 0.346 ms · 4.5 ns/px | 0.079 ms | 5 ‰ |
+
+Method line: `pinned=mask4 prio=High metric=wall-ns-in-process pairs=2×ABBA-runs
+best-of-31 null_floor=1-17‰ work=76800 px per arm`.
+
+**Reverted, measured worse-or-inside-the-drift**: both after runs sit above
+both before runs (+4 % and +6 % on the two kernels), while the same binary
+moved 3 % between its two runs. Either way there is nothing to keep: the
+compiler was already sharing the chroma across the two inlined calls (the
+multiplies were never the cost), and the restructure only changed codegen.
+What the kernel spends its 4.5 ns/px on is the 4-in / 6-out byte layout
+and three clamps per pixel — a layout question for the S3 twin (D2), not
+an arithmetic one for the host. Two pairs are enough to refute a keep, not
+to size an effect; no number above is a speed claim.
+
 ## Method line for every future row
 
 `pinned=<core> prio=High metric=<cpu|wall> pairs=<N> order=ABBA null_floor=<‰> work=<pixels|samples|blocks per arm>`
