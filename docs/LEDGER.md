@@ -102,6 +102,37 @@ What `probe::ceiling` says, with a 10 ‰ floor for a within-run judgement:
 The verdict column is the plan for D2; the numbers that decide it are the
 board's, not this table's.
 
+## The first brick the table bought: rounding without libm (host, 2026-09-02)
+
+The F32 → I16 conversion was 75 % of the PCM second because every sample
+paid a `libm::rintf` call. `(v + 1.5·2^23) − 1.5·2^23` rounds an `f32` under
+`2^22` to the nearest integer, ties to even, in two additions; the same in
+`f64` with `1.5·2^52` for F32 → I32. The integer → float divisions by a
+power of two became multiplications by the exact reciprocal.
+
+| gate | result |
+|---|---|
+| **Counter (primary):** libm calls per second of 16 kHz F32 → I16 | 16 000 → **0** |
+| Bit identity vs the libm twins over **every `f32`** (2^32 patterns, both conversions), `cargo test --release -- --ignored exhaustive` | **pass**, 15.65 s |
+| Bit identity on the edges (NaN, ±inf, ±0, subnormals, ±1, the ties at 1.5/32768 and 2.5/32768, 32766.5/32768, −32767.5/32768) and 10 M LCG bit patterns, in CI | pass |
+| Reciprocal multiply == division, every `i16` and 10 M `i32` | pass |
+| The three conversion rule tests | pass |
+| `rusty_esp_audio-esp`'s ffmpeg `swresample` byte-identity oracle, rerun on the patched crate | **7 pass** |
+
+Clock (confirmation), `bench/share.ps1 -Reps 31`, two runs each side, same
+session:
+
+| kernel | before (runs 3, 4) | after (runs 5, 6) |
+|---|---:|---:|
+| `pcm convert` F32 → I16 | 5.6 / 5.2 ns per sample, 0.089 / 0.084 ms | **1.9 / 1.8 ns per sample, 0.030 / 0.029 ms** |
+| `pcm convert` I16 → F32 | 1.1 / 1.1 ns per sample | 1.1 / 1.0 ns per sample — inside the floor; the multiply is a chip argument (the S3 FPU has no divide instruction), not a host one |
+| null floor | 1 ‰ / 7 ‰ | 0 ‰ / 0 ‰ |
+
+Method line: `pinned=mask4 prio=High metric=wall-ns-in-process pairs=31-best-of order=ABBA-null null_floor=0-7‰ work=16000 samples per arm`.
+A 2.8× on the kernel, byte-identical; on the host the PCM second is now
+led by the same conversion at about 53 % instead of 75 %, and the number
+that matters is still the board's.
+
 ## Method line for every future row
 
 `pinned=<core> prio=High metric=<cpu|wall> pairs=<N> order=ABBA null_floor=<‰> work=<pixels|samples|blocks per arm>`

@@ -59,6 +59,11 @@ The ledger has the rows, the floor per run, and what the ceiling probe makes
 of them: `yuyv_to_rgb888` is the twin worth writing first, `sad_16x16` is
 not worth writing for this path at any speedup.
 
+The table's first brick followed the same day: the F32 → I16 conversion
+rounds with two additions instead of a `libm` call, proven bit-identical over
+every `f32` there is (the ledger has the run), and reads 2.8× faster per
+sample on the host with the ffmpeg `swresample` oracle still byte-identical.
+
 ## The rule that keeps this crate small
 
 A kernel lives next to its one caller until a second package needs it, or

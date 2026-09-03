@@ -25,27 +25,43 @@ pub const fn output_bytes(from: SampleFormat, to: SampleFormat, input_bytes: usi
     input_bytes / from.bytes() * to.bytes()
 }
 
+/// `1.5 · 2^23`. Adding it to an `f32` of magnitude under `2^22` lands in
+/// `[2^23, 2^24)`, where one ulp is exactly 1.0, so the addition rounds the
+/// value to the nearest integer — ties to even, the default mode — and the
+/// subtraction gives that integer back. Two additions where `rintf` was a
+/// libm call: the same bits for every input (`tests` below prove it over
+/// the whole `f32` space, `--ignored`), and on a chip without a rounding
+/// instruction the difference between a level meter and a stall.
+const ROUND_F32: f32 = 12_582_912.0;
+/// `1.5 · 2^52`, the same trick in `f64` for magnitudes under `2^51`.
+const ROUND_F64: f64 = 6_755_399_441_055_744.0;
+
 #[inline]
 fn f32_to_i16(x: f32) -> i16 {
-    let v = libm::rintf(x * 32768.0);
+    let v = x * 32768.0;
     if v >= 32767.0 {
         i16::MAX
     } else if v <= -32768.0 {
         i16::MIN
+    } else if v.is_nan() {
+        // `rintf(NaN) as i16` is 0; say so rather than rely on the cast.
+        0
     } else {
-        v as i16
+        ((v + ROUND_F32) - ROUND_F32) as i16
     }
 }
 
 #[inline]
 fn f32_to_i32(x: f32) -> i32 {
-    let v = libm::rint(f64::from(x) * 2_147_483_648.0);
+    let v = f64::from(x) * 2_147_483_648.0;
     if v >= 2_147_483_647.0 {
         i32::MAX
     } else if v <= -2_147_483_648.0 {
         i32::MIN
+    } else if v.is_nan() {
+        0
     } else {
-        v as i32
+        ((v + ROUND_F64) - ROUND_F64) as i32
     }
 }
 
@@ -68,12 +84,15 @@ fn convert_sample(from: SampleFormat, to: SampleFormat, i: &[u8], o: &mut [u8]) 
         (I24In32, I32) => {
             o.copy_from_slice(i);
         }
+        // Dividing by a power of two is multiplying by its exact reciprocal,
+        // bit for bit (no subnormal can arise from an integer this size), and
+        // a multiply is what a chip's FPU has where a divide is a routine.
         (I16, F32) => {
-            let v = f32::from(i16::from_le_bytes([i[0], i[1]])) / 32768.0;
+            let v = f32::from(i16::from_le_bytes([i[0], i[1]])) * (1.0 / 32768.0);
             o.copy_from_slice(&v.to_le_bytes());
         }
         (I32, F32) | (I24In32, F32) => {
-            let v = (i32::from_le_bytes([i[0], i[1], i[2], i[3]]) as f32) / 2_147_483_648.0;
+            let v = (i32::from_le_bytes([i[0], i[1], i[2], i[3]]) as f32) * (1.0 / 2_147_483_648.0);
             o.copy_from_slice(&v.to_le_bytes());
         }
         (F32, I16) => {
@@ -238,6 +257,113 @@ mod tests {
             i32::from_le_bytes([o32[8], o32[9], o32[10], o32[11]]),
             1 << 30
         );
+    }
+
+    /// The libm twins the rounding replaced, kept here as the oracle.
+    fn libm_f32_to_i16(x: f32) -> i16 {
+        let v = libm::rintf(x * 32768.0);
+        if v >= 32767.0 {
+            i16::MAX
+        } else if v <= -32768.0 {
+            i16::MIN
+        } else {
+            v as i16
+        }
+    }
+
+    fn libm_f32_to_i32(x: f32) -> i32 {
+        let v = libm::rint(f64::from(x) * 2_147_483_648.0);
+        if v >= 2_147_483_647.0 {
+            i32::MAX
+        } else if v <= -2_147_483_648.0 {
+            i32::MIN
+        } else {
+            v as i32
+        }
+    }
+
+    const EDGES: [f32; 22] = [
+        0.0,
+        -0.0,
+        f32::NAN,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::MIN_POSITIVE,
+        -f32::MIN_POSITIVE,
+        1e-45,
+        -1e-45,
+        1.0,
+        -1.0,
+        0.5,
+        -0.5,
+        0.999_969_5,
+        -0.999_969_5,
+        0.999_984_74,
+        1.5 / 32768.0,
+        2.5 / 32768.0,
+        -1.5 / 32768.0,
+        -2.5 / 32768.0,
+        32766.5 / 32768.0,
+        -32767.5 / 32768.0,
+    ];
+
+    #[test]
+    fn rounding_matches_libm_on_the_edges_and_a_corpus() {
+        for &x in &EDGES {
+            assert_eq!(f32_to_i16(x), libm_f32_to_i16(x), "{x}");
+            assert_eq!(f32_to_i32(x), libm_f32_to_i32(x), "{x}");
+        }
+        // every bit pattern class: an LCG over the raw bits, ten million of them
+        let mut state = 0x0F32_0F32_0F32_0F32u64;
+        for _ in 0..10_000_000u32 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let x = f32::from_bits((state >> 32) as u32);
+            assert_eq!(
+                f32_to_i16(x),
+                libm_f32_to_i16(x),
+                "{x} ({:#x})",
+                x.to_bits()
+            );
+            assert_eq!(
+                f32_to_i32(x),
+                libm_f32_to_i32(x),
+                "{x} ({:#x})",
+                x.to_bits()
+            );
+        }
+        // the reciprocal multiplies are the divisions, bit for bit
+        for v in i16::MIN..=i16::MAX {
+            assert_eq!(
+                (f32::from(v) * (1.0 / 32768.0)).to_bits(),
+                (f32::from(v) / 32768.0).to_bits()
+            );
+        }
+        let mut state = 0x1332_1332u64;
+        for _ in 0..10_000_000u32 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let v = (state >> 32) as i32;
+            assert_eq!(
+                ((v as f32) * (1.0 / 2_147_483_648.0)).to_bits(),
+                ((v as f32) / 2_147_483_648.0).to_bits()
+            );
+        }
+    }
+
+    /// Every `f32` there is, both conversions: `cargo test --release -p
+    /// rusty_esp_dsp -- --ignored exhaustive`. Run once per change to the
+    /// rounding; the ledger records the run.
+    #[test]
+    #[ignore]
+    fn rounding_matches_libm_exhaustively() {
+        for bits in 0..=u32::MAX {
+            let x = f32::from_bits(bits);
+            assert_eq!(f32_to_i16(x), libm_f32_to_i16(x), "{x} ({bits:#x})");
+            assert_eq!(f32_to_i32(x), libm_f32_to_i32(x), "{x} ({bits:#x})");
+        }
     }
 
     #[test]
