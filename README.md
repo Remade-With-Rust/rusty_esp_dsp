@@ -64,6 +64,18 @@ rounds with two additions instead of a `libm` call, proven bit-identical over
 every `f32` there is (the ledger has the run), and reads 2.8× faster per
 sample on the host with the ffmpeg `swresample` oracle still byte-identical.
 
+**D2's software half** is in (same day): the seam — `seam::PixelKernels`,
+`SampleKernels`, `BlockKernels`, one trait per family, `seam::Scalar` as the
+default and the oracle — and `crates/rusty_esp_dsp-esp`, where `PieS3`
+(`pie-s3`) and `PieP4` (`pie-p4`) implement the same traits. No twin exists
+yet; both delegate to the scalar oracle, so a firmware can already choose its
+kernel set in one place (`default_kernels()`) and nothing changes as twins
+arrive. `seam::twin_matches_scalar` is the gate a twin must pass, and it
+already runs in CI against the delegating types. The `-esp` crate compiles
+for `xtensa-esp32s3-none-elf` (esp toolchain, `build-std`, local) and both
+RISC-V targets (CI). The board half — the first twin and its cycle row —
+waits for an S3.
+
 ## The rule that keeps this crate small
 
 A kernel lives next to its one caller until a second package needs it, or
@@ -89,25 +101,29 @@ crates/rusty_esp_dsp     no_std + forbid(unsafe): the scalar kernels and the pro
   src/block.rs           H.264 block costs
   src/int.rs             integer helpers
   src/probe.rs           work counters and the ceiling probe
+  src/seam.rs            the kernel-family traits, Scalar, and the twin gate
   tests/moved.rs         byte identity against the copies D0 replaced
   tests/h264_oracle.rs   byte identity against rusty_h264-common's transform
   examples/share.rs      the D1 share table + null arm (run it through bench/share.ps1)
+crates/rusty_esp_dsp-esp no_std + deny(unsafe): PieS3 / PieP4 behind pie-s3 / pie-p4 (delegating today)
 bench/pinvs.ps1          pinned, CPU-time, ABBA, null-armed A/B of two command lines
 bench/share.ps1          builds and runs the share example pinned at High priority
 docs/plans/              the roadmap: D0 to D4, the kernel inventory, the decision log
 docs/LEDGER.md           every number, with the run that produced it
 ```
 
-`crates/rusty_esp_dsp-esp` (the PIE twins behind `pie-s3` / `pie-p4`, the
-only fenced `unsafe`) arrives with D2.
+The first twin brings the first fenced `unsafe` to `-esp`, around an
+intrinsic and nothing else; the scalar crate stays `forbid(unsafe)`.
 
 ## Build
 
 ```sh
-cargo test --workspace                                   # host: unit + the two oracle suites
+cargo test --workspace --features rusty_esp_dsp-esp/std,rusty_esp_dsp-esp/pie-s3   # host: unit, the two oracle suites, the twin gate
 cargo clippy --workspace --all-targets -- -D warnings
 cargo check -p rusty_esp_dsp --no-default-features --target riscv32imac-unknown-none-elf
 cargo check -p rusty_esp_dsp --no-default-features --features alloc --target riscv32imafc-unknown-none-elf
+cargo check -p rusty_esp_dsp-esp --no-default-features --features pie-p4 --target riscv32imafc-unknown-none-elf
+RUSTUP_TOOLCHAIN=esp cargo check -p rusty_esp_dsp-esp --no-default-features --features pie-s3 --target xtensa-esp32s3-none-elf -Z build-std=core   # local, esp toolchain
 cargo deny check
 powershell -ExecutionPolicy Bypass -File bench/share.ps1 -Reps 31   # the pinned share table
 ```

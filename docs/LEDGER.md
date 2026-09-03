@@ -133,6 +133,29 @@ A 2.8× on the kernel, byte-identical; on the host the PCM second is now
 led by the same conversion at about 53 % instead of 75 %, and the number
 that matters is still the board's.
 
+## D2 software half: the seam and the chip crate (host, 2026-09-02)
+
+No speed number — nothing here is faster yet. These are the gates the
+software half had to pass so the first twin lands in a crate that already
+builds for its chip and is already held to the oracle.
+
+| gate | result |
+|---|---|
+| `cargo test --workspace --features rusty_esp_dsp-esp/std,rusty_esp_dsp-esp/pie-s3` | **28 pass** (19 unit incl. 2 seam, 3 h264 oracle, 4 moved, 2 `-esp`), 1 ignored (exhaustive) |
+| `twin_matches_scalar(&Scalar, …, 64)` and `(&PieS3, …, 32)` | 832 and 416 comparisons, all identical (13 per round: 7 pixel, 3 sample, 3 block) |
+| `cargo clippy --workspace --all-targets` with the same features, `-D warnings` | clean |
+| `cargo check -p rusty_esp_dsp-esp --no-default-features [--features pie-s3 / pie-p4] --target riscv32imafc-unknown-none-elf` | 3 of 3 pass |
+| `RUSTUP_TOOLCHAIN=esp cargo check -p rusty_esp_dsp-esp --no-default-features --features pie-s3 --target xtensa-esp32s3-none-elf -Z build-std=core` | **pass**, 14 s (esp toolchain, `core` built from source; the first Xtensa bare-metal check in the family) |
+| `cargo deny check` | clean (no new dependencies) |
+| `unsafe` in `-esp` | none; `#![deny(unsafe_code)]` |
+
+The gate's corpus, per round: an even width 2–80 and height 2–60 (so every
+downscale and every YUYV pair is exercised), fresh LCG bytes per input, i16
+vectors of 1–500 samples, 32×32 planes for the SADs, 1–9 Hadamard blocks.
+The twin's return value **and** its output buffer are compared, so a twin
+that gets the pixels right but the `Geometry` or the byte count wrong fails
+too.
+
 ## Method line for every future row
 
 `pinned=<core> prio=High metric=<cpu|wall> pairs=<N> order=ABBA null_floor=<‰> work=<pixels|samples|blocks per arm>`
