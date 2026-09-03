@@ -9,7 +9,10 @@
 >
 > **Status by milestone:** D0 ✅ host 2026-09-02 (gates in `docs/LEDGER.md`:
 > 16 unit + 7 oracle tests, byte identity against every replaced copy and
-> against `rusty_h264-common`, clippy, deny, both riscv32 targets) · D1 ☐ ·
+> against `rusty_h264-common`, clippy, deny, both riscv32 targets) · D1 ✅ host
+> 2026-09-02 (`bench/pinvs.ps1`, `bench/share.ps1` + the `share` example; the
+> share table and null floor in the ledger; `yuyv_to_rgb888` leads the raw path
+> at ~55 %, the F32 → I16 convert leads the PCM second at ~75 %) ·
 > D2 ☐ (board) · D3 ☐ (board, software half first) · D4 ☐ (board).
 
 ## 1. Why it exists, and the rule that keeps it small
@@ -99,7 +102,7 @@ rusty_esp_dsp/                     one repo, deployable on its own (umbrella rul
 | # | Deliverable | Gate |
 |---|---|---|
 | **D0** ✅ host 2026-09-02 | The repo and the scalar core: `pixel` (the four YUYV/RGB conversions, the two downscales), `sample` (`dot_i16`, `sum_sq_i16`, `rms_dbfs_i16`, PCM convert), `block` (`sad8x8`, `sad16x16`, `satd4x4`, `hadamard4x4` — scalar, matching `rusty_h264`'s), `probe` (the work counters + the ceiling-probe helper); image, audio and signal cores switched to import them, their own copies deleted | byte-identical outputs against the copies they replace over a generated corpus (the same LCG corpus style as the core's manifest test); all four consumer crates' suites unchanged; `riscv32imac` and `riscv32imafc` compile with `--no-default-features` |
-| **D1** | The host harness: `bench/pinvs.ps1` ported (pinned, High priority, CPU time, ABBA, paired win-rate with z, null arm, method line printed) and a `probe` example that prints each kernel's share of a 320×240 raw frame path and a 16 kHz PCM second | a null-arm floor recorded per machine before any speed number; the share table in the ledger |
+| **D1** ✅ host 2026-09-02 | The host harness: `bench/pinvs.ps1` ported (pinned, High priority, CPU time, ABBA, paired win-rate with z, null arm, method line printed) and a `probe` example that prints each kernel's share of a 320×240 raw frame path and a 16 kHz PCM second | a null-arm floor recorded per machine before any speed number; the share table in the ledger |
 | **D2** | S3 PIE twins for the kernels the probe ranks first (expected: `yuyv_to_rgb565`, `downscale2x_rgb565`, `dot_i16`), in `-esp` behind `pie-s3`, gated byte-identical on the host against `Scalar` through a **cycle-accurate?** no — through the same oracle tests compiled for the S3 and run on the board; work counters equal both arms | on the S3: each twin's pixels/s or samples/s against the scalar arm, cycle counter, same work count; the ceiling probe's prediction beside the measurement (a twin that misses its prediction is a finding, not a failure) — **board row** |
 | **D3** | The H.264 block twins: `sad`, `satd`, `hadamard`, `quant` for the S3, wired to `rusty_h264` through its accel seam (upstream PR, the way `rusty_h264-accel` carries x86 today), gated on the encoder's byte-identical bitstream vs scalar over the QVGA oracle | bitstream byte-identical; V3's S3 FPS row before and after, with the profile share that predicted it — **board row**, with the software half (the seam and the twins compiled for the S3) done first |
 | **D4** | P4 (`esp.*`, 128-bit) twins of D2's kernels behind `pie-p4`; the ESP32/S2/C-series stay scalar by design | as D2, on the P4 — **board row** |
@@ -130,6 +133,8 @@ board half (the number).
 
 | Date | Decision |
 |---|---|
+| 2026-09-02 | D1's share table is in-process best-of-N with an ns timer, not the CPU-time process A/B: a whole QVGA path is 0.6 ms and the scheduler tick is 15.6 ms, so `pinvs.ps1`'s rule (both arms ≥ 15 s) is right for arms and wrong for shares. The pin and priority still apply, through the wrapper. |
+| 2026-09-02 | The first twin to price on the S3 is `yuyv_to_rgb888` (56 % of the raw path); `sad_16x16` is not worth a twin for this path (0.6 %). The F32 → I16 convert (75 % of the PCM second) is first an algorithm question (`rintf` per sample), not a SIMD one. |
 | 2026-09-02 | D0 kept `quantize` out: it drags the 52×8 MF/deadzone tables and the encoder's own dead-zone policy along; D3 is where the quantizer twin is priced, through `rusty_h264`'s seam, with the tables staying upstream. |
 | 2026-09-02 | The block kernels take a stride and return `Result` (`BufferTooSmall` names the bytes needed): one bounds check per block is nothing next to 64 to 256 absolute differences, and it is the family's rule. |
 | 2026-09-02 | Crate shape for D0 is one crate, `crates/rusty_esp_dsp`, not the function template's facade/core/esp trio: there is no backend to wrap yet, and the `-esp` crate arrives with D2's first twin. |

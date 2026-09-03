@@ -22,11 +22,12 @@ can ship products that plug straight into the MATA home computer.
 **Claims discipline:** this README makes no performance or capability claim that
 is not backed by a test, a benchmark ledger entry, or a kill test recorded in the
 plan. There is no speed number here yet, because nothing has been measured on a
-chip; D1 builds the harness and D2 produces the first board row.
+chip; D1's table is a share table for the ceiling probe, and D2 produces the
+first board row.
 
 ## Status
 
-**D0 shipped on the host (2026-09-02).** The kernels that two function
+**D0 and D1 shipped on the host (2026-09-02).** The kernels that two function
 packages carried, or that a chip-side speedup would be spent on, live here
 now, and the packages import them:
 
@@ -45,6 +46,18 @@ the copy it replaced over a generated corpus (the copies live in
 on every block of a generated corpus including block counts that are not a
 multiple of four, and the three consumers' own test suites are unchanged.
 Counts and commands are in the ledger.
+
+**D1** is the harness and the first share table: `bench/pinvs.ps1` (the
+family's pinned, High-priority, CPU-time, ABBA, null-armed A/B, ported from
+rs_h264 so the discipline has one copy) and `bench/share.ps1`, which runs the
+`share` example on one core and prints, per kernel, the best-of-31 time, the
+work count and the share of its path. On this laptop the QVGA raw frame path
+is led by `yuyv_to_rgb888` (about 55 % of it, four runs) and the PCM second
+by the F32 → I16 conversion (about 75 %, one `rintf` per sample); the null
+floor read under 1 % within a run and the path moved about 10 % between runs.
+The ledger has the rows, the floor per run, and what the ceiling probe makes
+of them: `yuyv_to_rgb888` is the twin worth writing first, `sad_16x16` is
+not worth writing for this path at any speedup.
 
 ## The rule that keeps this crate small
 
@@ -73,13 +86,15 @@ crates/rusty_esp_dsp     no_std + forbid(unsafe): the scalar kernels and the pro
   src/probe.rs           work counters and the ceiling probe
   tests/moved.rs         byte identity against the copies D0 replaced
   tests/h264_oracle.rs   byte identity against rusty_h264-common's transform
+  examples/share.rs      the D1 share table + null arm (run it through bench/share.ps1)
+bench/pinvs.ps1          pinned, CPU-time, ABBA, null-armed A/B of two command lines
+bench/share.ps1          builds and runs the share example pinned at High priority
 docs/plans/              the roadmap: D0 to D4, the kernel inventory, the decision log
 docs/LEDGER.md           every number, with the run that produced it
 ```
 
 `crates/rusty_esp_dsp-esp` (the PIE twins behind `pie-s3` / `pie-p4`, the
-only fenced `unsafe`) arrives with D2; `bench/` (the pinned, interleaved,
-null-armed host harness) with D1.
+only fenced `unsafe`) arrives with D2.
 
 ## Build
 
@@ -89,6 +104,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo check -p rusty_esp_dsp --no-default-features --target riscv32imac-unknown-none-elf
 cargo check -p rusty_esp_dsp --no-default-features --features alloc --target riscv32imafc-unknown-none-elf
 cargo deny check
+powershell -ExecutionPolicy Bypass -File bench/share.ps1 -Reps 31   # the pinned share table
 ```
 
 Features: `std` (default) implies `alloc`; with neither the crate is pure

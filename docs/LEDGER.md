@@ -26,9 +26,81 @@ allowances not yet encountered are warnings); `riscv32imac-unknown-none-elf`
 and `riscv32imafc-unknown-none-elf` compile with `--no-default-features` and
 with `--features alloc`.
 
-Consumers after the switch (each repo's own gates, same day): recorded in
-each consumer's ledger and in the umbrella's mission plan; the point of the
-D0 gate is that those suites did not change.
+Consumers after the switch (each repo's own gates, same day): image 14,
+audio 43 + 3 + 7 oracle (the ffmpeg `swresample` byte identity held), signal
+77 + 3 capture-oracle, video 34 + 12, iroh 31 — the point of the D0 gate is
+that those suites did not change, and they did not.
+
+## D1 share table (host, 2026-09-02)
+
+`bench/share.ps1 -Reps 31`: the `share` example built in release and run on
+one core (affinity mask 4) at High priority; each kernel timed in-process,
+best of 31 single calls, one whole frame or one whole second per call; the
+null arm is the same kernel timed as arm A and arm B alternating (ABBA),
+and its floor is the spread of the two best-of-31 minima. Four runs; the
+table is run 4 (the committed example), the spread column is over all four.
+Machine: the Janus development laptop, busy (Wi-Fi, IDE, the user's own
+builds) — the standing condition, not an excuse.
+
+**This is a share table, not a speed claim.** It exists so the ceiling probe
+has a share to multiply. A host CPU says nothing about an S3's PIE, and 47 to
+63 ms of process CPU time per run is far below the 15 s the CPU-time A/B
+harness (`bench/pinvs.ps1`) demands — that harness is for whole-process arm
+comparisons and was not used for these numbers.
+
+### QVGA raw frame path (320×240 YUYV in), run 4
+
+| kernel | work | best of 31 | per unit | share | share over 4 runs |
+|---|---:|---:|---:|---:|---:|
+| `yuyv_to_gray8` | 76 800 px | 0.016 ms | 0.2 ns/px | 2.5 % | 2.4 – 2.6 % |
+| `yuyv_to_rgb565` | 76 800 px | 0.081 ms | 1.0 ns/px | 13.0 % | 12.2 – 13.0 % |
+| `yuyv_to_rgb888` | 76 800 px | 0.349 ms | 4.5 ns/px | **56.0 %** | 54.6 – 56.0 % |
+| `rgb565_to_rgb888` | 76 800 px | 0.035 ms | 0.5 ns/px | 5.6 % | 5.6 – 6.1 % |
+| `rgb888_to_rgb565` | 76 800 px | 0.028 ms | 0.4 ns/px | 4.5 % | 4.5 – 5.0 % |
+| `downscale2x_gray8` | 19 200 px out | 0.009 ms | 0.5 ns/px | 1.4 % | 1.4 – 1.5 % |
+| `downscale2x_rgb565` | 19 200 px out | 0.032 ms | 1.7 ns/px | 5.2 % | 5.2 – 5.6 % |
+| `sad_16x16`, whole frame vs a shifted copy | 300 blocks | 0.004 ms | 13.0 ns/block | 0.6 % | 0.6 – 0.7 % |
+| `residual_4x4` + `satd_4x4_sum`, whole frame | 4 800 blocks | 0.069 ms | 14.4 ns/block | 11.1 % | 11.1 – 11.9 % |
+| **path** | 422 400 px + 5 100 blocks | **0.622 ms** | | 100 % | 0.615 – 0.674 ms |
+
+### One second of 16 kHz mono i16, run 4
+
+| kernel | work | best of 31 | per unit | share | share over 4 runs |
+|---|---:|---:|---:|---:|---:|
+| `rms_dbfs_i16` | 16 000 samples | 0.003 ms | 0.2 ns/sample | 3.1 % | 3.1 – 3.3 % |
+| `sum_sq_i16` | 16 000 samples | 0.003 ms | 0.2 ns/sample | 3.1 % | 3.0 – 3.3 % |
+| `dot_i16` | 16 000 samples | 0.003 ms | 0.2 ns/sample | 3.1 % | 3.0 – 3.4 % |
+| `pcm convert` I16 → F32 | 16 000 samples | 0.017 ms | 1.1 ns/sample | 15.3 % | 15.1 – 16.3 % |
+| `pcm convert` F32 → I16 | 16 000 samples | 0.084 ms | 5.2 ns/sample | **75.5 %** | 73.8 – 75.8 % |
+| **path** | 80 000 samples | **0.111 ms** | | 100 % | 0.104 – 0.118 ms |
+
+### The floor, and what the probe says with it
+
+| run | null floor (spread of best-of-31 minima, `yuyv_to_gray8` / `yuyv_to_rgb888`) | process CPU time |
+|---|---:|---:|
+| 1 | 0 ‰ | 63 ms |
+| 2 | 0 ‰ | 63 ms |
+| 3 | 1 ‰ | 47 ms |
+| 4 | 7 ‰ | 47 ms |
+
+Within a run the minima of two identical arms agree to under 1 % (best-of-N
+finds the floor; codec-measurement 1). **Between runs the path moved 9.6 %**
+(0.615 to 0.674 ms), so a twin is judged inside one run, arm against arm,
+never against a table from another day.
+
+What `probe::ceiling` says, with a 10 ‰ floor for a within-run judgement:
+
+| candidate twin | share | speedup assumed | `pipeline_gain_permille` | verdict |
+|---|---:|---:|---:|---|
+| `yuyv_to_rgb888` (S3 PIE, 8 px per op) | 560 ‰ | 4× | 420 ‰ | **Build** — the raw path's whole story |
+| `yuyv_to_rgb565` | 130 ‰ | 4× | 98 ‰ | Build |
+| `satd_4x4_sum` | 111 ‰ | 3× | 74 ‰ | Build, but through `rusty_h264`'s seam (D3) |
+| `downscale2x_rgb565` | 52 ‰ | 4× | 39 ‰ | Build, marginal |
+| `sad_16x16` | 6 ‰ | 8× | 5 ‰ | **BelowFloor** — do not write it for this path |
+| F32 → I16 convert (one `rintf` per sample) | 755 ‰ of the PCM second | 4× | 566 ‰ | Build — but the fix is likely algorithmic (a fixed-point round), priced before any PIE |
+
+The verdict column is the plan for D2; the numbers that decide it are the
+board's, not this table's.
 
 ## Method line for every future row
 
