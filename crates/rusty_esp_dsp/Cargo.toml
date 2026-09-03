@@ -32,7 +32,7 @@ libm = { version = "0.2", default-features = false }
 # encoder's own scalar transform lives. Default features OFF (no allocator
 # hijack, no x86 asm) plus `std` for the host test run. Same branch as
 # rusty_esp_video's encoder dependency.
-rusty_h264-common = { version = "0.12", git = "https://github.com/remade-with-rust/rusty_h264", branch = "no-std", default-features = false, features = ["std"] }
+rusty_h264-common = { version = "0.14", default-features = false, features = ["std"] }
 
 [lints]
 workspace = true

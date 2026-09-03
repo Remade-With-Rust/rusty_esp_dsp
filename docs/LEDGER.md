@@ -189,3 +189,10 @@ to size an effect; no number above is a speed claim.
 `pinned=<core> prio=High metric=<cpu|wall> pairs=<N> order=ABBA null_floor=<‰> work=<pixels|samples|blocks per arm>`
 
 A row without it is not a number.
+
+## The transform oracle on rusty_h264-common 0.14 from crates.io (host, 2026-09-03)
+
+`rusty_h264-common` moved from the `no-std` git branch (0.12) to the 0.14.0
+release; the git allow-list row is gone. `tests/h264_oracle.rs` (the
+Hadamard and SATD sums against the encoder's own transform) passes
+unchanged: 3 of 3, and the workspace's 28.
