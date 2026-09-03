@@ -18,10 +18,15 @@
 //! and `riscv32imafc-unknown-none-elf` so the first twin lands in a crate
 //! that already builds for its chip.
 
+#[cfg(any(feature = "pie-s3", feature = "pie-p4"))]
 use rusty_esp_core::error::Result;
+#[cfg(any(feature = "pie-s3", feature = "pie-p4"))]
 use rusty_esp_core::frame::Geometry;
-use rusty_esp_dsp::seam::{BlockKernels, PixelKernels, SampleKernels, Scalar};
+use rusty_esp_dsp::seam::Scalar;
+#[cfg(any(feature = "pie-s3", feature = "pie-p4"))]
+use rusty_esp_dsp::seam::{BlockKernels, PixelKernels, SampleKernels};
 
+#[cfg(any(feature = "pie-s3", feature = "pie-p4"))]
 macro_rules! delegate_to_scalar {
     ($ty:ident) => {
         impl PixelKernels for $ty {

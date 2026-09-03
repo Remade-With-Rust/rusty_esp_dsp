@@ -143,7 +143,7 @@ builds for its chip and is already held to the oracle.
 |---|---|
 | `cargo test --workspace --features rusty_esp_dsp-esp/std,rusty_esp_dsp-esp/pie-s3` | **28 pass** (19 unit incl. 2 seam, 3 h264 oracle, 4 moved, 2 `-esp`), 1 ignored (exhaustive) |
 | `twin_matches_scalar(&Scalar, …, 64)` and `(&PieS3, …, 32)` | 832 and 416 comparisons, all identical (13 per round: 7 pixel, 3 sample, 3 block) |
-| `cargo clippy --workspace --all-targets` with the same features, `-D warnings` | clean |
+| `cargo clippy --workspace --all-targets -- -D warnings`, with no features, with `pie-s3` + `std`, and with `pie-p4` | clean (the first fleet run caught the no-feature build's unused imports in `-esp`; fixed the same evening, and the fleet gate is what runs it) |
 | `cargo check -p rusty_esp_dsp-esp --no-default-features [--features pie-s3 / pie-p4] --target riscv32imafc-unknown-none-elf` | 3 of 3 pass |
 | `RUSTUP_TOOLCHAIN=esp cargo check -p rusty_esp_dsp-esp --no-default-features --features pie-s3 --target xtensa-esp32s3-none-elf -Z build-std=core` | **pass**, 14 s (esp toolchain, `core` built from source; the first Xtensa bare-metal check in the family) |
 | `cargo deny check` | clean (no new dependencies) |
