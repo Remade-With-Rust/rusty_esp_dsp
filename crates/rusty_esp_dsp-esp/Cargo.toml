@@ -15,7 +15,10 @@ categories = ["embedded", "no-std", "multimedia", "hardware-support"]
 
 [features]
 default = []
-std = ["rusty_esp_dsp/std"]
+# The family ladder: nothing -> alloc -> std, so the fleet gate can hold this
+# crate to the same three rungs as every other no_std crate.
+alloc = ["rusty_esp_dsp/alloc"]
+std = ["alloc", "rusty_esp_dsp/std"]
 # The ESP32-S3 twins. Selecting the feature selects `PieS3`; a kernel without
 # a twin yet is the scalar one under the same name, so a firmware can pick
 # `PieS3` in one place before every twin exists.
