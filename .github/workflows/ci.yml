@@ -70,3 +70,7 @@ jobs:
           targets: ${{ matrix.target }}
       - run: cargo check -p rusty_esp_dsp --no-default-features --target ${{ matrix.target }}
       - run: cargo check -p rusty_esp_dsp --no-default-features --features alloc --target ${{ matrix.target }}
+      # The chip half: the P4's twins on the P4-class target; the S3's twins
+      # need the esp toolchain (xtensa-esp32s3-none-elf, build-std) and are
+      # checked locally, ledger row D2.
+      - run: cargo check -p rusty_esp_dsp-esp --no-default-features --features pie-p4 --target ${{ matrix.target }}

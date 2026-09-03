@@ -40,6 +40,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusty_esp_dsp-esp"
+version = "0.1.0"
+dependencies = [
+ "rusty_esp_core",
+ "rusty_esp_dsp",
+]
+
+[[package]]
 name = "rusty_h264-common"
 version = "0.12.0"
 source = "git+https://github.com/remade-with-rust/rusty_h264?branch=no-std#062cbb47dcb63e9426b7206da3107c3986550250"

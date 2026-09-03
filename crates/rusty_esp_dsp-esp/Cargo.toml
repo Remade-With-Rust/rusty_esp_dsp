@@ -1,0 +1,31 @@
+[package]
+name = "rusty_esp_dsp-esp"
+description = "The chip half of rusty_esp_dsp: the PIE twins (ESP32-S3 `ee.*` behind `pie-s3`, ESP32-P4 `esp.*` behind `pie-p4`) of the scalar kernels, each gated byte-identical against the scalar oracle. The only crate of the package allowed a fenced unsafe block, and only around an intrinsic. no_std."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+readme = "README.md"
+documentation = "https://docs.rs/rusty_esp_dsp-esp"
+keywords = ["esp32", "embedded", "no-std", "dsp", "simd"]
+categories = ["embedded", "no-std", "multimedia", "hardware-support"]
+
+[features]
+default = []
+std = ["rusty_esp_dsp/std"]
+# The ESP32-S3 twins. Selecting the feature selects `PieS3`; a kernel without
+# a twin yet is the scalar one under the same name, so a firmware can pick
+# `PieS3` in one place before every twin exists.
+pie-s3 = []
+# The ESP32-P4 twins (D4); the same shape.
+pie-p4 = []
+
+[dependencies]
+rusty_esp_dsp = { path = "../rusty_esp_dsp", version = "0.1.0", default-features = false }
+rusty_esp_core = { workspace = true }
+
+[lints]
+workspace = true

@@ -24,6 +24,9 @@
 //!   uses.
 //! - [`probe`]: the work counters both arms of a measurement report, and the
 //!   ceiling probe that says whether a twin is worth building at all.
+//! - [`seam`]: one trait per kernel family with [`seam::Scalar`] as the
+//!   default and the oracle; the twins in `rusty_esp_dsp-esp` implement the
+//!   same traits and are gated against it by [`seam::twin_matches_scalar`].
 //!
 //! No allocator, no drivers, no product types, no FFT (nothing needs one
 //! yet), no neural-network ops (those are FFai's). Borrowed slices in,
@@ -36,6 +39,7 @@ pub mod int;
 pub mod pixel;
 pub mod probe;
 pub mod sample;
+pub mod seam;
 
 pub use rusty_esp_core as esp_core;
 
@@ -65,4 +69,5 @@ pub mod prelude {
     };
     pub use crate::probe::{Verdict, Work};
     pub use crate::sample::{dot_i16, peak_abs_i16, rms_dbfs_i16, sum_sq_i16};
+    pub use crate::seam::{BlockKernels, PixelKernels, SampleKernels, Scalar};
 }
