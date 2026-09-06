@@ -1,0 +1,51 @@
+# The I5 ceiling probe on real silicon: run the scalar kernels on an
+# ESP32-S3 and report per-unit cost with the work counts beside it, so the
+# share table the twins are ranked by is the chip's rather than a laptop's.
+# Also reports what the chip says about its own memory, and dumps a megabyte
+# from its random number generator for an outside statistic to judge.
+#
+# Track B (esp-hal, no ESP-IDF), Seeed XIAO ESP32-S3 Sense. A separate cargo
+# project: Xtensa target, the esp toolchain, build-std.
+
+[package]
+name = "xiao-s3-probe"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "xiao-s3-probe"
+harness = false
+
+[dependencies]
+esp-hal = { version = "=1.2.0", features = ["esp32s3"] }
+esp-alloc = { version = "=0.11.0", features = ["esp32s3"] }
+esp-bootloader-esp-idf = { version = "=0.6.0", features = ["esp32s3"] }
+esp-println = { version = "=0.18.0", features = ["esp32s3"] }
+esp-backtrace = { version = "=0.20.0", features = ["esp32s3", "panic-handler", "println"] }
+# The kernels and the measurement discipline, no_std: the same code the host
+# share table measured, so the two are comparable per unit.
+rusty_esp_dsp = { path = "../../crates/rusty_esp_dsp", default-features = false }
+
+[features]
+default = []
+# The megabyte dump for an entropy statistic; off by default because it costs
+# 48 s and 16,384 lines and the kernel numbers do not need it.
+rngdump = []
+
+[profile.release]
+# 3, not "s": the host share table this is compared against was built for
+# speed, and a size-optimised arm against a speed-optimised arm is not a
+# comparison. (Measured both ways on 2026-09-06; see the ledger.)
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = "z"
+panic = "abort"
+
+[workspace]

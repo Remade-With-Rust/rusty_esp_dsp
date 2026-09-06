@@ -196,3 +196,118 @@ A row without it is not a number.
 release; the git allow-list row is gone. `tests/h264_oracle.rs` (the
 Hadamard and SATD sums against the encoder's own transform) passes
 unchanged: 3 of 3, and the workspace's 28.
+
+## I5 on silicon: the same kernels on an ESP32-S3 (2026-09-06)
+
+The D1 share table above says, in its own words, that "a host CPU says
+nothing about an S3's PIE". This row is the S3 half. `firmware/xiao-s3-probe`
+runs the same scalar kernels from this crate on a Seeed XIAO ESP32-S3 Sense
+over Track B (esp-hal 1.2.0, no ESP-IDF), 160x120 frames out of a 220 KiB
+heap, each kernel repeated until it has spent at least 100 ms so a fast one
+is not measured against the timer.
+
+Method line: `board=xiao-esp32s3-sense clock=80MHz opt-level=3 lto=fat
+metric=in-process-us budget=100ms/kernel work=px-and-blocks-counted
+pairs=1 null_floor=not-established`. One arm, no ABBA: this is a **cost
+table for a chip that has no twin yet**, not an A/B, and nothing below is a
+speed claim about anything but this part at this clock.
+
+**At this clock** is load-bearing: the probe takes `Config::default()`, which
+boots this part at 80 MHz, and a camera pipeline would run it at 240. Every
+absolute figure below is therefore about 3x pessimistic. The **shares are
+not** — every kernel scales with the same clock — and shares are what this
+row exists to correct.
+
+**The opt-level matters and was measured both ways.** The first run built at
+`opt-level = "s"`; the host table it is compared against is speed-optimised,
+and a size-optimised arm against a speed-optimised arm is not a comparison
+(codec-measurement 4). Rebuilt at `3`, the two conversions that dominate the
+host moved a long way and the rest barely moved:
+
+| kernel | ps/unit at `"s"` | ps/unit at `3` |
+|---|---:|---:|
+| `yuyv_to_gray8` | 112 710 | 125 226 |
+| `yuyv_to_rgb565` | 932 065 | **563 098** |
+| `yuyv_to_rgb888` | 794 427 | **387 938** |
+| `rgb565_to_rgb888` | 437 994 | 488 035 |
+| `rgb888_to_rgb565` | 362 972 | 350 399 |
+| `downscale2x_gray8` | 277 808 | 289 072 |
+| `downscale2x_rgb565` | 1 716 875 | 1 779 253 |
+| `sad_16x16` (per block) | 44 439 393 | 21 558 422 |
+
+### The finding: the host's ranking does not survive the crossing
+
+Holding the host's own work mix fixed (76 800 px per pixel kernel, 19 200 px
+out per downscale, 300 blocks of SAD) and substituting the S3's per-unit
+costs, both sides renormalised over the eight kernels the probe covers
+(the host's `residual_4x4` + `satd_4x4_sum` has no S3 arm yet, so it is out
+of both columns):
+
+| kernel | host share | **S3 share** | S3 / host per unit |
+|---|---:|---:|---:|
+| `yuyv_to_gray8` | 2.9 % | 5.0 % | 602x |
+| `yuyv_to_rgb565` | 14.6 % | **22.4 %** | 534x |
+| `yuyv_to_rgb888` | **63.1 %** | 15.4 % | **85x** |
+| `rgb565_to_rgb888` | 6.3 % | 19.4 % | 1071x |
+| `rgb888_to_rgb565` | 5.1 % | 13.9 % | 961x |
+| `downscale2x_gray8` | 1.6 % | 2.9 % | 617x |
+| `downscale2x_rgb565` | 5.8 % | 17.7 % | 1068x |
+| `sad_16x16` | 0.7 % | 3.4 % | 1617x |
+| **path** | 0.553 ms | **193.2 ms** | |
+
+**On the host one kernel is 63 % of the path; on the S3 the largest is 22 %
+and four kernels sit between 14 % and 22 %.** There is no dominant kernel on
+this silicon.
+
+The last column says why, and it is the more useful half. The host is
+between 85x and 1617x faster per unit — a **19x spread across kernels that
+all do comparable per-pixel work**. `yuyv_to_rgb888` is the single kernel
+where the host is under 500x, which is what a kernel the host's compiler
+*failed* to vectorise looks like beside seven it vectorised. The D2 revert
+above had already named the cause from the other side: that kernel's cost is
+its 4-in / 6-out byte layout and three clamps per pixel. So the host's 56 %
+was measuring the host's own vectorisation hole, and on a chip where nothing
+is vectorised the ranking flattens.
+
+### What this does to the ceiling probe
+
+Re-running `probe::ceiling`'s arithmetic on the S3 shares, same 4x
+assumption as the host table used:
+
+| candidate twin | host `pipeline_gain_permille` | **S3** |
+|---|---:|---:|
+| `yuyv_to_rgb888` (PIE, 8 px per op) | 420 | **115** |
+| `yuyv_to_rgb565` | 98 | **168** |
+| `downscale2x_rgb565` | 39 | **133** |
+| `rgb565_to_rgb888` | — | **146** |
+| `sad_16x16` | 5 (**BelowFloor**) | 25 |
+
+The twin D1 called "the raw path's whole story" is now the fourth-best of
+five, and three kernels the host priced as marginal or did not price at all
+are ahead of it. **Brick 12's target was chosen from the host number and
+should be re-chosen from this one** — or, better, from a mix measured on a
+real camera path rather than one-call-each, since every share above inherits
+the host's synthetic mix.
+
+### Memory, from the chip rather than the ELF
+
+`esp_alloc::HEAP` at four stages, same run:
+
+| stage | used | free | total |
+|---|---:|---:|---:|
+| boot | 0 | 225 280 | 225 280 |
+| buffers | 172 800 | 52 480 | 225 280 |
+| after kernels | 172 800 | 52 480 | 225 280 |
+| end | 172 800 | 52 480 | 225 280 |
+
+172 800 is exactly the five buffers asked for (19 200 px x 9 bytes), so the
+allocator's accounting and the source agree, and **no kernel in this crate
+allocates**: the figure does not move across eight kernels. That is a
+property worth keeping — it is what lets these run under a fixed heap.
+
+### What is NOT done here
+
+No PIE twin exists, so **the "PIE ceiling probes" half of the I5 row is
+still open**. Everything above is the scalar arm, which is the baseline a
+PIE twin would be judged against; the ceiling table says which twin to write
+first, and it is no longer the one the host chose.
