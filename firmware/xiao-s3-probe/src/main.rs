@@ -29,6 +29,32 @@ use rusty_esp_dsp::probe::Work;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
+#[cfg(all(feature = "alloc-esp", feature = "alloc-rusty"))]
+compile_error!("pick one allocator arm: alloc-esp or alloc-rusty, not both");
+#[cfg(not(any(feature = "alloc-esp", feature = "alloc-rusty")))]
+compile_error!("pick an allocator arm: alloc-esp (default) or alloc-rusty");
+
+/// The heap both arms are given. Equal budgets, so neither is advantaged by
+/// having more memory to walk.
+const HEAP_BYTES: usize = 220 * 1024;
+
+/// Which allocator this build carries, printed so a log says what ran rather
+/// than what a manifest said.
+const ALLOCATOR: &str = if cfg!(feature = "alloc-rusty") {
+    "rusty_alloc"
+} else {
+    "esp-alloc"
+};
+
+#[cfg(feature = "alloc-rusty")]
+#[global_allocator]
+static ALLOC: rusty_esp_alloc::Alloc = rusty_esp_alloc::Alloc;
+
+/// The region rusty_alloc serves from. A chip has no operating system to ask
+/// for memory, only what the linker reserved.
+#[cfg(feature = "alloc-rusty")]
+static HEAP: rusty_esp_alloc::Region<HEAP_BYTES> = rusty_esp_alloc::Region::new();
+
 /// The frame every pixel kernel is measured over. Smaller than the host
 /// table's QVGA so the buffers fit internal RAM without PSRAM bring-up; the
 /// comparable figure is per unit, not per frame.
@@ -75,16 +101,23 @@ fn measure(name: &str, unit: &str, units_per_rep: u64, mut f: impl FnMut() -> Wo
     work
 }
 
+/// What the allocator says about itself, in the same shape on both arms so a
+/// ledger row can put them side by side.
 fn report_memory(stage: &str) {
-    let stats = esp_alloc::HEAP.stats();
+    #[cfg(feature = "alloc-esp")]
+    let (used, free) = (esp_alloc::HEAP.used(), esp_alloc::HEAP.free());
+    #[cfg(feature = "alloc-rusty")]
+    let (used, free) = {
+        let (u, f, _total) = rusty_esp_alloc::occupancy();
+        (u, f)
+    };
     println!(
-        "MEM stage={stage} used={} free={} total={}",
-        esp_alloc::HEAP.used(),
-        esp_alloc::HEAP.free(),
-        esp_alloc::HEAP.used() + esp_alloc::HEAP.free()
+        "MEM stage={stage} alloc={ALLOCATOR} used={used} free={free} total={} budget={HEAP_BYTES}",
+        used + free
     );
     // the allocator's own view, one line, for the ledger's method column
-    println!("MEM stage={stage} detail={stats:?}");
+    #[cfg(feature = "alloc-esp")]
+    println!("MEM stage={stage} detail={:?}", esp_alloc::HEAP.stats());
 }
 
 #[cfg(feature = "rngdump")]
@@ -110,20 +143,23 @@ fn dump_random(trng: &mut esp_hal::rng::Trng) {
         println!("RNGDATA {text}");
         sent += line.len();
     }
-    println!(
-        "RNG end bytes={sent} us={}",
-        start.elapsed().as_micros()
-    );
+    println!("RNG end bytes={sent} us={}", start.elapsed().as_micros());
 }
 
 #[esp_hal::main]
 fn main() -> ! {
     let peripherals = esp_hal::init(esp_hal::Config::default());
     // Room for one source frame and one destination frame at the largest
-    // format (three bytes a pixel), plus the small buffers.
-    esp_alloc::heap_allocator!(size: 220 * 1024);
+    // format (three bytes a pixel), plus the small buffers. Both arms get the
+    // same budget.
+    #[cfg(feature = "alloc-esp")]
+    esp_alloc::heap_allocator!(size: HEAP_BYTES);
+    #[cfg(feature = "alloc-rusty")]
+    HEAP.give()
+        .expect("the heap region is given once, before any allocation");
 
     println!("== JANUS PROBE xiao-s3 ==");
+    println!("PROBE allocator={ALLOCATOR} heap_bytes={HEAP_BYTES}");
     println!("PROBE frame={W}x{H} px={PX} budget_us={BUDGET_US}");
     report_memory("boot");
 
@@ -132,8 +168,8 @@ fn main() -> ! {
     let mut rgb565 = vec![0u8; PX * 2];
     let mut gray = vec![0u8; PX];
     let mut small = vec![0u8; PX]; // holds either downscale output
-    // a deterministic pattern: the same bytes the host arm uses, so the work
-    // counts and the outputs are comparable rather than merely similar
+                                   // a deterministic pattern: the same bytes the host arm uses, so the work
+                                   // counts and the outputs are comparable rather than merely similar
     for (i, b) in yuyv.iter_mut().enumerate() {
         *b = (i as u32).wrapping_mul(2_654_435_761).to_le_bytes()[0];
     }
@@ -190,12 +226,9 @@ fn main() -> ! {
             for bx in 0..blocks_x {
                 let at = by * 16 * stride + bx * 16;
                 let shifted = at + 1;
-                if let Ok(v) = rusty_esp_dsp::block::sad_16x16(
-                    &gray[at..],
-                    stride,
-                    &gray[shifted..],
-                    stride,
-                ) {
+                if let Ok(v) =
+                    rusty_esp_dsp::block::sad_16x16(&gray[at..], stride, &gray[shifted..], stride)
+                {
                     sum = sum.wrapping_add(v);
                 }
             }

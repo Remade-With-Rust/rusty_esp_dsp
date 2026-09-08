@@ -3,7 +3,14 @@ target = "xtensa-esp32s3-none-elf"
 
 [target.xtensa-esp32s3-none-elf]
 runner = "espflash flash --monitor"
-rustflags = ["-C", "link-arg=-Tlinkall.x"]
+# rusty_alloc's no_std profile refuses to build unless the target is asserted
+# single threaded, which is the right way round. It IS true here: this firmware
+# runs `esp_hal::main` on one core, never starts the app core, and allocates
+# nothing from an interrupt handler. If any of those three stops being true,
+# remove the cfg before the allocator does something undefined.
+#
+# Harmless on the esp-alloc arm, where rusty_alloc is not in the graph at all.
+rustflags = ["-C", "link-arg=-Tlinkall.x", "--cfg", "ra_single_threaded"]
 
 [unstable]
 build-std = ["core", "alloc"]

@@ -21,7 +21,11 @@ harness = false
 
 [dependencies]
 esp-hal = { version = "=1.2.0", features = ["esp32s3"] }
-esp-alloc = { version = "=0.11.0", features = ["esp32s3"] }
+# One arm each, and never both: see [features]. `optional` matters --
+# esp-alloc claims `#[global_allocator]` under its own default feature, so
+# it cannot merely be present while the other arm is selected.
+esp-alloc = { version = "=0.11.0", features = ["esp32s3"], optional = true }
+rusty_esp_alloc = { git = "https://github.com/Remade-With-Rust/rusty_esp_core", default-features = false, optional = true }
 esp-bootloader-esp-idf = { version = "=0.6.0", features = ["esp32s3"] }
 esp-println = { version = "=0.18.0", features = ["esp32s3"] }
 esp-backtrace = { version = "=0.20.0", features = ["esp32s3", "panic-handler", "println"] }
@@ -30,7 +34,17 @@ esp-backtrace = { version = "=0.20.0", features = ["esp32s3", "panic-handler", "
 rusty_esp_dsp = { path = "../../crates/rusty_esp_dsp", default-features = false }
 
 [features]
-default = []
+# The allocator arm. Exactly one, and the default is esp-hal's standard so
+# nothing changes for anyone who does not ask.
+#
+#   cargo build --release                                        # esp-alloc
+#   cargo build --release --no-default-features --features alloc-rusty,...
+#
+# ONE BINARY SOURCE: both arms are this firmware with one line different, so a
+# comparison between them is like for like rather than two programs.
+default = ["alloc-esp"]
+alloc-esp = ["dep:esp-alloc"]
+alloc-rusty = ["dep:rusty_esp_alloc"]
 # The megabyte dump for an entropy statistic; off by default because it costs
 # 48 s and 16,384 lines and the kernel numbers do not need it.
 rngdump = []
