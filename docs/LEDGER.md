@@ -311,3 +311,93 @@ No PIE twin exists, so **the "PIE ceiling probes" half of the I5 row is
 still open**. Everything above is the scalar arm, which is the baseline a
 PIE twin would be judged against; the ceiling table says which twin to write
 first, and it is no longer the one the host chose.
+
+## The allocator swap on silicon: rusty_alloc 2.0.1 against esp-alloc (2026-09-08)
+
+`firmware/xiao-s3-probe` builds both allocators from **one source**, selected
+by a cargo feature, so the dependency graph and every other line are
+identical. Both arms are handed the same 220 KiB and run the same eight
+kernels over the same five buffers.
+
+Method line: `board=xiao-esp32s3-sense clock=80MHz opt-level=3 lto=fat
+arms=2-one-source budget=225280-both metric=in-process-us budget_us=100000
+work=px-and-blocks-counted pairs=1 null_floor=see-below`.
+
+**Work parity.** Both arms allocate `19,200 x 2`, `38,400 x 2` and `57,600`
+= **172,800 bytes live**, and neither frees before the end. Identical in both
+arms, so the allocator is the only variable.
+
+### The geometry, predicted then measured
+
+The region is carved into whole segments and the remainder is stranded. From
+the geometry alone, a 220 KiB region under the small profile should yield
+3 x 64 KiB segments plus one 4 KiB backend page and strand the rest:
+
+| | predicted | measured |
+|---|---:|---:|
+| region handed over | 225,280 | 225,280 |
+| taken by the allocator | 200,704 | **200,704** |
+| stranded, unusable | 24,576 | **24,576** |
+
+**Exact, and it never moves** — `used` reads 200,704 at `buffers`,
+`after_kernels` and `end` alike. So 10.9% of this budget is dead to a 64 KiB
+granule, and the 172,800 live bytes occupy 87.9% of the 196,608 that the
+segments do provide. Sizing the region as `k * 64 KiB + 4 KiB` is the fix and
+is now upstream as `usable_bytes`.
+
+### The kernels: four at six parts per million, four scattered
+
+| kernel | esp-alloc | rusty_alloc | delta |
+|---|---:|---:|---:|
+| `yuyv_to_gray8` | 125,226 | 125,218 | **-0.006 %** |
+| `downscale2x_gray8` | 289,072 | 289,086 | **+0.005 %** |
+| `downscale2x_rgb565` | 1,779,253 | 1,779,322 | **+0.004 %** |
+| `sad_16x16` (per block) | 21,558,422 | 21,558,635 | **+0.001 %** |
+| `yuyv_to_rgb565` | 563,098 | 581,898 | +3.34 % |
+| `yuyv_to_rgb888` | 387,938 | 406,726 | +4.84 % |
+| `rgb888_to_rgb565` | 350,399 | 362,871 | +3.56 % |
+| `rgb565_to_rgb888` | 488,035 | 450,468 | **-7.70 %** |
+
+**The top four are the null arm, and they came for free.** Four kernels
+reproduced to within six parts per million across a complete reflash, a
+different allocator and two days. That is this instrument's floor, and it is
+far below every difference in the bottom four — so those four are real
+effects, not scatter.
+
+**But they are not the allocator's speed.** The heap does not move once the
+buffers exist: `used` is identical at all three stages, and I1 already
+established that no kernel in this crate allocates. Zero allocator calls
+happen during a measured kernel, so nothing the allocator does can be inside
+these numbers.
+
+**They are where the buffers landed.** The two allocators hand out different
+addresses, and the four kernels that moved are exactly the four touching
+`rgb888` (57,600 B) or `rgb565` (38,400 B) as source or destination; the four
+that did not move touch only the two 19,200-byte buffers. The **mixed sign**
+is the confirming detail: allocator overhead would push one way, and
+`rgb565_to_rgb888` got 7.7 % *faster*. Alignment and bank placement do that.
+
+So the honest summary is the one predicted before the run: **on a workload
+that allocates five buffers once and never frees, the allocator swap is
+invisible to compute.** What it does instead is shuffle buffer placement by up
+to 8 % either way, which is a caution about comparing kernel numbers across
+allocators rather than a result about either allocator.
+
+### What it costs
+
+| budget | delta | note |
+|---|---:|---|
+| flash (`.text` + `.rodata` + `.data`) | **+16,584 B** | +6.9 % of this firmware |
+| static RAM (`.bss` + `.data`) | **+3,092 B** | comes straight out of `.stack` |
+| region stranded by the granule | 24,576 B | recoverable by sizing to `k * 64 KiB + 4 KiB` |
+
+`.stack` shrank by exactly 3,092 bytes, matching the static growth to the
+byte, because the linker gives the stack whatever RAM is left. A firmware near
+its stack limit does not get a bigger binary when it adopts this — it gets an
+overflow. Decomposition, levers and the two floor functions are in
+`rusty_alloc/docs/plans/firmware-code-size.md`.
+
+**Why keep it, then.** Not for speed on this firmware, which the table above
+says plainly. For the double-free abort: one block cannot be handed to two
+owners. That is the trade being taken knowingly, and the cost is now measured
+rather than assumed.
