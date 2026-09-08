@@ -10,7 +10,18 @@ runner = "espflash flash --monitor"
 # remove the cfg before the allocator does something undefined.
 #
 # Harmless on the esp-alloc arm, where rusty_alloc is not in the graph at all.
-rustflags = ["-C", "link-arg=-Tlinkall.x", "--cfg", "ra_single_threaded"]
+# ra_small_profile is NOT optional and nothing makes you set it. Without it
+# rusty_alloc's segment is 32 MiB, a 220 KiB region yields ZERO segments,
+# `init_region` still returns Ok, the build is clean, and every allocation
+# fails on the board. With it a segment is 64 KiB. Found 2026-09-08; written up
+# for upstream in rusty_alloc/docs/plans/embedded-adoption.md section 1.
+#
+# Consequence worth knowing: a region yields floor((N - 4 KiB) / 64 KiB)
+# segments and strands the rest, so this 220 KiB budget gives the rusty arm
+# 192 KiB usable and 24 KiB dead. Both arms are still handed the same 220 KiB,
+# because equal budgets is the stronger discipline and the stranding is the
+# geometry's real cost rather than something to engineer away.
+rustflags = ["-C", "link-arg=-Tlinkall.x", "--cfg", "ra_single_threaded", "--cfg", "ra_small_profile"]
 
 [unstable]
 build-std = ["core", "alloc"]
