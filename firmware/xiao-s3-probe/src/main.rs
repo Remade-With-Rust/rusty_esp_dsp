@@ -36,7 +36,21 @@ compile_error!("pick an allocator arm: alloc-esp (default) or alloc-rusty");
 
 /// The heap both arms are given. Equal budgets, so neither is advantaged by
 /// having more memory to walk.
-const HEAP_BYTES: usize = 220 * 1024;
+const HEAP_BYTES: usize = 200_704;
+
+/// 200,704 is not a round number, it is `good_region_size(220 * 1024)`.
+///
+/// A 220 KiB region is carved into whole 64 KiB segments plus one 4 KiB page,
+/// so three segments fit and **24,576 bytes are stranded** -- measured on this
+/// board on 2026-09-08, when it was three times the allocator's entire code
+/// cost. rusty_alloc 2.0.3 added the arithmetic; this asserts the constant
+/// against it rather than trusting a comment, and both arms take the same
+/// number so the comparison stays like for like.
+#[cfg(feature = "alloc-rusty")]
+const _: () = assert!(
+    HEAP_BYTES == rusty_esp_alloc::good_region_size(220 * 1024),
+    "the heap is no longer the largest zero-waste region under 220 KiB"
+);
 
 /// Which allocator this build carries, printed so a log says what ran rather
 /// than what a manifest said.

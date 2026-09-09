@@ -464,3 +464,84 @@ comparable across an allocator change.
 `used=200704 free=24576` at every stage, identical to 2.0.1 and to the
 prediction: three 64 KiB segments plus the 4 KiB page, 24,576 bytes stranded
 by the granule.
+
+## rusty_alloc 2.0.3, and the alignment trap in a day-old API (2026-09-09)
+
+2.0.3 folds everything that exists to manage many OS ranges down to what one
+linker-handed region needs, and adds the `good_region_size` this consumer
+asked for. Re-measured on the board, same firmware source, same five buffers.
+
+### The size claims hold, and two of them exactly
+
+| | esp-alloc | 2.0.1 | 2.0.2 | **2.0.3** |
+|---|---:|---:|---:|---:|
+| flash delta | — | +16,584 | +8,084 | **+3,392** |
+| static RAM delta | — | +3,092 | +3,052 | **+284** |
+| `.stack` delta | — | -3,092 | -3,052 | **-284** |
+| attributable code | 1,043 | 16,256 | 8,297 | **4,313** |
+| symbols | 6 | 57 | 37 | **27** |
+
+Upstream quotes +3,208 flash, +284 static RAM and 4,313 bytes of code. **The
+static RAM figure and the code figure match to the byte.** The 184-byte flash
+gap is this seam's own `Error` variants and their strings, the same residue as
+the last two releases.
+
+Against 2.0.1, flash is down **79.5 %** and static RAM **90.8 %**. The static
+RAM number is the one that matters most here: the `.stack` identity still
+holds exactly, so adopting the allocator now costs 284 bytes of stack rather
+than 3,092. The hazard that decomposition exposed is largely closed.
+
+### The finding: `good_region_size` is right only for an aligned base
+
+The new `good_region_size(220 * 1024)` returns 200,704 -- three 64 KiB
+segments plus the 4 KiB page, the largest region under the budget that strands
+nothing. Sizing the heap to exactly that **killed the firmware**:
+
+```
+MEM stage=boot used=0 free=200704 total=200704
+...
+handle_alloc_error / __rdl_alloc_error_handler / main
+```
+
+The third buffer could not be allocated. The cause is not the arithmetic, it
+is what the arithmetic assumes: segments must be `SEGMENT_SIZE`-ALIGNED, and
+a `static Region<N>` wrapping `[u8; N]` has **alignment 1**, so where it lands
+is the linker's choice. An unaligned base throws away everything up to the
+first 64 KiB boundary -- up to 65,535 bytes -- and at exactly 200,704 there is
+no slack to absorb it. Two segments fitted where three were needed.
+
+The 220 KiB region it replaced worked only by accident: its 24,576 bytes of
+waste happened to be enough to absorb the misalignment.
+
+**Fixed and proven both directions.** `Region` is now `#[repr(align(65536))]`,
+and at the same 200,704 bytes:
+
+| | unaligned | aligned |
+|---|---|---|
+| stage=buffers | **panic in `handle_alloc_error`** | `used=200704 free=0` |
+
+`free=0` is the whole point: the budget was set to the predicted floor and the
+run passes with nothing left over, which is far stronger evidence than a pass
+with slack. It also recovers the 24,576 bytes that the 220 KiB configuration
+stranded, so the heap now serves 196,608 usable from a 200,704 region instead
+of the same 196,608 from 225,280.
+
+**Worth stating plainly because the API is one day old:** a consumer who
+follows `good_region_size`'s own advice without aligning gets a firmware that
+dies at startup, and nothing in the type system, the build or the API says so.
+The compile-time check cannot catch it either -- `usable_bytes` takes a base,
+but a `const fn` cannot know where the linker will put a `static`.
+
+### Kernels, across a region that moved and shrank
+
+| comparison | worst kernel delta |
+|---|---:|
+| esp-alloc to rusty 2.0.1 | 7.698 % |
+| rusty 2.0.1 to 2.0.2 | 0.006 % |
+| 2.0.3 at 220 KiB to 2.0.3 aligned at 196 KiB | **0.007 %** |
+
+Every buffer moved to a different address and every kernel held. That refines
+the placement story rather than contradicting it: what the kernels are
+sensitive to is a buffer's offset within its page and bank, which the
+allocation sequence fixes, not its absolute address, which the region's base
+sets. Fourth independent confirmation of the instrument floor at ~6 ppm.
