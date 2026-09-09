@@ -401,3 +401,66 @@ overflow. Decomposition, levers and the two floor functions are in
 says plainly. For the double-free abort: one block cannot be handed to two
 owners. That is the trade being taken knowingly, and the cost is now measured
 rather than assumed.
+
+## rusty_alloc 2.0.2 verified, and the placement hypothesis settled (2026-09-09)
+
+2.0.2 took the levers `rusty_alloc/docs/plans/firmware-code-size.md` proposed
+and claims the firmware flash cost roughly halved. Re-measured here rather
+than accepted, on this board, same firmware source, same 220 KiB budget, same
+five buffers.
+
+### The size claim holds
+
+| | esp-alloc | 2.0.1 | **2.0.2** |
+|---|---:|---:|---:|
+| `.text` | 50,337 | 62,417 | **54,221** |
+| `.rodata` | 7,724 | 10,124 | **9,828** |
+| `.data` | 2,300 | 4,404 | **4,396** |
+| **flash delta** | — | **+16,584** | **+8,084** |
+| attributable symbols | 1,043 / 6 | 16,256 / 57 | **8,297 / 37** |
+| static RAM delta | — | +3,092 | **+3,052** |
+
+**-51.3 % of the flash cost.** Upstream quotes +7,860 against our +8,084; the
+224-byte gap is this seam's own additions, not theirs — the three new `Error`
+variants and their `Display` strings landed after their measurement. Their
+attributable figure (8,262) and ours (8,297) agree to 35 bytes.
+
+Every symbol the plan named is gone from the linked image: `adopt_segment`,
+`drain_delayed`, `try_guarded`, `Random::refill`, and `init_thread_heap` —
+the last being the one the plan explicitly refused to put a number on, now
+replaced by a 966-byte `create_heap`. The `.stack` identity still holds to the
+byte: static growth of 3,052 against `.stack` shrinking by exactly 3,052.
+
+### The controlled experiment: it was placement, not code
+
+The 2026-09-08 row found four of eight kernels moving 3.3 % to -7.7 % between
+allocators, and argued from the mixed sign that this was where the buffers
+landed rather than anything the allocator did. 2.0.2 tests that properly,
+because it changes the allocator's **code** enormously while leaving its
+**allocation behaviour** untouched:
+
+| comparison | what changed | worst kernel delta |
+|---|---|---:|
+| esp-alloc to rusty 2.0.1 | code **and** addresses | **7.698 %** |
+| rusty 2.0.1 to rusty 2.0.2 | code only, ~half of it removed | **0.006 %** |
+
+**All eight kernels agree across 2.0.1 and 2.0.2 to within 0.006 %**, after
+half the allocator's code was deleted. Two arms discriminate the two
+explanations cleanly: if the allocator's code were inside those measurements,
+removing 8 KB of it would move them, and it does not. The 7.7 % was buffer
+placement.
+
+That also makes this the third independent confirmation of the instrument's
+floor at roughly six parts per million, now including a full reflash and a
+different allocator build.
+
+**The transferable caution stands and is now proven rather than argued:**
+changing an allocator can move a compute benchmark by 8 % without executing a
+single instruction inside the measured region. Kernel numbers are not
+comparable across an allocator change.
+
+### Geometry, unchanged
+
+`used=200704 free=24576` at every stage, identical to 2.0.1 and to the
+prediction: three 64 KiB segments plus the 4 KiB page, 24,576 bytes stranded
+by the granule.
