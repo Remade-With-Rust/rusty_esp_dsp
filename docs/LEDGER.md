@@ -355,3 +355,80 @@ alignment-checked cast — a new dependency on a `forbid(unsafe_code)` crate —
 or a change to the `Element` trait's buffer type. Both are decisions about
 the architecture rather than optimisations of it, so this is recorded and
 left alone.
+
+## I10 — the seams next door (2026-09-19)
+
+I9 said the audio elements were an untouched seam and found sixteen wins in
+them. The same question asked of `rusty_esp_signal-core` and
+`rusty_esp_image-core` found two more. The probe now runs **36 kernels** in
+one binary, which is what makes small wins claimable: the null-arm floor read
+4.6% on the flash that grew the binary by two crates and **0.01% or 0.00%** on
+every flash after it.
+
+**Eleven wins, byte-identical**, against this pass's baseline:
+
+| kernel | before | after | |
+|---|---:|---:|---:|
+| `testpattern_rgb565` | 1 458 528 | 308 538 | **−78.8%** |
+| `rotate90_gray8` | 138 358 | 59 806 | **−56.8%** |
+| `ld2410_feed` | 718 372 | 433 673 | **−39.6%** |
+| `csi_wander` | 13 029 625 | 10 029 346 | **−23.0%** |
+| `csi_features` | 2 253 130 | 1 895 793 | **−15.9%** |
+| `biquad_mono` | 1 125 673 | 1 032 878 | **−8.2%** |
+| `agc_i16` | 1 296 280 | 1 194 643 | **−7.8%** |
+| `mono_to_stereo` | 102 219 | 94 285 | **−7.0%** |
+| `dc_block_mono` | 823 889 | 808 593 | **−1.9%** |
+
+### ★★ The census found a spill that the SOURCE said was an optimisation
+
+`compute_wander`'s inner loop was 34 instructions for two elements, and TEN
+were `l32i.n a?, a1, N` — reloads off the stack pointer — plus a spill store.
+The cause was a change made EARLIER IN THIS SAME PASS: two accumulators each
+for the sum and the squares, to break the dependency chain. Four `u64`
+accumulators is eight 32-bit registers, past the Xtensa window. Ledger I8
+already contains this exact law — *eight `u16` maxima fit the window, eight
+`i64` accumulators do not* — and it was broken anyway, because the split was
+bundled with three other changes and never measured on its own. One
+accumulator each: **−15.3%**.
+
+**A technique that is a law in one kernel is a hypothesis in the next, and
+bundling it with other changes is how it stops being tested.**
+
+### ★ Same-build A/B — and the one probe that lied
+
+Two leaf functions cannot be compared across builds here, so put BOTH arms in
+one binary. That settled `isqrt` in a single flash: the restoring
+square root (sixteen shift-compare-subtract steps, no division) is **+54.4%
+worse** than Newton's four steps with a `quou` in each. Divide-free is not
+free when the divide is an instruction. It is *correct* — an exhaustive sweep
+of all 2^32 inputs agrees with Newton everywhere, in 99 s — so this is a
+speed refutation, not a correctness one.
+
+**But a same-build A/B is still one probe.** `rotate180`'s reversed-chunk
+rewrite read **−9.1%** that way, and **identical to within 8 ps in the five
+builds after it**. One probe said win, five said wash: the −9.1% was codegen
+that did not survive two more crates entering the binary. The win is
+**retracted**; the code stays for being byte-identical and clearer.
+
+### The other findings
+
+- **`TestPattern::grab` was an algebra problem wearing a loop.**
+  `colour_at(x, y)` depends on `y` only through `y == marker_y`, so a frame is
+  TWO distinct rows. It was also running two 64-bit divisions — libcalls —
+  *per pixel*, and re-matching the pixel format per pixel including an
+  `Unsupported` arm the constructor had already rejected. −78.8%.
+- **A transpose cannot make both sides sequential, so make both LOCAL.**
+  `rotate90_gray8` tiled 8×8: −52.5%. **T = 16 measured +422%** — a cliff, not
+  a slope.
+- **A no-op on the value is not a no-op on the code.**
+  `n.min(MAX_SUBCARRIERS)` cannot change `n`, and it is what lets the compiler
+  see `frame[sc]` is in bounds, retiring a compare and a panic branch that ran
+  `W · n` times a frame. −3.0%.
+- **The INPUT TYPE can be the proof.** `features` accumulates its variance in
+  `u32` because `iq: &[i8]` bounds every amplitude at `isqrt(16·2·128²) = 724`.
+  A `u64` accumulator here is `add.n` + `bltu` + a carry `mov` per element.
+- **A state machine's phase is invariant for the run it is in.** `feed_slice`
+  re-entered `step` for each of the 35 DATA bytes of a 45-byte report to move
+  one byte each. −39.6%.
+- Unroll widths again, per kernel: `mono_to_stereo` won at 16, `gain` **fell
+  off a cliff at 32 (+115.3%)** having won at 16, `agc` was flat at 8.

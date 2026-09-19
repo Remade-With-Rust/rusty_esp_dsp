@@ -26,6 +26,34 @@ pub const fn isqrt(v: u32) -> u32 {
     x
 }
 
+/// `floor(sqrt(v))` again, by restoring binary long division: two bits of
+/// radicand per step, sixteen steps, and NO division anywhere.
+///
+/// A candidate twin for [`isqrt`], kept beside it so the two can be measured
+/// in the SAME build -- the ESP32-S3 layout swings enough between builds
+/// (-8%..+12% on untouched kernels) that an across-build comparison of two
+/// leaf functions this small cannot be trusted. Newton converges in about
+/// four steps against this one's sixteen, but each of its steps is a 32-bit
+/// DIVIDE, and a divide is not pipelined on this core.
+///
+/// Gated exhaustively against [`isqrt`] over all 2^32 inputs.
+#[must_use]
+pub const fn isqrt_restoring(v: u32) -> u32 {
+    let mut rem: u32 = 0;
+    let mut root: u32 = 0;
+    let mut i: u32 = 16;
+    while i > 0 {
+        i -= 1;
+        root <<= 1;
+        rem = (rem << 2) | ((v >> (i * 2)) & 3);
+        if rem > root {
+            rem -= root + 1;
+            root += 2;
+        }
+    }
+    root >> 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -426,6 +426,20 @@ fn main() -> ! {
             Work { samples: na, ..Work::ZERO }
         });
 
+        let mut agc = rusty_esp_audio_core::elements::Agc::default();
+        measure("agc_i16", "sample", na, || {
+            let b = PcmBlock::new(f_mono, Micros(20_000), &mono).expect("blk");
+            let _ = agc.process(b, &mut mono_out);
+            Work { samples: na, ..Work::ZERO }
+        });
+
+        let mut vad = rusty_esp_audio_core::elements::EnergyVad::default();
+        measure("vad_i16", "sample", na, || {
+            let b = PcmBlock::new(f_mono, Micros(20_000), &mono).expect("blk");
+            let _ = vad.process(b, &mut mono_out);
+            Work { samples: na, ..Work::ZERO }
+        });
+
         // 16k -> 48k: in_r = 1, out_r = 3, so three output frames per input.
         let mut rs = LinearResampler::new(16_000, 48_000).expect("rs");
         let mut rs_out = vec![0u8; rs.max_output_frames(NA) * 2];
@@ -435,6 +449,116 @@ fn main() -> ! {
             Work { samples: na * 3, ..Work::ZERO }
         });
         report_memory("after_audio");
+    }
+
+    // ---- CSI presence kernels (rusty_esp_signal-core) --------------------
+    // `features` runs once per radio frame at 20-50 Hz; `push` folds a
+    // 50-frame window over up to 56 subcarriers on every one of them.
+    {
+        use rusty_esp_signal_core::radar::csi::{Config, CsiFrame, Layout, PresenceDetector};
+        use rusty_esp_dsp::esp_core::time::Micros;
+
+        // 64 interleaved (imaginary, real) i8 pairs, the shape the radio hands
+        // over. Deterministic, and spread over the whole i8 range so the
+        // amplitudes are not all one magnitude.
+        let iq: alloc::vec::Vec<i8> = (0..128)
+            .map(|i| (((i as i32) * 37) % 255 - 127) as i8)
+            .collect();
+        let frame = CsiFrame { timestamp: Micros(0), rssi: -50, channel: 6, iq: &iq };
+        let layout = Layout::LLTF_20MHZ;
+        let sc = layout.count() as u64;
+        measure("csi_features", "subcarrier", sc, || {
+            core::hint::black_box(frame.features(&layout).ok());
+            Work { samples: sc, ..Work::ZERO }
+        });
+
+        // The detector is 6.4 KiB of ring; box it rather than the stack.
+        let feats = frame.features(&layout).expect("features");
+        let mut det = alloc::boxed::Box::new(PresenceDetector::<50>::new(Config::default()));
+        let mut t = 0u64;
+        measure("csi_wander", "subcarrier", sc, || {
+            t += 20_000;
+            core::hint::black_box(det.push(&feats, Micros(t)));
+            Work { samples: sc, ..Work::ZERO }
+        });
+        report_memory("after_csi");
+    }
+
+    // ---- the LD2410 UART parser: a state machine driven one byte at a time
+    {
+        use rusty_esp_signal_core::radar::ld2410::Parser;
+        // The engineering-mode report: 45 bytes, of which 35 are a DATA
+        // section the state machine re-dispatches on for every single one.
+        const REPORT: [u8; 45] = [
+            0xF4, 0xF3, 0xF2, 0xF1, 0x23, 0x00, 0x01, 0xAA, 0x03, 0x1E, 0x00, 0x3C, 0x00, 0x00,
+            0x39, 0x00, 0x00, 0x08, 0x08, 0x3C, 0x22, 0x05, 0x03, 0x03, 0x04, 0x03, 0x06, 0x05,
+            0x00, 0x00, 0x39, 0x10, 0x13, 0x06, 0x06, 0x08, 0x04, 0x03, 0x05, 0x55, 0x00, 0xF8,
+            0xF7, 0xF6, 0xF5,
+        ];
+        let nb = REPORT.len() as u64;
+        let mut parser = Parser::new();
+        measure("ld2410_feed", "byte", nb, || {
+            let mut at = 0usize;
+            while at < REPORT.len() {
+                let (used, frame) = parser.feed_slice(&REPORT[at..]);
+                core::hint::black_box(&frame);
+                if used == 0 {
+                    break;
+                }
+                at += used;
+            }
+            Work { bytes: nb, ..Work::ZERO }
+        });
+    }
+
+    // ---- the pixel kernels the DSP crate did not take --------------------
+    {
+        use rusty_esp_image_core::ops;
+        measure("rotate90_gray8", "px", px, || {
+            let _ = ops::rotate90_gray8(&gray, W, H, &mut small);
+            Work::pixels(px)
+        });
+        // gray8, NOT rgb565: `small` is PX bytes, and an rgb565 source needs
+        // 2*PX, so `expect_len` rejected it and the first run measured an
+        // ERROR RETURN at 143 ps/px -- 0.03 cycles a pixel, which is what an
+        // impossible number looks like when a kernel never ran.
+        // The shape `rotate180` had before the cursor rewrite, kept HERE
+        // rather than in the crate so the two can be measured in one build --
+        // the optimised version shipped before it ever had a valid baseline
+        // (its first probe passed a half-sized destination and measured an
+        // error return), so this is how it earns one.
+        fn rotate180_as_written(src: &[u8], bpp: usize, dst: &mut [u8]) {
+            let n = src.len() / bpp;
+            for (i, s) in src.chunks_exact(bpp).enumerate() {
+                let o = (n - 1 - i) * bpp;
+                dst[o..o + bpp].copy_from_slice(s);
+            }
+        }
+        {
+            use rusty_esp_dsp::esp_core::frame::{Geometry, PixelFormat};
+            use rusty_esp_image_core::source::{ImageSource, TestPattern};
+            let g = Geometry::new(W, H, PixelFormat::Rgb565).expect("geom");
+            let mut tp = TestPattern::new(g, 30).expect("pattern");
+            measure("testpattern_rgb565", "px", px, || {
+                let _ = tp.grab(&mut rgb565);
+                Work::pixels(px)
+            });
+        }
+
+        measure("rotate180_as_written", "px", px, || {
+            rotate180_as_written(&gray, 1, &mut small);
+            Work::pixels(px)
+        });
+        measure("rotate180_gray8", "px", px, || {
+            let _ = ops::rotate180(&gray, 1, &mut small);
+            Work::pixels(px)
+        });
+        // No EOI in this buffer, so the scan runs its worst case -- which is
+        // the case a DMA over-read actually hits.
+        measure("jpeg_find_eoi", "byte", PX as u64, || {
+            core::hint::black_box(rusty_esp_image_core::jpeg::find_eoi(&gray));
+            Work { bytes: PX as u64, ..Work::ZERO }
+        });
     }
 
     measure("sad_8x8", "block", blocks, || {
