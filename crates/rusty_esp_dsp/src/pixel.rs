@@ -84,18 +84,14 @@ pub fn rgb565_to_rgb888(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     expect_len(dst, pixels * 3)?;
     // Four pixels per trip: one 2-byte load and one 3-byte store per trip is
     // mostly loop overhead and a dependent load-store pair. Same unpack.
-    let body = pixels / 4 * 4;
+    let body = pixels / 8 * 8;
     let (sb, st) = src.split_at(body * 2);
     let (db, dt) = dst[..pixels * 3].split_at_mut(body * 3);
-    for (s, d) in sb.chunks_exact(8).zip(db.chunks_exact_mut(12)) {
-        let p0 = unpack_rgb565(u16::from_le_bytes([s[0], s[1]]));
-        let p1 = unpack_rgb565(u16::from_le_bytes([s[2], s[3]]));
-        let p2 = unpack_rgb565(u16::from_le_bytes([s[4], s[5]]));
-        let p3 = unpack_rgb565(u16::from_le_bytes([s[6], s[7]]));
-        d[0..3].copy_from_slice(&p0);
-        d[3..6].copy_from_slice(&p1);
-        d[6..9].copy_from_slice(&p2);
-        d[9..12].copy_from_slice(&p3);
+    for (s, d) in sb.chunks_exact(16).zip(db.chunks_exact_mut(24)) {
+        for k in 0..8 {
+            let (i, o) = (k * 2, k * 3);
+            d[o..o + 3].copy_from_slice(&unpack_rgb565(u16::from_le_bytes([s[i], s[i + 1]])));
+        }
     }
     for (s, d) in st.chunks_exact(2).zip(dt.chunks_exact_mut(3)) {
         d.copy_from_slice(&unpack_rgb565(u16::from_le_bytes([s[0], s[1]])));
@@ -191,14 +187,18 @@ pub fn yuyv_to_gray8(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     // single dependent load-store pair wrapped in loop overhead, which an
     // in-order core cannot overlap; four give the loads room to pipeline.
     // Same bytes selected, so the output is identical.
-    let body = pixels / 4 * 4;
+    let body = pixels / 8 * 8;
     let (sb, st) = src.split_at(body * 2);
     let (db, dt) = dst[..pixels].split_at_mut(body);
-    for (s, d) in sb.chunks_exact(8).zip(db.chunks_exact_mut(4)) {
+    for (s, d) in sb.chunks_exact(16).zip(db.chunks_exact_mut(8)) {
         d[0] = s[0];
         d[1] = s[2];
         d[2] = s[4];
         d[3] = s[6];
+        d[4] = s[8];
+        d[5] = s[10];
+        d[6] = s[12];
+        d[7] = s[14];
     }
     for (s, d) in st.chunks_exact(2).zip(dt.iter_mut()) {
         *d = s[0];
@@ -226,6 +226,9 @@ pub fn downscale2x_gray8(src: &[u8], width: u32, height: u32, dst: &mut [u8]) ->
         let drow = &mut dst[oy * ow..oy * ow + ow];
         // Two output pixels per trip: one 4-load/1-store body is mostly loop
         // overhead. Same sums, same rounding.
+        // Two output pixels per trip. FOUR measured +2.8% WORSE on the S3
+        // (234,060 -> 240,629 ps/px_out, 2026-09-19): past two, this body
+        // stops being loop-overhead-bound and starts costing registers.
         let pairs = ow / 2 * 2;
         let (r0b, r0t) = r0.split_at(pairs * 2);
         let (r1b, r1t) = r1.split_at(pairs * 2);
