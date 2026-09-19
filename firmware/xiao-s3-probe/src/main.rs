@@ -361,6 +361,82 @@ fn main() -> ! {
         });
     }
 
+    // ---- audio element kernels (rusty_esp_audio-core) --------------------
+    // Per-sample DSP loops with accumulator chains and per-frame channel
+    // dispatch -- the shape that paid -43% on peak_abs_i16. Audited for
+    // ALLOCATION earlier and clean; never for instruction count.
+    {
+        use rusty_esp_audio_core::elements::{
+            Biquad, BiquadKind, DcBlock, Gain, LinearResampler, MonoToStereo, StereoToMono, mix_i16,
+        };
+        use rusty_esp_audio_core::pipeline::Element;
+        use rusty_esp_dsp::esp_core::pcm::{PcmBlock, PcmFormat, SampleFormat};
+        use rusty_esp_dsp::esp_core::time::Micros;
+
+        // 256 frames: the heap has ~11 KiB left and these are five buffers.
+        const NA: usize = 256;
+        let na = NA as u64;
+        let f_mono = PcmFormat::new(16_000, 1, SampleFormat::I16).expect("fmt");
+        let f_stereo = PcmFormat::new(16_000, 2, SampleFormat::I16).expect("fmt");
+
+        let mono: alloc::vec::Vec<u8> = (0..NA * 2).map(|i| (i % 251) as u8).collect();
+        let stereo: alloc::vec::Vec<u8> = (0..NA * 4).map(|i| (i % 241) as u8).collect();
+        let mut mono_out = vec![0u8; NA * 2];
+        let mut stereo_out = vec![0u8; NA * 4];
+        report_memory("audio_buffers");
+
+        // Not unity: unity is a byte-exact copy shortcut and measures memcpy.
+        let mut gain = Gain::linear(0.5);
+        measure("gain_i16", "sample", na, || {
+            let b = PcmBlock::new(f_mono, Micros(0), &mono).expect("blk");
+            let _ = gain.process(b, &mut mono_out);
+            Work { samples: na, ..Work::ZERO }
+        });
+
+        let mut m2s = MonoToStereo;
+        measure("mono_to_stereo", "sample", na, || {
+            let b = PcmBlock::new(f_mono, Micros(0), &mono).expect("blk");
+            let _ = m2s.process(b, &mut stereo_out);
+            Work { samples: na, ..Work::ZERO }
+        });
+
+        let mut s2m = StereoToMono;
+        measure("stereo_to_mono", "frame", na, || {
+            let b = PcmBlock::new(f_stereo, Micros(0), &stereo).expect("blk");
+            let _ = s2m.process(b, &mut mono_out);
+            Work { samples: na, ..Work::ZERO }
+        });
+
+        measure("mix_i16", "sample", na, || {
+            let _ = mix_i16(&mono, &mono, &mut mono_out);
+            Work { samples: na, ..Work::ZERO }
+        });
+
+        let mut dc = DcBlock::new();
+        measure("dc_block_mono", "sample", na, || {
+            let b = PcmBlock::new(f_mono, Micros(0), &mono).expect("blk");
+            let _ = dc.process(b, &mut mono_out);
+            Work { samples: na, ..Work::ZERO }
+        });
+
+        let mut bq = Biquad::new(BiquadKind::LowPass { f0: 3000.0, q: 0.7071 });
+        measure("biquad_mono", "sample", na, || {
+            let b = PcmBlock::new(f_mono, Micros(0), &mono).expect("blk");
+            let _ = bq.process(b, &mut mono_out);
+            Work { samples: na, ..Work::ZERO }
+        });
+
+        // 16k -> 48k: in_r = 1, out_r = 3, so three output frames per input.
+        let mut rs = LinearResampler::new(16_000, 48_000).expect("rs");
+        let mut rs_out = vec![0u8; rs.max_output_frames(NA) * 2];
+        measure("resample_16k_48k", "out_frame", na * 3, || {
+            let b = PcmBlock::new(f_mono, Micros(0), &mono).expect("blk");
+            let _ = rs.process(b, &mut rs_out);
+            Work { samples: na * 3, ..Work::ZERO }
+        });
+        report_memory("after_audio");
+    }
+
     measure("sad_8x8", "block", blocks, || {
         let stride = W as usize;
         let mut sum = 0u32;

@@ -1256,6 +1256,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusty_esp_audio-core"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "libm",
+ "rusty_esp_core",
+ "rusty_esp_dsp",
+]
+
+[[package]]
 name = "rusty_esp_core"
 version = "0.1.0"
 
@@ -1653,6 +1663,7 @@ dependencies = [
  "esp-hal",
  "esp-println",
  "rusty_esp_alloc",
+ "rusty_esp_audio-core",
  "rusty_esp_dsp",
 ]
 

@@ -32,6 +32,10 @@ esp-backtrace = { version = "=0.20.0", features = ["esp32s3", "panic-handler", "
 # The kernels and the measurement discipline, no_std: the same code the host
 # share table measured, so the two are comparable per unit.
 rusty_esp_dsp = { path = "../../crates/rusty_esp_dsp", default-features = false }
+# The audio element kernels (gain, channels, DC block, biquad, resampler).
+# Audited for ALLOCATION earlier and found clean; never for instruction count,
+# which is a different question. Measured here so they get a null arm too.
+rusty_esp_audio-core = { path = "../../../rusty_esp_audio/crates/rusty_esp_audio-core", default-features = false, features = ["alloc"] }
 
 [features]
 # The allocator arm. Exactly one, and the default is esp-hal's standard so
@@ -63,3 +67,9 @@ opt-level = "z"
 panic = "abort"
 
 [workspace]
+
+# audio-core takes rusty_esp_dsp from git; the probe takes it by path. Without
+# this the graph carries TWO copies and the kernels measured are not the ones
+# being edited -- the reachability trap, as a build-graph bug.
+[patch."https://github.com/Remade-With-Rust/rusty_esp_dsp"]
+rusty_esp_dsp = { path = "../../crates/rusty_esp_dsp" }

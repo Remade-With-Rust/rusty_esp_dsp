@@ -269,3 +269,89 @@ op-count is not emitted op-count.
 `sad_16x16` **44%** on layout alone, its loop untouched at 129 instructions:
 that kernel's ~400-byte loop is acutely cache-line sensitive, which is also
 why it must be judged against same-run neighbours and never across builds.
+
+## I9 — the audio element kernels (2026-09-19)
+
+The elements in `rusty_esp_audio-core` were audited for ALLOCATION in the
+codec-memory-copies pass and found clean. Nobody had asked the other question.
+The probe grew from 19 kernels to 26 so they would be measured beside the DSP
+ones, which makes every run carry its own null arm; the floors were **2.0%**
+on the first flash and **0.01%** on each of the next three.
+
+**Sixteen wins, byte-identical, against the pass baseline:**
+
+| kernel | before | after | |
+|---|---:|---:|---:|
+| `gain_i16` | 560 807 | 203 450 | **−63.7%** |
+| `mono_to_stereo` | 247 962 | 100 898 | **−59.3%** |
+| `dc_block_mono` | 1 557 768 | 822 003 | **−47.2%** |
+| `resample_16k_48k` | 4 126 993 | 2 207 318 | **−46.5%** |
+| `mix_i16` | 385 505 | 222 825 | **−42.2%** |
+| `biquad_mono` | 1 781 711 | 1 124 517 | **−36.9%** |
+| `stereo_to_mono` | 385 524 | 261 556 | **−32.2%** |
+
+ps per sample (per output frame for the resampler), ESP32-S3.
+
+### The five techniques, and that four of them were already in this ledger
+
+**A quantity is a property of the CALL, not of the sample.** `Gain` formed an
+`i64` product for a range `|x| ≤ 32768, |q15| ≤ 65535` cannot reach (the
+product is at most 2^31 − 2^15, so the rounding term still fits `i32`), and
+hoisting that test out of the loop is −26.8%. `DcBlock` and `Biquad` re-read
+and wrote back two and four state words **through the struct** every frame,
+because the channel loop hid that `ch` is fixed for the block; resolving
+`ch == 1` / `ch == 2` once holds the state in registers, −28.0% and −20.4%.
+The resampler's `frame()` multiplied by a runtime frame size for a channel
+loop that runs once: a mono arm is −30.8%.
+
+**A clamp that cannot fire.** `Gain::apply` clamped to the `i32` range and
+then saturated to `i16`. `i16` is a subset of `i32`, so the first clamp could
+never change an outcome the second did not.
+
+**A value computed twice in two units.** `libm::roundf(x)` IS
+`truncf(x + copysignf(0.5 − 0.25·EPSILON, x))`, and the `as i16` after it
+truncates toward zero as well — the float unit computed what the cast then
+recomputed. Fusing them is −26.7% on `dc_block` and −20.7% on `biquad`. This
+is an ALGEBRAIC claim about someone else's implementation, which a corpus can
+only fail to refute, so it is gated by a sweep of all 2^32 `f32` bit patterns
+(`tests/round_sat16_exhaustive.rs`, 13 s in release) rather than by samples.
+
+**A 64-bit division is a libcall on this core.** `(rem << 32) / out_r` — and
+`out_r` is a *reduced* rate ratio, so it fits 16 bits and long division in
+base 2^16 gives the identical quotient from two 32-bit divides, which are
+instructions: −12.7%. Carrying `idx`/`rem` instead of recomputing them
+retires two MORE divisions per output frame and measured **−1.3% inside a
+2.0% floor** — real work removed, unresolvable, not counted.
+
+**Unroll width is per kernel and only measurement knows it.** `gain` won at 4
+(−40.5%), again at 8 (−9.0%) and again at 16 (−8.5%). `mono_to_stereo` won at
+4 (−54.3%) and at 8 (−10.9%). `mix_i16` won at 4 (−43.8%) and **lost at 8
+(+23.4%)** — its body is the largest of the three movers, so it stops one step
+earlier. Same law as I8, three more data points.
+
+### Refuted, measured worse, reverted
+
+`t.clamp(-32768.0, 32767.0) as i16` in `round_sat16`: identical for all 2^32
+patterns, reads better, and cost `dc_block` **+12.1%** and `biquad` **+6.5%**.
+Branching to a constant wins because the saturating cast does not fold away
+after `clamp` the way it does after a range-proving branch.
+
+Both reverts were **confirmed on the chip, not assumed**: `dc_block` returned
+to 822 003 against the 822 060 it left, `biquad` to 1 124 517 against
+1 124 618.
+
+### ★ The largest lever here is still unspent, and it is an architecture question
+
+**Every i16 access in every element is BYTE-WISE.** A census of the flashed
+ELF reads `halfword ld/st = 0` in all five element loops, while the same
+firmware emits 88 halfword ops — every one of them from the DSP kernels that
+take `&[i16]`. `StereoToMono` spends **56 of its 72 loop instructions**
+(24 byte ld/st, 8 `slli`, 8 `or`, 8 `sext`, 8 `srli`) marshalling bytes into
+i16s and back, to do four adds and four shifts.
+
+The cause is not the loops: `PcmBlock` carries `&[u8]`, `l16ui` needs 2-byte
+alignment, and LLVM cannot prove a `&[u8]` has it. Closing it needs a safe
+alignment-checked cast — a new dependency on a `forbid(unsafe_code)` crate —
+or a change to the `Element` trait's buffer type. Both are decisions about
+the architecture rather than optimisations of it, so this is recorded and
+left alone.
