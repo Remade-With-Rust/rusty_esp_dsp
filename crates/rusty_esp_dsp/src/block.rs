@@ -97,10 +97,27 @@ pub fn hadamard_4x4(block: &[i32; 16]) -> [i32; 16] {
 /// range that cannot be reached. The returned value is unchanged.
 #[must_use]
 pub fn satd_4x4(block: &[i32; 16]) -> i64 {
-    let m = hadamard_4x4(block);
+    // Fused with the transform: run the four ROW butterflies, then take each
+    // COLUMN butterfly's four outputs straight into the accumulator. The
+    // separate `hadamard_4x4` writes its 16 results to an array that this
+    // function immediately reads back, and that round trip is what the
+    // flashed image spends its spill slots on. Same butterflies, same
+    // coefficients; the sum is over the same sixteen magnitudes in a
+    // different order, which is exact in u32 either way.
+    let (a0, b0, c0, d0) = hadamard_1d(block[0], block[1], block[2], block[3]);
+    let (a1, b1, c1, d1) = hadamard_1d(block[4], block[5], block[6], block[7]);
+    let (a2, b2, c2, d2) = hadamard_1d(block[8], block[9], block[10], block[11]);
+    let (a3, b3, c3, d3) = hadamard_1d(block[12], block[13], block[14], block[15]);
+
     let mut acc: u32 = 0;
-    for &v in &m {
-        acc += v.unsigned_abs();
+    for (w, x, y, z) in [
+        (a0, a1, a2, a3),
+        (b0, b1, b2, b3),
+        (c0, c1, c2, c3),
+        (d0, d1, d2, d3),
+    ] {
+        let (p, q, r, s) = hadamard_1d(w, x, y, z);
+        acc += p.unsigned_abs() + q.unsigned_abs() + r.unsigned_abs() + s.unsigned_abs();
     }
     i64::from(acc)
 }
