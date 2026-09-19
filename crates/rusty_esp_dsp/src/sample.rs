@@ -10,18 +10,30 @@
 pub mod pcm;
 
 /// `Σ a[i] · b[i]` over the shorter of the two slices, exact in `i64`.
+///
+/// The PRODUCT is formed in `i32` and only then widened: two `i16`s multiply
+/// to at most `32 768 · 32 768 = 2^30`, which is exact in `i32`, so the value
+/// is identical — but a 32-bit core does it in one `mull` instead of the
+/// multi-instruction 64×64 sequence `i64 · i64` compiles to. The ACCUMULATOR
+/// stays `i64`, which is where the range is genuinely needed.
 #[must_use]
 pub fn dot_i16(a: &[i16], b: &[i16]) -> i64 {
     a.iter()
         .zip(b)
-        .map(|(&x, &y)| i64::from(x) * i64::from(y))
+        .map(|(&x, &y)| i64::from(i32::from(x) * i32::from(y)))
         .sum()
 }
 
-/// `Σ a[i]²`, exact in `i64`.
+/// `Σ a[i]²`, exact in `i64`. The square is formed in `i32` (at most `2^30`,
+/// see [`dot_i16`]) and widened for the accumulate.
 #[must_use]
 pub fn sum_sq_i16(a: &[i16]) -> i64 {
-    a.iter().map(|&x| i64::from(x) * i64::from(x)).sum()
+    a.iter()
+        .map(|&x| {
+            let v = i32::from(x);
+            i64::from(v * v)
+        })
+        .sum()
 }
 
 /// Sum of squares and sample count over little-endian `i16` bytes; a
@@ -31,8 +43,10 @@ pub fn sum_sq_i16_le(samples: &[u8]) -> (i64, usize) {
     let mut acc: i64 = 0;
     let mut n: usize = 0;
     for s in samples.chunks_exact(2) {
-        let v = i64::from(i16::from_le_bytes([s[0], s[1]]));
-        acc += v * v;
+        // Square in i32 (at most 2^30, exact) and widen for the accumulate;
+        // `i64 * i64` here was a 64x64 multiply per sample on a 32-bit core.
+        let v = i32::from(i16::from_le_bytes([s[0], s[1]]));
+        acc += i64::from(v * v);
         n += 1;
     }
     (acc, n)
