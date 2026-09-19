@@ -917,3 +917,43 @@ Not flashed: one joins Wi-Fi and the operator is remote, and there is no
 camera on this desk. The pixel arm is therefore 96x96, runs last with the
 JPEG slot already dropped, and prints a reason and returns on every failure
 path rather than disturbing the I1 numbers.
+
+### R3 addendum — the six block kernels are ORACLES, and the census mislabelled them
+
+R1 and R3 both filed `sad_16x16`, `sad_8x8`, `satd_4x4(_sum)`, `residual_4x4`
+and `hadamard_4x4` under "no shipping caller", with the implication that this
+is a gap. It is not. `block.rs` says what they are, and it says it in the
+first paragraph:
+
+> The S3 / P4 twins of these (D3) go upstream through `rusty_h264`'s accel
+> seam; **this module is where their oracle lives.**
+
+`Cargo.toml` carries `rusty_h264-common = "0.14"` as a dev-dependency and
+`tests/h264_oracle.rs` demands byte-identity against its transform over a
+generated corpus. These kernels exist to be the scalar reference that a
+vector twin is gated against. **An oracle is correctly not on a hot path**;
+wiring one into a firmware to move a reachability number would be a category
+error, and would also be the exact defect the census exists to find, pointed
+backwards.
+
+**The denominator was wrong, not the numerator.** Of the 39:
+
+| | |
+|---|---|
+| **20** | reachable and shipping |
+| **6** | oracles by design — correctly unreachable |
+| **4** | pre-positioned for a planned deployment (the CSI/LD2410 kill tests) |
+| **9** | no honest consumer in any firmware that exists |
+
+So the shippable set is **20 of 33**, and the nine are a question about the
+API surface rather than about wiring: `Gain` (AGC covers it), `MonoToStereo`,
+`StereoToMono`, `mix_i16` (a mono path), `LinearResampler`, `Convert`,
+`pcm::convert` (the mic and the wire are both 16 kHz i16),
+`EnergyVad::process` (would recompute the RMS the firmware already has), and
+`dot_i16` (a correlation nothing correlates).
+
+**The lesson for the census itself: classify a kernel's INTENT before
+counting it.** "Production-reachable" is the right question for a kernel
+meant to ship, and the wrong question for one deliberately kept as an oracle
+or a fixture. A census that does not separate them reports a gap where there
+is a design.
