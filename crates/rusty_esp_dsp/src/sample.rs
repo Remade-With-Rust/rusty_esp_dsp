@@ -70,22 +70,12 @@ pub fn sum_sq_i16_le(samples: &[u8]) -> (i64, usize) {
     // a second load, a shift and an or. The byte arm below is the oracle and
     // takes a misaligned or odd-length buffer.
     if let Some(v) = rusty_esp_core::pcm::as_i16(samples) {
-        let (mut a0, mut a1, mut a2, mut a3) = (0i64, 0i64, 0i64, 0i64);
-        let mut c = v.chunks_exact(4);
-        for s in c.by_ref() {
-            let (v0, v1) = (i32::from(s[0]), i32::from(s[1]));
-            let (v2, v3) = (i32::from(s[2]), i32::from(s[3]));
-            a0 += i64::from(v0 * v0);
-            a1 += i64::from(v1 * v1);
-            a2 += i64::from(v2 * v2);
-            a3 += i64::from(v3 * v3);
-        }
-        let mut tail = 0i64;
-        for &s in c.remainder() {
-            let x = i32::from(s);
-            tail += i64::from(x * x);
-        }
-        return ((a0 + a1) + (a2 + a3) + tail, v.len());
+        // The aligned arm IS `sum_sq_i16` -- same four accumulators, same
+        // u32 square, same tail. It was written out here first, which made it
+        // a hand-rolled twin of a kernel three lines up; calling it instead
+        // means one loop to optimise and one to gate, and it gives
+        // `sum_sq_i16` the production caller it did not have.
+        return (sum_sq_i16(v), v.len());
     }
 
     // Four samples (eight bytes) per trip into four independent

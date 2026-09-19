@@ -129,14 +129,14 @@ fn neither_cheaper_tail_is_bit_identical_but_both_are_far_inside_a_millidecibel(
     let mut checked: u64 = 0;
     let (mut d_ns, mut d_32) = (0u64, 0u64);
     let (mut w_ns, mut w_32) = (0.0f64, 0.0f64);
-    let mut note = |acc: i64, n: usize| {
+    let note = |acc: i64, n: usize| {
         if n == 0 || acc <= 0 {
             return None;
         }
         let a = tail_f64(acc, n);
         Some((a, tail_f64_nosqrt(acc, n), tail_f32(acc, n)))
     };
-    let mut feed = |acc: i64, n: usize, checked: &mut u64, d_ns: &mut u64, d_32: &mut u64,
+    let feed = |acc: i64, n: usize, checked: &mut u64, d_ns: &mut u64, d_32: &mut u64,
                     w_ns: &mut f64, w_32: &mut f64| {
         if let Some((a, ns, f3)) = note(acc, n) {
             *checked += 1;

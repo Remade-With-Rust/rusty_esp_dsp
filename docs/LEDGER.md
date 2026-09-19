@@ -851,3 +851,69 @@ A corpus can only ever FAIL TO REFUTE a claim about rounding. Where the claim
 is "these two float expressions produce identical bits", the corpus has to be
 millions of points or it is not evidence. `tests/rms_tail_tradeoff.rs` keeps
 both the sweep and the refutation.
+
+## R3 — 4 of 39 to 20 of 39 (2026-09-19)
+
+R1 found four production-reachable kernels and one firmware doing all the
+reaching. This is what could honestly be wired, and what could not.
+
+### Now reachable (20)
+
+**Audio, through `xiao-s3-sense-idf-pdm-udp` (8):** `rms_dbfs_i16`,
+`sum_sq_i16_le`, `sum_sq_i16`, `DcBlock`, `EnergyVad::judge`, **`Biquad`**,
+**`Agc`**, **`peak_abs_i16`**. The pipeline was one stage; it is now the three
+a voice front end actually has — offset out, rumble out, level up — and each
+block reports its PEAK as well as its RMS, because RMS hides clipping and
+make-up gain is where clipping appears.
+
+**Image, through `xiao-s3-sense-idf-capture` (12):** all seven pixel kernels,
+`rotate90_gray8`, `rotate180`, `crop`, `jpeg::probe`, `jpeg::find_eoi`.
+
+### The single decision that unlocked twelve of them
+
+`IdfCamera::init` rejected everything but JPEG, and `Mode` had only a
+`jpeg()` constructor. **`grab` was already format-agnostic.** One format gate
+and one assignment later the sensor can be asked for RGB565, YUYV422 or
+GRAYSCALE, and the I1 bench can say what a preview path costs.
+
+**When a whole category of kernels is unreachable, look for the ONE upstream
+decision** — it was never forty missing call sites, it was a camera that could
+only be asked for JPEG.
+
+### `crop` had no caller anywhere, and `sum_sq_i16` had a twin
+
+`crop` was called by nothing in the tree — not even the probe. And the aligned
+arm added to `sum_sq_i16_le` in I13 was a hand-rolled copy of `sum_sq_i16`
+three lines above it: same four accumulators, same `u32` square, same tail.
+Calling it instead is **−0.1%**, i.e. free, and turns two loops into one.
+**Check for the twin every time you add a fast arm.**
+
+### Still unreachable (19), with the reason for each
+
+| kernels | why |
+|---|---|
+| `sad_16x16`, `sad_8x8`, `satd_4x4(_sum)`, `residual_4x4`, `hadamard_4x4` | they are H.264 motion-estimation kernels and **`rusty_h264` is not in this tree** — they were written to match a codec that lives in another project |
+| `isqrt`, `CsiFrame::features`, `PresenceDetector::push`, `ld2410::feed` | driven by the on-radio kill tests during a trip, by `c6-mesh-node`'s own design — not a defect |
+| `Gain`, `MonoToStereo`, `StereoToMono`, `mix_i16`, `LinearResampler`, `Convert`, `pcm::convert` | no honest use in a mono 16 kHz PDM to UDP path |
+| `EnergyVad::process` | would recompute the `rms_dbfs_i16` the firmware already has; calling `judge` directly is the correct choice |
+| `dot_i16` | a correlation with no consumer |
+| `TestPattern::grab` | its only non-test constructor is behind a cargo feature the sketch firmware disables |
+
+**Neither remaining group is a wiring job.** Adding call sites to move this
+number would be the same defect the census exists to find, pointed the other
+way.
+
+### Both firmwares were BUILT, neither was flashed
+
+`cargo build --release` on the ESP-IDF target, exit 0 for both (964 KB and
+837 KB), compiling the local sibling crates. Three environment blockers had
+to go first, and the third is worth writing down: **a `python` on PATH that is
+itself a virtualenv** makes `sys.prefix != sys.base_prefix`, and
+`idf_tools.py` refuses whatever `VIRTUAL_ENV` says. Pointing PATH at the base
+interpreter is the fix. (The others: an output path over 10 characters, fixed
+with `CARGO_TARGET_DIR=C:/janus-*`; and a nested venv.)
+
+Not flashed: one joins Wi-Fi and the operator is remote, and there is no
+camera on this desk. The pixel arm is therefore 96x96, runs last with the
+JPEG slot already dropped, and prints a reason and returns on every failure
+path rather than disturbing the I1 numbers.
