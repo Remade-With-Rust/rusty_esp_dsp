@@ -157,3 +157,51 @@ spills** — purely load-bound, matching the standing finding that SAD does not
 reward wider SIMD. It is not the place to start.
 
 Instrument and the full laws: `rusty-esp-embedded` §21 + its `xtensa_census.py`.
+
+## I7: ten deterministic wins on the reduction kernels (2026-09-19)
+
+Follow-on to I6, after extending `xiao-s3-probe` to measure the sample and
+block reductions. Every change byte-identical, gated by `tests/moved.rs`
+(pre-move implementations over a generated corpus) and `tests/h264_oracle.rs`
+(rusty_h264-common's transform); 26 tests green throughout.
+
+### Measured on the S3, over serial
+
+| kernel | baseline | final | |
+|---|---:|---:|---:|
+| `yuyv_to_gray8` | 137,735 | **62,686** ps/px | **−54.5%** |
+| `peak_abs_i16` | 151,379 | **88,988** ps/sample | **−41.2%** |
+| `satd_4x4_sum` | 4,636,823 | **2,761,318** ps/block | **−40.4%** |
+| `sum_sq_i16` | 240,203 | **168,840** ps/sample | **−29.7%** |
+| `sum_sq_i16_le` | 289,020 | **220,590** ps/sample | **−23.7%** |
+| `dot_i16` | 294,660 | **257,532** ps/sample | **−12.6%** |
+
+Ten wins across three techniques, in descending yield:
+
+1. **Break the loop-carried dependency** (4 wins). `acc += ...` over a slice
+   makes every add wait on the previous one. Four independent accumulators —
+   or four running maxima — are byte-identical for integer work and let the
+   adds issue back to back: `peak_abs_i16` −43.3%, `sum_sq_i16` −25.0%,
+   `sum_sq_i16_le` −20.2%, `dot_i16` −7.0%. **The instruction count barely
+   moves; this is pure instruction-level parallelism.**
+2. **Stop using 64-bit arithmetic for range that cannot be reached** (4 wins).
+   Two i16s multiply to at most 2^30, exact in i32, so `i64 * i64` bought
+   nothing and cost a multi-instruction 64×64 sequence: −4.2 to −8.7%.
+   `satd_4x4`'s i64 accumulator had the same problem against a maximum of
+   65,280 — **−29.4%, loop 313 → 217 instructions, spills 113 → 80.**
+3. **Remove a round trip through memory** (1 win) and **amortise loop
+   overhead** (1 win). Fusing the Hadamard into `satd_4x4` so the sixteen
+   coefficients never reach an array: −15.7%, spills 80 → 51, stores 39 → 22.
+   Unrolling `yuyv_to_gray8` 4× (a strided byte copy costing 33 cycles per
+   output byte): −54.5%.
+
+### The null arm was free, and it is what makes these verdicts
+
+Every run measures sixteen kernels; the ones a change does not touch are its
+null arm. At best they reproduced **exactly** — five kernels bit-for-bit
+identical across the satd-fusion pair of runs — and the widest layout-driven
+mover on any run was 4.9%. Each claimed win clears its run's band by 1.5× to
+11×. Two changes were REFUTED on this evidence and reverted: rewriting
+`u8::abs_diff` as `(i32 − i32).unsigned_abs()` produced a byte-identical
+function (LLVM already lowers it that way), and row-slicing `residual_4x4`
+could not be separated from a ±8% layout swing in its own run.
