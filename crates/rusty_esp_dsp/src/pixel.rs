@@ -130,15 +130,24 @@ pub fn downscale2x_gray8(src: &[u8], width: u32, height: u32, dst: &mut [u8]) ->
     let (ow, oh) = (w / 2, h / 2);
     let out = Geometry::new(ow as u32, oh as u32, PixelFormat::Gray8)?;
     expect_len(dst, ow * oh)?;
+    // Slice both source rows to exactly the span this row reads and slice the
+    // destination row too, then walk them as fixed 2-byte chunks. Indexing
+    // `r0[2 * ox + 1]` and `dst[oy * ow + ox]` left the compiler unable to
+    // prove either index in range, so each output pixel carried its own
+    // bounds checks. Same arithmetic, same order, identical output bytes.
+    let span = ow * 2;
     for oy in 0..oh {
-        let r0 = &src[(2 * oy) * w..(2 * oy) * w + w];
-        let r1 = &src[(2 * oy + 1) * w..(2 * oy + 1) * w + w];
-        for ox in 0..ow {
-            let sum = u32::from(r0[2 * ox])
-                + u32::from(r0[2 * ox + 1])
-                + u32::from(r1[2 * ox])
-                + u32::from(r1[2 * ox + 1]);
-            dst[oy * ow + ox] = ((sum + 2) / 4) as u8;
+        let r0 = &src[(2 * oy) * w..(2 * oy) * w + span];
+        let r1 = &src[(2 * oy + 1) * w..(2 * oy + 1) * w + span];
+        let drow = &mut dst[oy * ow..oy * ow + ow];
+        for ((a, b), d) in r0
+            .chunks_exact(2)
+            .zip(r1.chunks_exact(2))
+            .zip(drow.iter_mut())
+        {
+            let sum =
+                u32::from(a[0]) + u32::from(a[1]) + u32::from(b[0]) + u32::from(b[1]);
+            *d = ((sum + 2) / 4) as u8;
         }
     }
     Ok(out)
