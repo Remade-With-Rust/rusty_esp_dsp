@@ -533,3 +533,56 @@ in this family already has.
 **Why it is still not taken here.** It is a dependency (or a lint relaxation)
 in the foundation crate of the family, and that is the user's call, not an
 optimiser's. What has changed is that it is now a call with a number on it.
+
+### I11 — `StereoToMono` taken to the end (2026-09-19)
+
+The first kernel to spend the alignment finding. **385 524 -> 97 139 ps/frame,
+-74.8%**, null arm 0.00%, in four measured steps and byte-identical at every
+one:
+
+| | ps/frame | step |
+|---|---:|---|
+| as found | 385 524 | |
+| byte-path unrolling (4, then 16) | 255 159 | **-33.8%** |
+| the aligned arm at 8 a trip | 104 224 | **-59.2%** |
+| the aligned arm at 16 | 97 139 | **-6.8%** |
+
+**The ceiling probe predicted the outcome to 0.6 points.** It said -58.6% for
+this kernel before a line of the real change was written; the shipped result
+was -59.2%. A prediction that survives implementation is what separates a
+finding from a number, and it is the second time in this campaign the
+arithmetic has done that (the other was the sliding window, -77.8% predicted
+against -74.2% measured).
+
+**The seam.** `rusty_esp_core::pcm::as_i16` / `as_i16_mut` return
+`Option<&[i16]>`: the alignment is established ONCE per call, and `None` means
+"take the byte path". Every element keeps its byte loop as the oracle and as
+what a misaligned or big-endian buffer gets -- the same shape a scalar kernel
+keeps for its vector twin. One crate holds the decision, so no other manifest
+changes and no other crate loses `forbid(unsafe_code)`.
+
+The cost was honest and is recorded where it happened: `rusty_esp_core` went
+from `forbid(unsafe_code)` to `deny` with `#[allow]` on exactly two functions,
+six lines of `align_to` on a POD type. `bytemuck` would have needed no unsafe
+at all and was declined only because that crate is the base of nine repos and
+has zero dependencies; `lib.rs` records the trade and that reversing it is
+three lines.
+
+**The width is measured, not assumed** -- all five beside each other in ONE
+binary, byte-identity checked before any was timed:
+
+| frames/trip | 1 | 4 | 8 | **16** | 32 |
+|---|---:|---:|---:|---:|---:|
+| ps/frame | 249 207 | 112 723 | 104 224 | **97 332** | 178 832 |
+
+Thirty-two falls off the register-window cliff exactly as `Gain` does at the
+same width. **And the first column is the finding:** ONE frame a trip over
+aligned samples (249 207) is no better than SIXTEEN frames a trip over bytes
+(255 159). The access method and the unroll are worth about the same on this
+kernel, and they COMPOSE -- which is why the byte-path work done earlier in
+the campaign was not wasted when the aligned arm landed on top of it.
+
+**What the remaining elements are worth.** The ceiling probe priced `gain` at
+-47.7% and `mono_to_stereo` at -42.2% on the same basis, and `mix_i16`,
+`DcBlock`, `Biquad`, `Agc`, `Convert` and `LinearResampler` all read i16
+through the same byte path. None of them has been converted yet.
