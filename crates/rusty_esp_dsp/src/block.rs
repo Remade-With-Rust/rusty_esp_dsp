@@ -20,6 +20,21 @@ use crate::expect_len;
 fn sad<const W: usize, const H: usize>(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
     expect_len(a, (H - 1) * sa + W)?;
     expect_len(b, (H - 1) * sb + W)?;
+    // TWO REFUTATIONS, both measured on a XIAO ESP32-S3 (2026-09-19). Leave
+    // this loop alone unless you have new evidence.
+    //
+    // 1. `u8::abs_diff` -> `(i32::from(*x) - i32::from(*y)).unsigned_abs()`,
+    //    to trade a compare-and-select for one Xtensa `abs`, compiled to a
+    //    BYTE-IDENTICAL function: sad_16x16 157/129/33 and sad_8x8 96/68/16
+    //    either way. LLVM already lowers it that way.
+    // 2. Four independent accumulators over 4-wide chunks -- the technique
+    //    that won -43% on peak_abs_i16 and -25% on sum_sq_i16 -- made this
+    //    kernel WORSE: sad_16x16 +47.5% (21.58 -> 31.84 Mps/block), sad_8x8
+    //    +12.0%, with the census predicting it (loop 129 -> 131, spills
+    //    0 -> 2). This loop is load-bound and LLVM has already unrolled it;
+    //    the extra accumulators only added register pressure and chunk
+    //    bookkeeping. Dependency-breaking pays on a long ALU chain with few
+    //    loads, NOT on a loop that is already waiting on memory.
     let mut acc = 0u32;
     for r in 0..H {
         let ra = &a[r * sa..r * sa + W];

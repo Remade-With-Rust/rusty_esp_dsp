@@ -82,7 +82,22 @@ pub fn rgb565_to_rgb888(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     }
     let pixels = src.len() / 2;
     expect_len(dst, pixels * 3)?;
-    for (s, d) in src.chunks_exact(2).zip(dst.chunks_exact_mut(3)) {
+    // Four pixels per trip: one 2-byte load and one 3-byte store per trip is
+    // mostly loop overhead and a dependent load-store pair. Same unpack.
+    let body = pixels / 4 * 4;
+    let (sb, st) = src.split_at(body * 2);
+    let (db, dt) = dst[..pixels * 3].split_at_mut(body * 3);
+    for (s, d) in sb.chunks_exact(8).zip(db.chunks_exact_mut(12)) {
+        let p0 = unpack_rgb565(u16::from_le_bytes([s[0], s[1]]));
+        let p1 = unpack_rgb565(u16::from_le_bytes([s[2], s[3]]));
+        let p2 = unpack_rgb565(u16::from_le_bytes([s[4], s[5]]));
+        let p3 = unpack_rgb565(u16::from_le_bytes([s[6], s[7]]));
+        d[0..3].copy_from_slice(&p0);
+        d[3..6].copy_from_slice(&p1);
+        d[6..9].copy_from_slice(&p2);
+        d[9..12].copy_from_slice(&p3);
+    }
+    for (s, d) in st.chunks_exact(2).zip(dt.chunks_exact_mut(3)) {
         d.copy_from_slice(&unpack_rgb565(u16::from_le_bytes([s[0], s[1]])));
     }
     Ok(pixels)
@@ -95,7 +110,17 @@ pub fn rgb888_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     }
     let pixels = src.len() / 3;
     expect_len(dst, pixels * 2)?;
-    for (s, d) in src.chunks_exact(3).zip(dst.chunks_exact_mut(2)) {
+    // Four pixels per trip, as in rgb565_to_rgb888. Same pack.
+    let body = pixels / 4 * 4;
+    let (sb, st) = src.split_at(body * 3);
+    let (db, dt) = dst[..pixels * 2].split_at_mut(body * 2);
+    for (s, d) in sb.chunks_exact(12).zip(db.chunks_exact_mut(8)) {
+        d[0..2].copy_from_slice(&pack_rgb565(s[0], s[1], s[2]).to_le_bytes());
+        d[2..4].copy_from_slice(&pack_rgb565(s[3], s[4], s[5]).to_le_bytes());
+        d[4..6].copy_from_slice(&pack_rgb565(s[6], s[7], s[8]).to_le_bytes());
+        d[6..8].copy_from_slice(&pack_rgb565(s[9], s[10], s[11]).to_le_bytes());
+    }
+    for (s, d) in st.chunks_exact(3).zip(dt.chunks_exact_mut(2)) {
         d.copy_from_slice(&pack_rgb565(s[0], s[1], s[2]).to_le_bytes());
     }
     Ok(pixels)
@@ -108,7 +133,17 @@ pub fn yuyv_to_rgb888(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     }
     let pixels = src.len() / 2;
     expect_len(dst, pixels * 3)?;
-    for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(6)) {
+    // Four pixels (two macropixels) per trip. Same conversions.
+    let body = pixels / 4 * 4;
+    let (sb, st) = src.split_at(body * 2);
+    let (db, dt) = dst[..pixels * 3].split_at_mut(body * 3);
+    for (s, d) in sb.chunks_exact(8).zip(db.chunks_exact_mut(12)) {
+        d[0..3].copy_from_slice(&yuv_to_rgb(s[0], s[1], s[3]));
+        d[3..6].copy_from_slice(&yuv_to_rgb(s[2], s[1], s[3]));
+        d[6..9].copy_from_slice(&yuv_to_rgb(s[4], s[5], s[7]));
+        d[9..12].copy_from_slice(&yuv_to_rgb(s[6], s[5], s[7]));
+    }
+    for (s, d) in st.chunks_exact(4).zip(dt.chunks_exact_mut(6)) {
         d[..3].copy_from_slice(&yuv_to_rgb(s[0], s[1], s[3]));
         d[3..].copy_from_slice(&yuv_to_rgb(s[2], s[1], s[3]));
     }
@@ -122,7 +157,21 @@ pub fn yuyv_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     }
     let pixels = src.len() / 2;
     expect_len(dst, pixels * 2)?;
-    for (s, d) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+    // Four pixels (two macropixels) per trip. Same conversions and pack.
+    let body = pixels / 4 * 4;
+    let (sb, st) = src.split_at(body * 2);
+    let (db, dt) = dst[..pixels * 2].split_at_mut(body * 2);
+    for (s, d) in sb.chunks_exact(8).zip(db.chunks_exact_mut(8)) {
+        let [r0, g0, b0] = yuv_to_rgb(s[0], s[1], s[3]);
+        let [r1, g1, b1] = yuv_to_rgb(s[2], s[1], s[3]);
+        let [r2, g2, b2] = yuv_to_rgb(s[4], s[5], s[7]);
+        let [r3, g3, b3] = yuv_to_rgb(s[6], s[5], s[7]);
+        d[0..2].copy_from_slice(&pack_rgb565(r0, g0, b0).to_le_bytes());
+        d[2..4].copy_from_slice(&pack_rgb565(r1, g1, b1).to_le_bytes());
+        d[4..6].copy_from_slice(&pack_rgb565(r2, g2, b2).to_le_bytes());
+        d[6..8].copy_from_slice(&pack_rgb565(r3, g3, b3).to_le_bytes());
+    }
+    for (s, d) in st.chunks_exact(4).zip(dt.chunks_exact_mut(4)) {
         let [r0, g0, b0] = yuv_to_rgb(s[0], s[1], s[3]);
         let [r1, g1, b1] = yuv_to_rgb(s[2], s[1], s[3]);
         d[..2].copy_from_slice(&pack_rgb565(r0, g0, b0).to_le_bytes());
@@ -175,13 +224,28 @@ pub fn downscale2x_gray8(src: &[u8], width: u32, height: u32, dst: &mut [u8]) ->
         let r0 = &src[(2 * oy) * w..(2 * oy) * w + span];
         let r1 = &src[(2 * oy + 1) * w..(2 * oy + 1) * w + span];
         let drow = &mut dst[oy * ow..oy * ow + ow];
-        for ((a, b), d) in r0
-            .chunks_exact(2)
-            .zip(r1.chunks_exact(2))
-            .zip(drow.iter_mut())
+        // Two output pixels per trip: one 4-load/1-store body is mostly loop
+        // overhead. Same sums, same rounding.
+        let pairs = ow / 2 * 2;
+        let (r0b, r0t) = r0.split_at(pairs * 2);
+        let (r1b, r1t) = r1.split_at(pairs * 2);
+        let (db, dt) = drow.split_at_mut(pairs);
+        for ((a, b), d) in r0b
+            .chunks_exact(4)
+            .zip(r1b.chunks_exact(4))
+            .zip(db.chunks_exact_mut(2))
         {
-            let sum =
-                u32::from(a[0]) + u32::from(a[1]) + u32::from(b[0]) + u32::from(b[1]);
+            let s0 = u32::from(a[0]) + u32::from(a[1]) + u32::from(b[0]) + u32::from(b[1]);
+            let s1 = u32::from(a[2]) + u32::from(a[3]) + u32::from(b[2]) + u32::from(b[3]);
+            d[0] = ((s0 + 2) / 4) as u8;
+            d[1] = ((s1 + 2) / 4) as u8;
+        }
+        for ((a, b), d) in r0t
+            .chunks_exact(2)
+            .zip(r1t.chunks_exact(2))
+            .zip(dt.iter_mut())
+        {
+            let sum = u32::from(a[0]) + u32::from(a[1]) + u32::from(b[0]) + u32::from(b[1]);
             *d = ((sum + 2) / 4) as u8;
         }
     }
