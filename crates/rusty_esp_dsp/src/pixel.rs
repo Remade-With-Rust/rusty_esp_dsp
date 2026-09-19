@@ -138,7 +138,20 @@ pub fn yuyv_to_gray8(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     }
     let pixels = src.len() / 2;
     expect_len(dst, pixels)?;
-    for (s, d) in src.chunks_exact(2).zip(dst.iter_mut()) {
+    // Four pixels (eight source bytes) per trip. One pixel per trip is a
+    // single dependent load-store pair wrapped in loop overhead, which an
+    // in-order core cannot overlap; four give the loads room to pipeline.
+    // Same bytes selected, so the output is identical.
+    let body = pixels / 4 * 4;
+    let (sb, st) = src.split_at(body * 2);
+    let (db, dt) = dst[..pixels].split_at_mut(body);
+    for (s, d) in sb.chunks_exact(8).zip(db.chunks_exact_mut(4)) {
+        d[0] = s[0];
+        d[1] = s[2];
+        d[2] = s[4];
+        d[3] = s[6];
+    }
+    for (s, d) in st.chunks_exact(2).zip(dt.iter_mut()) {
         *d = s[0];
     }
     Ok(pixels)

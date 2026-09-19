@@ -66,16 +66,30 @@ pub fn sum_sq_i16(a: &[i16]) -> i64 {
 /// trailing odd byte is ignored.
 #[must_use]
 pub fn sum_sq_i16_le(samples: &[u8]) -> (i64, usize) {
-    let mut acc: i64 = 0;
+    // Four samples (eight bytes) per trip into four independent
+    // accumulators: the square is exact in i32 (at most 2^30) and the
+    // accumulator chain is broken, for the same reasons as `sum_sq_i16`.
+    let (mut a0, mut a1, mut a2, mut a3) = (0i64, 0i64, 0i64, 0i64);
     let mut n: usize = 0;
-    for s in samples.chunks_exact(2) {
-        // Square in i32 (at most 2^30, exact) and widen for the accumulate;
-        // `i64 * i64` here was a 64x64 multiply per sample on a 32-bit core.
+    let mut c = samples.chunks_exact(8);
+    for s in c.by_ref() {
+        let v0 = i32::from(i16::from_le_bytes([s[0], s[1]]));
+        let v1 = i32::from(i16::from_le_bytes([s[2], s[3]]));
+        let v2 = i32::from(i16::from_le_bytes([s[4], s[5]]));
+        let v3 = i32::from(i16::from_le_bytes([s[6], s[7]]));
+        a0 += i64::from(v0 * v0);
+        a1 += i64::from(v1 * v1);
+        a2 += i64::from(v2 * v2);
+        a3 += i64::from(v3 * v3);
+        n += 4;
+    }
+    let mut tail = 0i64;
+    for s in c.remainder().chunks_exact(2) {
         let v = i32::from(i16::from_le_bytes([s[0], s[1]]));
-        acc += i64::from(v * v);
+        tail += i64::from(v * v);
         n += 1;
     }
-    (acc, n)
+    ((a0 + a1) + (a2 + a3) + tail, n)
 }
 
 /// The largest magnitude in the block (`32 768` for `i16::MIN`).
