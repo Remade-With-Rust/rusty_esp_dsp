@@ -35,6 +35,18 @@ fn sad<const W: usize, const H: usize>(a: &[u8], sa: usize, b: &[u8], sb: usize)
     //    the extra accumulators only added register pressure and chunk
     //    bookkeeping. Dependency-breaking pays on a long ALU chain with few
     //    loads, NOT on a loop that is already waiting on memory.
+    // THREE REFUTATIONS on this loop, all measured on a XIAO ESP32-S3
+    // (2026-09-19). It is load-bound and LLVM has already unrolled it well;
+    // every restructuring so far has cost more than it saved. Leave it alone
+    // without new evidence.
+    //
+    // 1. `u8::abs_diff` -> `(i32 - i32).unsigned_abs()`, to trade a
+    //    compare-and-select for one Xtensa `abs`: BYTE-IDENTICAL function.
+    // 2. Four independent accumulators (the technique worth -43% on
+    //    peak_abs_i16): sad_16x16 +47.5%, sad_8x8 +12.0%, census loop
+    //    129 -> 131 and spills 0 -> 2.
+    // 3. Two rows per trip, to halve the slice bookkeeping: sad_16x16
+    //    21.56 -> 31.10 Mps/block (+44%), sad_8x8 6.50 -> 8.98 (+38%).
     let mut acc = 0u32;
     for r in 0..H {
         let ra = &a[r * sa..r * sa + W];

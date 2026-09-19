@@ -39,15 +39,19 @@ const ROUND_F64: f64 = 6_755_399_441_055_744.0;
 #[inline]
 fn f32_to_i16(x: f32) -> i16 {
     let v = x * 32768.0;
-    if v >= 32767.0 {
-        i16::MAX
-    } else if v <= -32768.0 {
-        i16::MIN
+    // The in-range case first: it is what audio actually hits, and the old
+    // order made it evaluate three comparisons before doing any work. NaN
+    // fails both of these comparisons and falls through to the same handling
+    // it had before, so every result is unchanged.
+    if v > -32768.0 && v < 32767.0 {
+        ((v + ROUND_F32) - ROUND_F32) as i16
     } else if v.is_nan() {
         // `rintf(NaN) as i16` is 0; say so rather than rely on the cast.
         0
+    } else if v >= 32767.0 {
+        i16::MAX
     } else {
-        ((v + ROUND_F32) - ROUND_F32) as i16
+        i16::MIN
     }
 }
 

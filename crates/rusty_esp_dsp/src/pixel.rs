@@ -88,10 +88,14 @@ pub fn rgb565_to_rgb888(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     let (sb, st) = src.split_at(body * 2);
     let (db, dt) = dst[..pixels * 3].split_at_mut(body * 3);
     for (s, d) in sb.chunks_exact(16).zip(db.chunks_exact_mut(24)) {
-        for k in 0..8 {
-            let (i, o) = (k * 2, k * 3);
-            d[o..o + 3].copy_from_slice(&unpack_rgb565(u16::from_le_bytes([s[i], s[i + 1]])));
-        }
+        d[0..3].copy_from_slice(&unpack_rgb565(u16::from_le_bytes([s[0], s[1]])));
+        d[3..6].copy_from_slice(&unpack_rgb565(u16::from_le_bytes([s[2], s[3]])));
+        d[6..9].copy_from_slice(&unpack_rgb565(u16::from_le_bytes([s[4], s[5]])));
+        d[9..12].copy_from_slice(&unpack_rgb565(u16::from_le_bytes([s[6], s[7]])));
+        d[12..15].copy_from_slice(&unpack_rgb565(u16::from_le_bytes([s[8], s[9]])));
+        d[15..18].copy_from_slice(&unpack_rgb565(u16::from_le_bytes([s[10], s[11]])));
+        d[18..21].copy_from_slice(&unpack_rgb565(u16::from_le_bytes([s[12], s[13]])));
+        d[21..24].copy_from_slice(&unpack_rgb565(u16::from_le_bytes([s[14], s[15]])));
     }
     for (s, d) in st.chunks_exact(2).zip(dt.chunks_exact_mut(3)) {
         d.copy_from_slice(&unpack_rgb565(u16::from_le_bytes([s[0], s[1]])));
@@ -107,14 +111,18 @@ pub fn rgb888_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     let pixels = src.len() / 3;
     expect_len(dst, pixels * 2)?;
     // Four pixels per trip, as in rgb565_to_rgb888. Same pack.
-    let body = pixels / 4 * 4;
+    let body = pixels / 8 * 8;
     let (sb, st) = src.split_at(body * 3);
     let (db, dt) = dst[..pixels * 2].split_at_mut(body * 2);
-    for (s, d) in sb.chunks_exact(12).zip(db.chunks_exact_mut(8)) {
+    for (s, d) in sb.chunks_exact(24).zip(db.chunks_exact_mut(16)) {
         d[0..2].copy_from_slice(&pack_rgb565(s[0], s[1], s[2]).to_le_bytes());
         d[2..4].copy_from_slice(&pack_rgb565(s[3], s[4], s[5]).to_le_bytes());
         d[4..6].copy_from_slice(&pack_rgb565(s[6], s[7], s[8]).to_le_bytes());
         d[6..8].copy_from_slice(&pack_rgb565(s[9], s[10], s[11]).to_le_bytes());
+        d[8..10].copy_from_slice(&pack_rgb565(s[12], s[13], s[14]).to_le_bytes());
+        d[10..12].copy_from_slice(&pack_rgb565(s[15], s[16], s[17]).to_le_bytes());
+        d[12..14].copy_from_slice(&pack_rgb565(s[18], s[19], s[20]).to_le_bytes());
+        d[14..16].copy_from_slice(&pack_rgb565(s[21], s[22], s[23]).to_le_bytes());
     }
     for (s, d) in st.chunks_exact(3).zip(dt.chunks_exact_mut(2)) {
         d.copy_from_slice(&pack_rgb565(s[0], s[1], s[2]).to_le_bytes());
@@ -161,8 +169,7 @@ pub fn yuyv_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     let (sb, st) = src.split_at(body * 2);
     let (db, dt) = dst[..pixels * 2].split_at_mut(body * 2);
     for (s, d) in sb.chunks_exact(16).zip(db.chunks_exact_mut(16)) {
-        for k in 0..4 {
-            let (i, o) = (k * 4, k * 4);
+        for (i, o) in [(0usize, 0usize), (4, 4), (8, 8), (12, 12)] {
             let [r0, g0, b0] = yuv_to_rgb(s[i], s[i + 1], s[i + 3]);
             let [r1, g1, b1] = yuv_to_rgb(s[i + 2], s[i + 1], s[i + 3]);
             d[o..o + 2].copy_from_slice(&pack_rgb565(r0, g0, b0).to_le_bytes());
@@ -189,18 +196,13 @@ pub fn yuyv_to_gray8(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     // single dependent load-store pair wrapped in loop overhead, which an
     // in-order core cannot overlap; four give the loads room to pipeline.
     // Same bytes selected, so the output is identical.
-    let body = pixels / 8 * 8;
+    let body = pixels / 16 * 16;
     let (sb, st) = src.split_at(body * 2);
     let (db, dt) = dst[..pixels].split_at_mut(body);
-    for (s, d) in sb.chunks_exact(16).zip(db.chunks_exact_mut(8)) {
-        d[0] = s[0];
-        d[1] = s[2];
-        d[2] = s[4];
-        d[3] = s[6];
-        d[4] = s[8];
-        d[5] = s[10];
-        d[6] = s[12];
-        d[7] = s[14];
+    for (s, d) in sb.chunks_exact(32).zip(db.chunks_exact_mut(16)) {
+        for k in 0..16 {
+            d[k] = s[k * 2];
+        }
     }
     for (s, d) in st.chunks_exact(2).zip(dt.iter_mut()) {
         *d = s[0];
