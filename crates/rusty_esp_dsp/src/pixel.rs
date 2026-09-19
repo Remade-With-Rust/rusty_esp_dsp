@@ -14,6 +14,7 @@
 
 use rusty_esp_core::error::{Error, Result};
 use rusty_esp_core::frame::{Geometry, PixelFormat};
+use rusty_esp_core::pcm::{as_u16, as_u16_mut};
 
 use crate::expect_len;
 
@@ -82,6 +83,29 @@ pub fn rgb565_to_rgb888(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     }
     let pixels = src.len() / 2;
     expect_len(dst, pixels * 3)?;
+    // FAST ARM: the source IS u16. Each pixel costs one halfword load where
+    // the byte path needs two loads, a shift and an or. The destination is
+    // three bytes a pixel and cannot be viewed, so only the read side moves.
+    if let Some(sv) = as_u16(src) {
+        let dv = &mut dst[..pixels * 3];
+        // EIGHT. Sixteen measured +39.6% against a 0.0% null arm on an
+        // ESP32-S3 (2026-09-19): the three-byte destination store is what
+        // limits this body, and widening only adds live values.
+        let body = pixels / 8 * 8;
+        let (svb, svt) = sv.split_at(body);
+        let (dvb, dvt) = dv.split_at_mut(body * 3);
+        for (s, d) in svb.chunks_exact(8).zip(dvb.chunks_exact_mut(24)) {
+            for k in 0..8 {
+                d[k * 3..k * 3 + 3].copy_from_slice(&unpack_rgb565(s[k]));
+            }
+        }
+        for (s, d) in svt.iter().zip(dvt.chunks_exact_mut(3)) {
+            d.copy_from_slice(&unpack_rgb565(*s));
+        }
+        return Ok(pixels);
+    }
+
+    // BYTE ARM: the oracle, and the misaligned fallback.
     // Four pixels per trip: one 2-byte load and one 3-byte store per trip is
     // mostly loop overhead and a dependent load-store pair. Same unpack.
     let body = pixels / 8 * 8;
@@ -110,6 +134,25 @@ pub fn rgb888_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     }
     let pixels = src.len() / 3;
     expect_len(dst, pixels * 2)?;
+    // FAST ARM: the destination IS u16 -- one halfword store a pixel where
+    // the byte path needs two. The source is three bytes a pixel and cannot
+    // be viewed, so only the write side moves.
+    if let Some(dv) = as_u16_mut(&mut dst[..pixels * 2]) {
+        let body = pixels / 16 * 16;
+        let (sb, st) = src.split_at(body * 3);
+        let (dvb, dvt) = dv.split_at_mut(body);
+        for (s, d) in sb.chunks_exact(48).zip(dvb.chunks_exact_mut(16)) {
+            for k in 0..16 {
+                d[k] = pack_rgb565(s[k * 3], s[k * 3 + 1], s[k * 3 + 2]);
+            }
+        }
+        for (s, d) in st.chunks_exact(3).zip(dvt.iter_mut()) {
+            *d = pack_rgb565(s[0], s[1], s[2]);
+        }
+        return Ok(pixels);
+    }
+
+    // BYTE ARM: the oracle, and the misaligned fallback.
     // Four pixels per trip, as in rgb565_to_rgb888. Same pack.
     let body = pixels / 8 * 8;
     let (sb, st) = src.split_at(body * 3);
@@ -164,6 +207,31 @@ pub fn yuyv_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     }
     let pixels = src.len() / 2;
     expect_len(dst, pixels * 2)?;
+    // FAST ARM: the destination IS u16 -- one halfword store a pixel.
+    if let Some(dv) = as_u16_mut(&mut dst[..pixels * 2]) {
+        // FOUR macropixels. Eight measured +8.3% against a 0.0% null arm.
+        let body = pixels / 8 * 8;
+        let (sb, st) = src.split_at(body * 2);
+        let (dvb, dvt) = dv.split_at_mut(body);
+        for (s, d) in sb.chunks_exact(16).zip(dvb.chunks_exact_mut(8)) {
+            for k in 0..4 {
+                let (i, o) = (k * 4, k * 2);
+                let [r0, g0, b0] = yuv_to_rgb(s[i], s[i + 1], s[i + 3]);
+                let [r1, g1, b1] = yuv_to_rgb(s[i + 2], s[i + 1], s[i + 3]);
+                d[o] = pack_rgb565(r0, g0, b0);
+                d[o + 1] = pack_rgb565(r1, g1, b1);
+            }
+        }
+        for (s, d) in st.chunks_exact(4).zip(dvt.chunks_exact_mut(2)) {
+            let [r0, g0, b0] = yuv_to_rgb(s[0], s[1], s[3]);
+            let [r1, g1, b1] = yuv_to_rgb(s[2], s[1], s[3]);
+            d[0] = pack_rgb565(r0, g0, b0);
+            d[1] = pack_rgb565(r1, g1, b1);
+        }
+        return Ok(pixels);
+    }
+
+    // BYTE ARM: the oracle, and the misaligned fallback.
     // Four pixels (two macropixels) per trip. Same conversions and pack.
     let body = pixels / 8 * 8;
     let (sb, st) = src.split_at(body * 2);
@@ -273,6 +341,57 @@ pub fn downscale2x_rgb565(src: &[u8], width: u32, height: u32, dst: &mut [u8]) -
     // always sliced its rows, which is why it ran ~6x faster for the same
     // shape of work. The arithmetic below is unchanged, so every output byte
     // is identical.
+    // FAST ARM: both sides are u16, so a source pixel is one halfword load
+    // and an output pixel one halfword store -- this kernel reads FOUR and
+    // writes one, so it pays the marshalling five times per output pixel.
+    if let (Some(sv), Some(dvv)) = (as_u16(src), as_u16_mut(&mut dst[..ow * oh * 2])) {
+        for oy in 0..oh {
+            let r0 = &sv[(2 * oy) * w..(2 * oy) * w + ow * 2];
+            let r1 = &sv[(2 * oy + 1) * w..(2 * oy + 1) * w + ow * 2];
+            let drow = &mut dvv[oy * ow..oy * ow + ow];
+            // FOUR output pixels a trip. The byte arm's measured best width
+            // was ONE, but that body carried eight byte loads plus the shifts
+            // and ors to assemble them; this one carries four halfword loads,
+            // so the stopping point is a different question and is measured
+            // here rather than inherited.
+            // FOUR. Eight measured +10.7% against a 0.0% null arm on an
+            // ESP32-S3 (2026-09-19); one measured +14.9% worse than four.
+            // The stop moved from 1 (the byte arm) to 4 when the loads became
+            // halfwords, which is why it was re-measured rather than
+            // inherited.
+            let mut c0 = r0.chunks_exact(8);
+            let mut c1 = r1.chunks_exact(8);
+            let mut cd = drow.chunks_exact_mut(4);
+            for ((s0, s1), d) in c0.by_ref().zip(c1.by_ref()).zip(cd.by_ref()) {
+                for k in 0..4 {
+                    let (q0, q1) = (s0[k * 2], s0[k * 2 + 1]);
+                    let (q2, q3) = (s1[k * 2], s1[k * 2 + 1]);
+                    let r = ((r5to8(q0) + r5to8(q1) + r5to8(q2) + r5to8(q3) + 2) / 4) as u8;
+                    let g = ((g6to8(q0) + g6to8(q1) + g6to8(q2) + g6to8(q3) + 2) / 4) as u8;
+                    let b = ((b5to8(q0) + b5to8(q1) + b5to8(q2) + b5to8(q3) + 2) / 4) as u8;
+                    d[k] = pack_rgb565(r, g, b);
+                }
+            }
+            for ((s0, s1), d) in c0
+                .remainder()
+                .chunks_exact(2)
+                .zip(c1.remainder().chunks_exact(2))
+                .zip(cd.into_remainder().iter_mut())
+            {
+                // Keep the four PACKED pixels live and widen one channel at a
+                // time, exactly as the byte arm does -- unpacking all four
+                // first spills the register window.
+                let (q0, q1, q2, q3) = (s0[0], s0[1], s1[0], s1[1]);
+                let r = ((r5to8(q0) + r5to8(q1) + r5to8(q2) + r5to8(q3) + 2) / 4) as u8;
+                let g = ((g6to8(q0) + g6to8(q1) + g6to8(q2) + g6to8(q3) + 2) / 4) as u8;
+                let b = ((b5to8(q0) + b5to8(q1) + b5to8(q2) + b5to8(q3) + 2) / 4) as u8;
+                *d = pack_rgb565(r, g, b);
+            }
+        }
+        return Ok(out);
+    }
+
+    // BYTE ARM: the oracle, and the misaligned fallback.
     let stride = w * 2;
     let span = ow * 4; // the two-pixel columns this row actually reads
     for oy in 0..oh {
