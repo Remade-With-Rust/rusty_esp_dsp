@@ -16,6 +16,16 @@ pub const fn isqrt(v: u32) -> u32 {
     // at v spent roughly log2(v) iterations, each one a 32-bit DIVIDE, just
     // halving its way down to the right magnitude. `bits` significant bits
     // means v < 2^bits, so x0 = 2^ceil(bits/2) has x0^2 >= 2^bits > v.
+    // REFUTED, measured worse, reverted. The seed must be at or above
+    // sqrt(v) -- Newton descends monotonically to the floor from there, and
+    // from BELOW it can stop one short -- and `1 << ((bits + 1) / 2)` is
+    // tight for even `bits` and a factor of two loose for odd ones. Closing
+    // that with `if bits & 1 == 0 { 1 << h } else { 3 << (h - 1) }` (valid,
+    // since 1.5 > sqrt(2), and exhaustively proven identical over all 2^32
+    // inputs) measured **+15.2%** against a 1.6% null arm on an ESP32-S3,
+    // 2026-09-19. A branch and a two-operation shift on EVERY call cost more
+    // than the one divide they save on HALF of them. The cheapest seed wins
+    // on a kernel whose body is four instructions.
     let bits = 32 - v.leading_zeros();
     let mut x = 1u32 << ((bits + 1) / 2);
     let mut y = (x + v / x) / 2;
