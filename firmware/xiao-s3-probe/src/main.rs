@@ -316,6 +316,51 @@ fn main() -> ! {
         core::hint::black_box(acc);
         Work { blocks, ..Work::ZERO }
     });
+    // hadamard_4x4 is public API and no longer reached through satd_4x4
+    // (which fuses its own butterflies), so measure it directly.
+    measure("hadamard_4x4", "block", nb, || {
+        let mut acc = 0i32;
+        for blk in &res_blocks {
+            acc = acc.wrapping_add(rusty_esp_dsp::block::hadamard_4x4(blk)[0]);
+        }
+        core::hint::black_box(acc);
+        Work { blocks: nb, ..Work::ZERO }
+    });
+    // isqrt: the CSI amplitude path's integer square root.
+    measure("isqrt", "sample", ns, || {
+        let mut acc = 0u32;
+        for i in 0..NS {
+            acc = acc.wrapping_add(rusty_esp_dsp::int::isqrt((i as u32) * 7919));
+        }
+        core::hint::black_box(acc);
+        Work { samples: ns, ..Work::ZERO }
+    });
+
+    // pcm::convert -- the sample-format converter, both hot directions.
+    // Small buffers: the frame buffers leave only ~23 KiB of heap.
+    {
+        use rusty_esp_dsp::esp_core::pcm::{PcmBlock, PcmFormat, SampleFormat};
+        use rusty_esp_dsp::esp_core::time::Micros;
+        use rusty_esp_dsp::sample::pcm;
+        const NP: usize = 512;
+        let np = NP as u64;
+        let fmt_i16 = PcmFormat::new(16_000, 1, SampleFormat::I16).expect("fmt");
+        let fmt_f32 = PcmFormat::new(16_000, 1, SampleFormat::F32).expect("fmt");
+        let src_i16: alloc::vec::Vec<u8> = (0..NP * 2).map(|i| (i % 251) as u8).collect();
+        let mut buf_f32 = vec![0u8; NP * 4];
+        measure("pcm_i16_to_f32", "sample", np, || {
+            let b = PcmBlock::new(fmt_i16, Micros(0), &src_i16).expect("blk");
+            let _ = pcm::convert(b, SampleFormat::F32, &mut buf_f32);
+            Work { samples: np, ..Work::ZERO }
+        });
+        let mut buf_i16 = vec![0u8; NP * 2];
+        measure("pcm_f32_to_i16", "sample", np, || {
+            let b = PcmBlock::new(fmt_f32, Micros(0), &buf_f32).expect("blk");
+            let _ = pcm::convert(b, SampleFormat::I16, &mut buf_i16);
+            Work { samples: np, ..Work::ZERO }
+        });
+    }
+
     measure("sad_8x8", "block", blocks, || {
         let stride = W as usize;
         let mut sum = 0u32;

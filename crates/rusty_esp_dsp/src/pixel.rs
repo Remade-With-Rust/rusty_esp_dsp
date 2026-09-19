@@ -130,6 +130,9 @@ pub fn yuyv_to_rgb888(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     let pixels = src.len() / 2;
     expect_len(dst, pixels * 3)?;
     // Four pixels (two macropixels) per trip. Same conversions.
+    // Four pixels per trip. EIGHT measured +1.9% worse on the S3
+    // (334,759 -> 340,999 ps/px, 2026-09-19): this body already carries two
+    // full colour conversions, so it is not loop-overhead-bound.
     let body = pixels / 4 * 4;
     let (sb, st) = src.split_at(body * 2);
     let (db, dt) = dst[..pixels * 3].split_at_mut(body * 3);
@@ -154,18 +157,17 @@ pub fn yuyv_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     let pixels = src.len() / 2;
     expect_len(dst, pixels * 2)?;
     // Four pixels (two macropixels) per trip. Same conversions and pack.
-    let body = pixels / 4 * 4;
+    let body = pixels / 8 * 8;
     let (sb, st) = src.split_at(body * 2);
     let (db, dt) = dst[..pixels * 2].split_at_mut(body * 2);
-    for (s, d) in sb.chunks_exact(8).zip(db.chunks_exact_mut(8)) {
-        let [r0, g0, b0] = yuv_to_rgb(s[0], s[1], s[3]);
-        let [r1, g1, b1] = yuv_to_rgb(s[2], s[1], s[3]);
-        let [r2, g2, b2] = yuv_to_rgb(s[4], s[5], s[7]);
-        let [r3, g3, b3] = yuv_to_rgb(s[6], s[5], s[7]);
-        d[0..2].copy_from_slice(&pack_rgb565(r0, g0, b0).to_le_bytes());
-        d[2..4].copy_from_slice(&pack_rgb565(r1, g1, b1).to_le_bytes());
-        d[4..6].copy_from_slice(&pack_rgb565(r2, g2, b2).to_le_bytes());
-        d[6..8].copy_from_slice(&pack_rgb565(r3, g3, b3).to_le_bytes());
+    for (s, d) in sb.chunks_exact(16).zip(db.chunks_exact_mut(16)) {
+        for k in 0..4 {
+            let (i, o) = (k * 4, k * 4);
+            let [r0, g0, b0] = yuv_to_rgb(s[i], s[i + 1], s[i + 3]);
+            let [r1, g1, b1] = yuv_to_rgb(s[i + 2], s[i + 1], s[i + 3]);
+            d[o..o + 2].copy_from_slice(&pack_rgb565(r0, g0, b0).to_le_bytes());
+            d[o + 2..o + 4].copy_from_slice(&pack_rgb565(r1, g1, b1).to_le_bytes());
+        }
     }
     for (s, d) in st.chunks_exact(4).zip(dt.chunks_exact_mut(4)) {
         let [r0, g0, b0] = yuv_to_rgb(s[0], s[1], s[3]);

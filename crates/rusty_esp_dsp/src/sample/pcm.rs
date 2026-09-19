@@ -130,12 +130,53 @@ pub fn convert(input: PcmBlock<'_>, to: SampleFormat, out: &mut [u8]) -> Result<
         return Err(Error::Unsupported);
     }
     let (fb, tb) = (from.bytes(), to.bytes());
-    for (i, o) in input
-        .data
-        .chunks_exact(fb)
-        .zip(out[..n].chunks_exact_mut(tb))
-    {
-        convert_sample(from, to, i, o);
+    // Resolve the format pair ONCE and run a loop that knows it, instead of
+    // re-matching `(from, to)` for every sample. The per-sample arithmetic is
+    // unchanged -- `convert_sample` stays as the single definition of each
+    // pair and the oracle for this fast path -- only the dispatch moves out
+    // of the loop.
+    macro_rules! each {
+        (|$i:ident, $o:ident| $body:block) => {{
+            for ($i, $o) in input
+                .data
+                .chunks_exact(fb)
+                .zip(out[..n].chunks_exact_mut(tb))
+            {
+                $body
+            }
+        }};
+    }
+    use SampleFormat::{F32, I16, I24In32, I32};
+    match (from, to) {
+        (I16, I32) | (I16, I24In32) => each!(|i, o| {
+            let v = i32::from(i16::from_le_bytes([i[0], i[1]])) << 16;
+            o.copy_from_slice(&v.to_le_bytes());
+        }),
+        (I32, I16) | (I24In32, I16) => each!(|i, o| {
+            let v = i32::from_le_bytes([i[0], i[1], i[2], i[3]]) >> 16;
+            o.copy_from_slice(&(v as i16).to_le_bytes());
+        }),
+        (I16, F32) => each!(|i, o| {
+            let v = f32::from(i16::from_le_bytes([i[0], i[1]])) * (1.0 / 32768.0);
+            o.copy_from_slice(&v.to_le_bytes());
+        }),
+        (I32, F32) | (I24In32, F32) => each!(|i, o| {
+            let v =
+                (i32::from_le_bytes([i[0], i[1], i[2], i[3]]) as f32) * (1.0 / 2_147_483_648.0);
+            o.copy_from_slice(&v.to_le_bytes());
+        }),
+        (F32, I16) => each!(|i, o| {
+            let v = f32_to_i16(f32::from_le_bytes([i[0], i[1], i[2], i[3]]));
+            o.copy_from_slice(&v.to_le_bytes());
+        }),
+        (F32, I32) => each!(|i, o| {
+            let v = f32_to_i32(f32::from_le_bytes([i[0], i[1], i[2], i[3]]));
+            o.copy_from_slice(&v.to_le_bytes());
+        }),
+        // The rarer pairs keep the shared per-sample definition.
+        _ => each!(|i, o| {
+            convert_sample(from, to, i, o);
+        }),
     }
     Ok(n)
 }
