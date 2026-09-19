@@ -37,6 +37,28 @@ pub const fn unpack_rgb565(p: u16) -> [u8; 3] {
     ]
 }
 
+/// One RGB565 channel widened to 8 bits, top bits replicated into the low
+/// bits — exactly the per-channel arithmetic of [`unpack_rgb565`], but taken
+/// straight from the packed pixel and already widened, so a caller that wants
+/// one channel of several pixels never materialises the `[u8; 3]`s.
+#[inline]
+const fn r5to8(p: u16) -> u32 {
+    let v = ((p >> 11) & 0x1F) as u32;
+    (v << 3) | (v >> 2)
+}
+
+#[inline]
+const fn g6to8(p: u16) -> u32 {
+    let v = ((p >> 5) & 0x3F) as u32;
+    (v << 2) | (v >> 4)
+}
+
+#[inline]
+const fn b5to8(p: u16) -> u32 {
+    let v = (p & 0x1F) as u32;
+    (v << 3) | (v >> 2)
+}
+
 /// BT.601 full-range YCbCr → RGB888, fixed-point.
 #[must_use]
 pub fn yuv_to_rgb(y: u8, u: u8, v: u8) -> [u8; 3] {
@@ -178,15 +200,20 @@ pub fn downscale2x_rgb565(src: &[u8], width: u32, height: u32, dst: &mut [u8]) -
             .zip(r1.chunks_exact(4))
             .zip(drow.chunks_exact_mut(2))
         {
-            let p00 = unpack_rgb565(u16::from_le_bytes([s0[0], s0[1]]));
-            let p01 = unpack_rgb565(u16::from_le_bytes([s0[2], s0[3]]));
-            let p10 = unpack_rgb565(u16::from_le_bytes([s1[0], s1[1]]));
-            let p11 = unpack_rgb565(u16::from_le_bytes([s1[2], s1[3]]));
-            let avg = |k: usize| {
-                ((u32::from(p00[k]) + u32::from(p01[k]) + u32::from(p10[k]) + u32::from(p11[k]) + 2)
-                    / 4) as u8
-            };
-            d.copy_from_slice(&pack_rgb565(avg(0), avg(1), avg(2)).to_le_bytes());
+            // Keep the four PACKED pixels live and widen one channel at a
+            // time. Unpacking all four into `[u8; 3]` first put twelve values
+            // plus three iterators live at once, far past the usable Xtensa
+            // register window, and the loop spilled: 30 stores per output
+            // pixel where the algorithm needs two. Same per-channel
+            // arithmetic and rounding, so the output bytes are identical.
+            let q0 = u16::from_le_bytes([s0[0], s0[1]]);
+            let q1 = u16::from_le_bytes([s0[2], s0[3]]);
+            let q2 = u16::from_le_bytes([s1[0], s1[1]]);
+            let q3 = u16::from_le_bytes([s1[2], s1[3]]);
+            let r = ((r5to8(q0) + r5to8(q1) + r5to8(q2) + r5to8(q3) + 2) / 4) as u8;
+            let g = ((g6to8(q0) + g6to8(q1) + g6to8(q2) + g6to8(q3) + 2) / 4) as u8;
+            let b = ((b5to8(q0) + b5to8(q1) + b5to8(q2) + b5to8(q3) + 2) / 4) as u8;
+            d.copy_from_slice(&pack_rgb565(r, g, b).to_le_bytes());
         }
     }
     Ok(out)
