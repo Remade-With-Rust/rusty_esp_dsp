@@ -89,12 +89,20 @@ pub fn hadamard_4x4(block: &[i32; 16]) -> [i32; 16] {
 }
 
 /// SATD of one 4×4 residual block: `Σ|hadamard_4x4(block)|`.
+///
+/// Accumulated in `u32`, not `i64`: a residual sample is at most ±255, the
+/// 4×4 Hadamard's gain is 16, so no coefficient exceeds 4 080 and the sum of
+/// sixteen cannot exceed 65 280 — three orders of magnitude inside `u32`.
+/// The `i64` sum cost a double-width add per coefficient on a 32-bit core for
+/// range that cannot be reached. The returned value is unchanged.
 #[must_use]
 pub fn satd_4x4(block: &[i32; 16]) -> i64 {
-    hadamard_4x4(block)
-        .iter()
-        .map(|&v| i64::from(v.unsigned_abs()))
-        .sum()
+    let m = hadamard_4x4(block);
+    let mut acc: u32 = 0;
+    for &v in &m {
+        acc += v.unsigned_abs();
+    }
+    i64::from(acc)
 }
 
 /// SATD over a slice of 4×4 residual blocks — the motion-estimation and

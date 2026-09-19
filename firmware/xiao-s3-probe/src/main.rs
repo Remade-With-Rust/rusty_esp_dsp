@@ -254,6 +254,85 @@ fn main() -> ! {
         }
     });
 
+    // ---- sample + block reductions (D3 candidates) -----------------------
+    // Small buffers: the frame buffers already hold 172 800 of the 196 608 B
+    // heap, so these are sized to fit the remainder with room to spare.
+    const NS: usize = 2048;
+    let pcm_a: alloc::vec::Vec<i16> = (0..NS)
+        .map(|i| (((i as i32) * 37) % 65536 - 32768) as i16)
+        .collect();
+    let pcm_b: alloc::vec::Vec<i16> = (0..NS)
+        .map(|i| (((i as i32) * 101) % 65536 - 32768) as i16)
+        .collect();
+    let ns = NS as u64;
+    measure("dot_i16", "sample", ns, || {
+        core::hint::black_box(rusty_esp_dsp::sample::dot_i16(&pcm_a, &pcm_b));
+        Work { samples: ns, ..Work::ZERO }
+    });
+    measure("sum_sq_i16", "sample", ns, || {
+        core::hint::black_box(rusty_esp_dsp::sample::sum_sq_i16(&pcm_a));
+        Work { samples: ns, ..Work::ZERO }
+    });
+    measure("peak_abs_i16", "sample", ns, || {
+        core::hint::black_box(rusty_esp_dsp::sample::peak_abs_i16(&pcm_a));
+        Work { samples: ns, ..Work::ZERO }
+    });
+    let le_samples = (gray.len() / 2) as u64;
+    measure("sum_sq_i16_le", "sample", le_samples, || {
+        core::hint::black_box(rusty_esp_dsp::sample::sum_sq_i16_le(&gray));
+        Work { samples: le_samples, ..Work::ZERO }
+    });
+
+    const NB: usize = 64;
+    let res_blocks: alloc::vec::Vec<[i32; 16]> = (0..NB)
+        .map(|b| {
+            let mut x = [0i32; 16];
+            let mut i = 0;
+            while i < 16 {
+                x[i] = (((b * 16 + i) as i32) % 511) - 255;
+                i += 1;
+            }
+            x
+        })
+        .collect();
+    let nb = NB as u64;
+    measure("satd_4x4_sum", "block", nb, || {
+        core::hint::black_box(rusty_esp_dsp::block::satd_4x4_sum(&res_blocks));
+        Work { blocks: nb, ..Work::ZERO }
+    });
+    measure("residual_4x4", "block", blocks, || {
+        let stride = W as usize;
+        let mut acc = 0i32;
+        for by in 0..blocks_y {
+            for bx in 0..blocks_x {
+                let at = by * 16 * stride + bx * 16;
+                if let Ok(r) =
+                    rusty_esp_dsp::block::residual_4x4(&gray[at..], stride, &gray[at + 1..], stride)
+                {
+                    acc = acc.wrapping_add(r[0]);
+                }
+            }
+        }
+        core::hint::black_box(acc);
+        Work { blocks, ..Work::ZERO }
+    });
+    measure("sad_8x8", "block", blocks, || {
+        let stride = W as usize;
+        let mut sum = 0u32;
+        for by in 0..blocks_y {
+            for bx in 0..blocks_x {
+                let at = by * 16 * stride + bx * 16;
+                if let Ok(v) =
+                    rusty_esp_dsp::block::sad_8x8(&gray[at..], stride, &gray[at + 1..], stride)
+                {
+                    sum = sum.wrapping_add(v);
+                }
+            }
+        }
+        core::hint::black_box(sum);
+        Work { blocks, ..Work::ZERO }
+    });
+
     report_memory("after_kernels");
 
     #[cfg(feature = "rngdump")]
