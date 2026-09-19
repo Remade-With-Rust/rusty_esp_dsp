@@ -16,24 +16,50 @@ pub mod pcm;
 /// is identical — but a 32-bit core does it in one `mull` instead of the
 /// multi-instruction 64×64 sequence `i64 · i64` compiles to. The ACCUMULATOR
 /// stays `i64`, which is where the range is genuinely needed.
+/// Four independent accumulators, because a single `acc += ...` chain is a
+/// loop-carried dependency: each add waits on the previous one, and an
+/// in-order core stalls on it. Integer addition is associative and the i64
+/// accumulators cannot overflow here, so the total is identical.
 #[must_use]
 pub fn dot_i16(a: &[i16], b: &[i16]) -> i64 {
-    a.iter()
-        .zip(b)
-        .map(|(&x, &y)| i64::from(i32::from(x) * i32::from(y)))
-        .sum()
+    let n = a.len().min(b.len());
+    let (a, b) = (&a[..n], &b[..n]);
+    let (mut a0, mut a1, mut a2, mut a3) = (0i64, 0i64, 0i64, 0i64);
+    let mut ca = a.chunks_exact(4);
+    let mut cb = b.chunks_exact(4);
+    for (x, y) in ca.by_ref().zip(cb.by_ref()) {
+        a0 += i64::from(i32::from(x[0]) * i32::from(y[0]));
+        a1 += i64::from(i32::from(x[1]) * i32::from(y[1]));
+        a2 += i64::from(i32::from(x[2]) * i32::from(y[2]));
+        a3 += i64::from(i32::from(x[3]) * i32::from(y[3]));
+    }
+    let mut tail = 0i64;
+    for (&x, &y) in ca.remainder().iter().zip(cb.remainder()) {
+        tail += i64::from(i32::from(x) * i32::from(y));
+    }
+    (a0 + a1) + (a2 + a3) + tail
 }
 
 /// `Σ a[i]²`, exact in `i64`. The square is formed in `i32` (at most `2^30`,
 /// see [`dot_i16`]) and widened for the accumulate.
 #[must_use]
 pub fn sum_sq_i16(a: &[i16]) -> i64 {
-    a.iter()
-        .map(|&x| {
-            let v = i32::from(x);
-            i64::from(v * v)
-        })
-        .sum()
+    let (mut a0, mut a1, mut a2, mut a3) = (0i64, 0i64, 0i64, 0i64);
+    let mut c = a.chunks_exact(4);
+    for x in c.by_ref() {
+        let (v0, v1) = (i32::from(x[0]), i32::from(x[1]));
+        let (v2, v3) = (i32::from(x[2]), i32::from(x[3]));
+        a0 += i64::from(v0 * v0);
+        a1 += i64::from(v1 * v1);
+        a2 += i64::from(v2 * v2);
+        a3 += i64::from(v3 * v3);
+    }
+    let mut tail = 0i64;
+    for &x in c.remainder() {
+        let v = i32::from(x);
+        tail += i64::from(v * v);
+    }
+    (a0 + a1) + (a2 + a3) + tail
 }
 
 /// Sum of squares and sample count over little-endian `i16` bytes; a
@@ -53,9 +79,25 @@ pub fn sum_sq_i16_le(samples: &[u8]) -> (i64, usize) {
 }
 
 /// The largest magnitude in the block (`32 768` for `i16::MIN`).
+///
+/// Four independent running maxima for the same reason as [`dot_i16`]'s four
+/// accumulators: `max` is associative and commutative, so the answer is
+/// identical, but one running maximum is a loop-carried dependency.
 #[must_use]
 pub fn peak_abs_i16(a: &[i16]) -> u16 {
-    a.iter().map(|x| x.unsigned_abs()).max().unwrap_or(0)
+    let (mut m0, mut m1, mut m2, mut m3) = (0u16, 0u16, 0u16, 0u16);
+    let mut c = a.chunks_exact(4);
+    for x in c.by_ref() {
+        m0 = m0.max(x[0].unsigned_abs());
+        m1 = m1.max(x[1].unsigned_abs());
+        m2 = m2.max(x[2].unsigned_abs());
+        m3 = m3.max(x[3].unsigned_abs());
+    }
+    let mut best = m0.max(m1).max(m2).max(m3);
+    for &x in c.remainder() {
+        best = best.max(x.unsigned_abs());
+    }
+    best
 }
 
 /// Level of an interleaved i16 block in dBFS (RMS over all channels).
