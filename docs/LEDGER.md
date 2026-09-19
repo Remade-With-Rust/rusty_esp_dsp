@@ -717,3 +717,69 @@ The `copysignf` bias replaced by a float select: exact for all 2^32 patterns,
 and **+2.0%** in a same-build A/B. The sign mask is cheaper than a float
 compare and select. It was priced ALONE only after being bundled once — where
 it read +6.5% / +0.2% / +2.2% against a 9.1% null arm and said nothing.
+
+## R1 — the reachability census, and what it says about I6-I13 (2026-09-19)
+
+Deferred three times, finally run. Every optimised kernel traced from the 11
+shipping firmware entry points. **Four of thirty-nine are production-
+reachable, and ONE firmware does all the reaching.**
+
+| | kernel | how |
+|---|---|---|
+| 1 | `sample::rms_dbfs_i16` | called directly by `xiao-s3-sense-idf-pdm-udp` |
+| 2 | `sample::sum_sq_i16_le` | through `rms_dbfs_i16` |
+| 3 | `DcBlock::process` | `Pipeline::new([&mut dc as &mut dyn Element])`, then `.process` |
+| 4 | `EnergyVad` | **partial**: `judge()` runs; the optimised `Element::process` body does not |
+
+The rest: **32 probe-only**, 2 test-only (`Convert`, `jpeg::probe`), and
+`ops::crop` with **no caller at all** outside its own unit test.
+
+Verified independently of the audit, because a claim this large should not
+rest on one pass: **no production firmware's `Cargo.toml` names
+`rusty_esp_dsp`**; `pdm-udp/main.rs` really does build the pipeline and call
+`rms_dbfs_i16` at lines 114-116, 162 and 218; `c6-mesh-node` really does reach
+its CSI helpers only as `let _ = install_csi;`; and `crop`'s only call sites
+are lines 167 and 171 of its own `#[cfg(test)]`.
+
+### ★★ A dependency edge is not a call edge, and `pub use` makes them identical in a manifest
+
+`rusty_esp_image-core` and `rusty_esp_signal-core` both depend on
+`rusty_esp_dsp`, and `cargo tree` shows the edge. Neither CALLS into it on a
+production path: `ops.rs:14` is `pub use rusty_esp_dsp::pixel::{...}` and
+`csi.rs:507` is `pub use rusty_esp_dsp::int::isqrt;`. A re-export consumes the
+dependency and creates no call. **A manifest edge, a `cargo tree` row and a
+successful build all look the same whether the callee runs or not** — which is
+why this needed a census and not an argument.
+
+### ★ `let _ = f;` compiles a function without calling it
+
+`c6-mesh-node` names `install_csi`, `drive_station` and `read_ld2410` this
+way, deliberately, to prove they compile for the chip. It forces
+monomorphisation and creates no call edge. The entire CSI presence path —
+`CsiFrame::features`, `PresenceDetector::push`, and `isqrt` beneath them —
+hangs off that, so the most expensive kernel in the probe reaches production
+through a function reference that is never invoked. **Grep for `let _ = ` on a
+function item before concluding a path is live.**
+
+### What this does and does not mean for I6-I13
+
+It does NOT retire the work. `rusty_esp_dsp`'s own `lib.rs` says what it is:
+the scalar kernel home, where a loop moves once two packages carry it or once
+a chip-side speedup would be spent on it, and where the twin is written
+against the scalar oracle. Kernels living there before a caller exists is the
+stated design. And some of the probe-only set is **pre-positioned for known
+planned work** rather than speculative: the CSI presence path is waiting on a
+deployment trip, and the LD2410 is a sensor that exists.
+
+It DOES resize the claims. Of everything I6-I13 measured, the wins that touch
+a shipping path today are `sum_sq_i16_le` (−21.4%), `rms_dbfs_i16` through it,
+and `DcBlock` (−47.2% across I9, then −18.0% more from `round_sat_i16`) —
+which makes `DcBlock` the most valuable kernel in this tree by a wide margin,
+and it was never treated as such. The −78.8% on a test-pattern generator, the
+−74.2% on `csi_wander` and the −74.8% on `StereoToMono` are groundwork.
+
+**Two structural causes, both fixable and neither an optimisation:**
+(a) the video path ships `Passthrough` over a sensor that already emits JPEG,
+so not one pixel byte is read end to end — every pixel and block kernel is
+downstream of a decision made in the camera driver;
+(b) the two crates above consume `rusty_esp_dsp` as re-export surface only.
