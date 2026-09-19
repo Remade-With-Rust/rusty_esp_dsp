@@ -70,3 +70,32 @@ From +16,584 B of flash, +3,092 B of stack and 24,576 stranded bytes at
 argument against adopting it on this firmware has essentially gone; what
 remains is the flash, and the reason to pay it is still the double-free abort
 rather than speed on a workload of this shape.
+
+## I5: the scalar kernels priced on the S3 (2026-09-18)
+
+The `xiao-s3-probe` firmware (Track B, esp-hal, esp-alloc arm) ran the scalar
+pixel and block kernels on a XIAO ESP32-S3 and reported per-kernel throughput.
+Serial only. `PieS3` still `delegate_to_scalar!`, so these ARE the kernels the
+chip runs today; the numbers are the ceiling a hand-written `ee.*` SIMD kernel
+would have to beat.
+
+| kernel | unit | ps/unit | throughput |
+|---|---|---:|---:|
+| yuyv_to_gray8 | px | 150,245 | 6.65 Mpx/s |
+| rgb888_to_rgb565 | px | 350,399 | 2.85 Mpx/s |
+| downscale2x_gray8 | px_out | 289,081 | 3.46 Mpx/s |
+| yuyv_to_rgb888 | px | 375,442 | 2.66 Mpx/s |
+| rgb565_to_rgb888 | px | 463,003 | 2.16 Mpx/s |
+| yuyv_to_rgb565 | px | 563,093 | 1.78 Mpx/s |
+| downscale2x_rgb565 | px_out | 1,779,218 | 0.56 Mpx/s |
+| sad_16x16 | block | 21,577,185 | 46.4 k block/s |
+
+Method: `esp-hal::time::Instant`, each kernel run in a loop until ≥ 100,000 µs
+elapsed (so a fast kernel is not measured against timer resolution), one untimed
+warm pass first; `ps_per_unit = us·1e6 / units`, integer arithmetic. esp-alloc
+196,608 B heap, 160×120 frame. The rusty_alloc arm panicked on 2026-09-09 and is
+excluded; esp-alloc is the baseline. The kernels' correctness is the scalar
+oracle by construction (host `assert_eq!` tests); this row is their speed on the
+silicon they are meant to price. A SIMD `ee.*` kernel is worth writing where the
+row is slow and the pipeline share is real — `downscale2x_rgb565` and the SAD
+are the fat ones.
