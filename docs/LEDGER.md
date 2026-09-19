@@ -205,3 +205,67 @@ mover on any run was 4.9%. Each claimed win clears its run's band by 1.5× to
 `u8::abs_diff` as `(i32 − i32).unsigned_abs()` produced a byte-identical
 function (LLVM already lowers it that way), and row-slicing `residual_4x4`
 could not be separated from a ±8% layout swing in its own run.
+
+## I8: fifteen more kernel wins, and where each technique STOPS (2026-09-19)
+
+Follow-on to I7, after extending the probe to 18 kernels (adding hadamard_4x4,
+isqrt and both pcm::convert directions). Every change byte-identical; gated by
+`tests/moved.rs`, `tests/h264_oracle.rs` and a widened `isqrt` sweep.
+
+### Measured on the S3, over serial
+
+| kernel | before | after | |
+|---|---:|---:|---:|
+| `pcm_i16_to_f32` | 659,301 | **348,279** | **−47.2%** |
+| `isqrt` | 2,377,487 | **1,239,440** | **−47.9%** |
+| `pcm_f32_to_i16` | 1,322,358 | **786,787** | **−40.5%** |
+| `rgb565_to_rgb888` | 462,951 | **309,727** | **−33.1%** |
+| `rgb888_to_rgb565` | 337,880 | **233,113** | **−31.0%** |
+| `yuyv_to_rgb888` | 450,494 | **334,752** | **−25.7%** |
+| `yuyv_to_rgb565` | 606,886 | **477,017** | **−21.4%** |
+| `downscale2x_gray8` | 289,063 | **234,062** | **−19.0%** |
+| `yuyv_to_gray8` | 62,686 | **50,964** | **−18.7%** |
+| `peak_abs_i16` | 85,851 | **79,676** | **−7.2%** |
+
+Four techniques: hoist a per-call dispatch out of a per-sample loop (pcm,
+−47%/−40%); seed an iterative algorithm near its answer (isqrt's Newton
+started at `v` and spent ~log2(v) DIVIDES halving down, −47.9%); process more
+units per trip; break a loop-carried dependency.
+
+### ★ Every technique has a measured STOPPING POINT, and it is per kernel
+
+The optimum unroll width is not a constant and cannot be reasoned to:
+
+| kernel | best width | what the next step up measured |
+|---|---|---|
+| `yuyv_to_gray8` | **16** | 8→16 still paid −7.1% |
+| `rgb565_to_rgb888` | **8** | — |
+| `rgb888_to_rgb565` | **8** | 4→8 only −0.7% |
+| `yuyv_to_rgb888` | **4** | 8 measured **+1.9%** |
+| `downscale2x_gray8` | **2** | 4 measured **+2.8%** |
+| `downscale2x_rgb565` | **1** | 2 measured **+2.7%** |
+
+The ordering tracks body size: widening pays while the trip is dominated by
+loop overhead and costs registers once it is not. `downscale2x_rgb565` already
+carries 56 bit-ops per output pixel, so it refuses at width two.
+
+The same applies to dependency-breaking, which is NOT universal: four lanes
+won −43% on `peak_abs_i16` and −25% on `sum_sq_i16`, and **lost** on `sad`
+(+47.5% on 16×16, +12% on 8×8) because that loop is load-bound and already
+unrolled. And lane count is bounded by the register file: eight `u16` maxima
+pay (−7.2%), eight `i64` accumulators do not (`dot_i16` +6.6%, `sum_sq_i16`
++13.3%) because sixteen registers exceed the window.
+
+### What LLVM had already done (five refutations, all 0.00% or worse)
+
+Strength-reducing the downscale row bases; dropping `sum_sq_i16_le`'s running
+count (it is `len / 2`); writing an unroll out explicitly instead of
+`for k in 0..N`; lowering `u8::abs_diff` to a single `abs`; and folding the
+565 bit-replication algebraically (`sum(r8) = 8·sum(v) + sum(v>>2)`, exact)
+— which read **+4.6%** with the census agreeing, bit-ops 56 → **57**. Paper
+op-count is not emitted op-count.
+
+`#[cold]` on the `expect_len` error path changed no census anywhere and moved
+`sad_16x16` **44%** on layout alone, its loop untouched at 129 instructions:
+that kernel's ~400-byte loop is acutely cache-line sensitive, which is also
+why it must be judged against same-run neighbours and never across builds.
