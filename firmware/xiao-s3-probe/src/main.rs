@@ -448,6 +448,49 @@ fn main() -> ! {
             let _ = rs.process(b, &mut rs_out);
             Work { samples: na * 3, ..Work::ZERO }
         });
+        // ---- the PRODUCTION audio block, as the shipping firmware runs it --
+        //
+        // The reachability census (ledger R1) found that four of thirty-nine
+        // kernels reach a shipping firmware, and that ONE firmware does all
+        // the reaching: `xiao-s3-sense-idf-pdm-udp`. Its per-block loop is
+        //
+        //     let out = pipeline.process(block, scratch)?;   // 1 stage: DcBlock
+        //     let level = rms_dbfs_i16(out.data);
+        //     vad.judge(level);
+        //
+        // Every DcBlock number in this probe was taken by calling
+        // `dc.process()` DIRECTLY. Production does not: it goes through
+        // `Pipeline::process`, which per stage checks the output format,
+        // asks `max_output_bytes`, builds a `PcmBlock`, and ping-pongs
+        // between the two halves of the scratch buffer -- none of which this
+        // probe has ever measured. `pipeline_dcblock` beside `dc_block_mono`
+        // in the same binary IS that tax.
+        {
+            use rusty_esp_audio_core::pipeline::Pipeline;
+            let mut pdc = rusty_esp_audio_core::elements::DcBlock::new();
+            let mut pipe = Pipeline::new([&mut pdc as &mut dyn Element]);
+            let scratch_len = pipe.scratch_bytes(f_mono, NA * 2).expect("scratch");
+            let mut scratch = vec![0u8; scratch_len];
+            println!("PRODPROBE scratch_bytes={scratch_len} for {} in", NA * 2);
+
+            measure("pipeline_dcblock", "sample", na, || {
+                let b = PcmBlock::new(f_mono, Micros(0), &mono).expect("blk");
+                let out = pipe.process(b, &mut scratch).expect("pipe");
+                core::hint::black_box(&out);
+                Work { samples: na, ..Work::ZERO }
+            });
+
+            let mut pvad = rusty_esp_audio_core::elements::EnergyVad::default();
+            measure("prod_audio_block", "sample", na, || {
+                let b = PcmBlock::new(f_mono, Micros(0), &mono).expect("blk");
+                if let Some(out) = pipe.process(b, &mut scratch).expect("pipe") {
+                    let level = rusty_esp_audio_core::rms_dbfs_i16(out.data);
+                    core::hint::black_box(pvad.judge(level));
+                }
+                Work { samples: na, ..Work::ZERO }
+            });
+        }
+
         report_memory("after_audio");
     }
 

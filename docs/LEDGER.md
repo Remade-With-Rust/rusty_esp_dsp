@@ -783,3 +783,71 @@ and it was never treated as such. The −78.8% on a test-pattern generator, the
 so not one pixel byte is read end to end — every pixel and block kernel is
 downstream of a decision made in the camera driver;
 (b) the two crates above consume `rusty_esp_dsp` as re-export surface only.
+
+## R2 — measuring the path that actually ships (2026-09-19)
+
+R1 found that ONE firmware reaches any kernel, and that its per-block loop is
+
+```rust
+let out = pipeline.process(block, scratch)?;   // 1 stage: DcBlock
+let level = rms_dbfs_i16(out.data);
+vad.judge(level);
+```
+
+**`Pipeline` appeared ZERO times in this probe.** Every DcBlock number in
+I9-I13 was taken by calling `dc.process()` directly; production does not.
+The probe now carries `pipeline_dcblock` and `prod_audio_block`, which are the
+shape that ships.
+
+### The Pipeline wrapper is cheap: +2.8%, a null result worth having
+
+`dc_block_mono` 593 317 vs `pipeline_dcblock` 609 765, same binary. The
+per-stage format check, `max_output_bytes` call, `PcmBlock::new` and
+scratch ping-pong cost **2.8%** over a direct call. That was worth measuring
+and is not worth optimising.
+
+### ★ Where the production block's time actually goes
+
+Per block (256 samples), from three same-build arms:
+
+| | ps/sample | share of the block |
+|---|---:|---:|
+| `prod_audio_block` (all of it) | 1 034 112 | 100% |
+| `pipeline_dcblock` | 609 765 | 59% |
+| `rms_dbfs_i16` + `judge` | ~424 347 | 41% |
+| of which `sum_sq_i16_le` | 185 707 | 18% |
+| **of which the f64 TAIL** | **~240 000** | **23%** |
+
+`rms_dbfs_i16`'s tail is `acc as f64 / n as f64`, `libm::sqrt`,
+`libm::log10`. **The ESP32-S3's FPU is single precision**, so every one of
+those is a software routine — and they are 23% of the only audio block that
+ships.
+
+### The menu, priced — and the decision is NOT an optimiser's
+
+| form | ps/sample | vs shipped | exactness |
+|---|---:|---:|---|
+| f64 (shipped) | 430 026 | — | bit-exact |
+| f64 without the sqrt | 416 096 | **−3.2%** | 0.97% of points differ, max **5.8e-11 dB** |
+| f32 throughout | 222 945 | **−48.2%** | 66% differ, max **1.53e-5 dB** |
+
+**Dropping the software sqrt buys almost nothing.** The cost is f64
+arithmetic generally — the `log10` and the divide — not the square root, so
+the middle row is a bad trade: it breaks exactness for 3.2%.
+
+Neither cheaper form is bit-identical, and `tests/moved.rs` pins this function
+with `assert_eq!` against the version that moved out of `rusty_esp_audio-core`
+— a deliberate exactness contract. **Taking the 48% means retiring that
+contract**, which is a decision about what the D0 move test is for, not an
+optimisation. Numbers are here so it can be made with one.
+
+### ★★ A 190-point corpus said "bit-identical". 3.5 million points said one in 110.
+
+The no-sqrt form reported max error **exactly 0** over the structured corpus —
+which would have made it shippable under `assert_eq!`. Sweeping 3.46 M points
+found **32 037 disagreements (0.9%)**, the first at `acc=1073741823, n=1`.
+
+A corpus can only ever FAIL TO REFUTE a claim about rounding. Where the claim
+is "these two float expressions produce identical bits", the corpus has to be
+millions of points or it is not evidence. `tests/rms_tail_tradeoff.rs` keeps
+both the sweep and the refutation.
