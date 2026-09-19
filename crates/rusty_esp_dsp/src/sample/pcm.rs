@@ -17,7 +17,7 @@
 //! Moved verbatim from `rusty_esp_audio-core::codec::pcm` (D0, 2026-09-02).
 
 use rusty_esp_core::error::{Error, Result};
-use rusty_esp_core::pcm::{PcmBlock, SampleFormat};
+use rusty_esp_core::pcm::{PcmBlock, SampleFormat, as_f32, as_f32_mut, as_i16, as_i16_mut};
 
 /// Bytes `convert` writes for `input_bytes` of `from` samples going to `to`.
 #[must_use]
@@ -73,6 +73,7 @@ fn f32_to_i32(x: f32) -> i32 {
 #[inline]
 fn convert_sample(from: SampleFormat, to: SampleFormat, i: &[u8], o: &mut [u8]) {
     use SampleFormat::{F32, I16, I24In32, I32};
+
     match (from, to) {
         (I16, I32) | (I16, I24In32) => {
             let v = i32::from(i16::from_le_bytes([i[0], i[1]])) << 16;
@@ -151,6 +152,35 @@ pub fn convert(input: PcmBlock<'_>, to: SampleFormat, out: &mut [u8]) -> Result<
         }};
     }
     use SampleFormat::{F32, I16, I24In32, I32};
+
+    // FAST ARMS for the two pairs a voice path actually runs, taken when both
+    // buffers view as samples. The table below stays the oracle and takes
+    // every misaligned or big-endian case.
+    //
+    // These pairs pay the byte marshalling TWICE: an i16 out of a `&[u8]` is
+    // two byte loads plus a shift and an or, and an f32 is FOUR byte loads
+    // plus three shifts and three ors. Settling both alignments once per call
+    // leaves one load and one store per sample.
+    match (from, to) {
+        (I16, F32) => {
+            if let (Some(si), Some(so)) = (as_i16(input.data), as_f32_mut(&mut out[..n])) {
+                for (i, o) in si.iter().zip(so.iter_mut()) {
+                    *o = f32::from(*i) * (1.0 / 32768.0);
+                }
+                return Ok(n);
+            }
+        }
+        (F32, I16) => {
+            if let (Some(si), Some(so)) = (as_f32(input.data), as_i16_mut(&mut out[..n])) {
+                for (i, o) in si.iter().zip(so.iter_mut()) {
+                    *o = f32_to_i16(*i);
+                }
+                return Ok(n);
+            }
+        }
+        _ => {}
+    }
+
     match (from, to) {
         (I16, I32) | (I16, I24In32) => each!(|i, o| {
             let v = i32::from(i16::from_le_bytes([i[0], i[1]])) << 16;

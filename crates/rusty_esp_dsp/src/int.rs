@@ -27,7 +27,7 @@ pub const fn isqrt(v: u32) -> u32 {
     // than the one divide they save on HALF of them. The cheapest seed wins
     // on a kernel whose body is four instructions.
     let bits = 32 - v.leading_zeros();
-    let mut x = 1u32 << ((bits + 1) / 2);
+    let mut x = 1u32 << bits.div_ceil(2);
     let mut y = (x + v / x) / 2;
     while y < x {
         x = y;
