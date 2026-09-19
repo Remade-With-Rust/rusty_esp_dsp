@@ -25,34 +25,23 @@ pub const fn output_bytes(from: SampleFormat, to: SampleFormat, input_bytes: usi
     input_bytes / from.bytes() * to.bytes()
 }
 
-/// `1.5 · 2^23`. Adding it to an `f32` of magnitude under `2^22` lands in
-/// `[2^23, 2^24)`, where one ulp is exactly 1.0, so the addition rounds the
-/// value to the nearest integer — ties to even, the default mode — and the
-/// subtraction gives that integer back. Two additions where `rintf` was a
-/// libm call: the same bits for every input (`tests` below prove it over
-/// the whole `f32` space, `--ignored`), and on a chip without a rounding
-/// instruction the difference between a level meter and a stall.
-const ROUND_F32: f32 = 12_582_912.0;
+// `ROUND_F32` moved to `rusty_esp_core::pcm::rint_sat_i16` along with the
+// only function that used it. `ROUND_F64` stays: `f32_to_i32` below still
+// rounds in f64 here, and has not been given the same treatment because the
+// probe does not measure an i32 pair -- an unmeasured change is not a change
+// worth making.
 /// `1.5 · 2^52`, the same trick in `f64` for magnitudes under `2^51`.
 const ROUND_F64: f64 = 6_755_399_441_055_744.0;
 
 #[inline]
 fn f32_to_i16(x: f32) -> i16 {
-    let v = x * 32768.0;
-    // The in-range case first: it is what audio actually hits, and the old
-    // order made it evaluate three comparisons before doing any work. NaN
-    // fails both of these comparisons and falls through to the same handling
-    // it had before, so every result is unchanged.
-    if v > -32768.0 && v < 32767.0 {
-        ((v + ROUND_F32) - ROUND_F32) as i16
-    } else if v.is_nan() {
-        // `rintf(NaN) as i16` is 0; say so rather than rely on the cast.
-        0
-    } else if v >= 32767.0 {
-        i16::MAX
-    } else {
-        i16::MIN
-    }
+    // One definition, in the crate every consumer already speaks. The range
+    // test there earns an unchecked final conversion, where the `as i16` this
+    // used to end on was a SATURATING cast still emitting its own range and
+    // NaN tests after these had already been done. Same bits for every input;
+    // `rounding_matches_libm_exhaustively` below is unchanged and still
+    // sweeps the whole f32 space.
+    rusty_esp_core::pcm::rint_sat_i16(x * 32768.0)
 }
 
 #[inline]
