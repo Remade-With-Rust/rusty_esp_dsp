@@ -645,3 +645,75 @@ the product stops fitting `i32`. `convert` and `LinearResampler` get their own
 because their output length is not their input's; the `f32 → i16` corpus
 carries out-of-range values both ways and NaN, since `f32_to_i16` must
 saturate all of them identically down either path.
+
+### I13 — fifteen more, and where they came from (2026-09-19)
+
+| # | kernel | change | |
+|---|---|---|---:|
+| 1 | `mono_to_stereo` | the element the conversion pass missed | **−35.9%** |
+| 2 | `sum_sq_i16_le` | aligned i16 view | **−21.4%** |
+| 3 | `dc_block_mono` | `to_int_unchecked` | **−18.0%** |
+| 4 | `biquad_mono` | `to_int_unchecked` | **−16.9%** |
+| 5 | `downscale2x_rgb565` | width 1 → 4 | **−14.9%** |
+| 6 | `downscale2x_rgb565` | aligned u16 view | **−14.3%** |
+| 7 | `rgb565_to_rgb888` | aligned u16 read | **−12.1%** |
+| 8 | `mix_i16` | width 8 → 16 | **−10.0%** |
+| 9 | `yuyv_to_rgb565` | aligned u16 write | **−9.5%** |
+| 10 | `vad_i16` | via `sum_sq_i16_le` | **−9.3%** |
+| 11 | `agc_i16` | `to_int_unchecked` | **−8.1%** |
+| 12 | `rgb888_to_rgb565` | aligned u16 write | **−7.4%** |
+| 13 | `mono_to_stereo` | width 16 → 32 | **−6.3%** |
+| 14 | `agc_i16` | via `rms_dbfs_i16` | **−6.1%** |
+| 15 | `rgb888_to_rgb565` | width 8 → 16 | **−4.0%** |
+
+### ★★ Read the null arm's DISTRIBUTION, not only its widest mover
+
+One flash read a 6.66% widest mover and would have voided four readings. The
+distribution said otherwise: **median 0.00%, p90 0.40%, and 2 of 27 kernels
+over 2%** — and both movers were `isqrt` and `jpeg_find_eoi`, tiny loops
+already known to be layout-sensitive (`sad_16x16` once swung 44% from a
++1-instruction change elsewhere). Against a p90 of 0.40% a −9.5% is 24× the
+resolving power.
+
+**Quote the max AND the p90.** The max is the worst case and is what a single
+straddling cache line does to one small loop; the p90 is what the instrument
+can actually resolve. Reporting only the max discards real wins; reporting
+only the p90 hides a build that genuinely moved.
+
+### ★ Three kernels moving together from ONE change is the attribution
+
+`round_sat_i16` is called once per sample by `DcBlock`, `Biquad` and `Agc`.
+Changing it moved all three, same direction, against a 0.00% null arm — which
+is a stronger statement than any one of them alone, because layout cannot
+move three independent kernels the same way at once.
+
+### ★ A saturating cast does not fold away just because you proved the range
+
+`x as i16` on an `f32` is a SATURATING cast: it emits its own range and NaN
+tests. The census found those still being emitted **after** two explicit
+comparisons had already established the range — four float compares per
+sample where two suffice. `to_int_unchecked` behind those same tests is
+−18.0% / −16.9% / −8.1%.
+
+The soundness is not an argument, it is a sweep: the exhaustive test calls the
+SHIPPED function over all 2^32 `f32` patterns, so it proves the cast is never
+handed a value it cannot represent. **A copy of the function in the test would
+have proved nothing about the code that runs.**
+
+### The widths all had to be RE-MEASURED after the access method changed
+
+Every aligned body is smaller than the byte body whose stopping point it
+inherited, so none of those stops transferred. `downscale2x_rgb565` moved from
+1 to 4 (and 8 is +10.7%); `mix_i16` from 8 to 16; `mono_to_stereo` from 16 to
+32; `rgb888_to_rgb565` from 8 to 16. Where a stop did NOT move, the number is
+recorded next to the constant: `rgb565_to_rgb888` at 16 is **+39.6%** (its
+three-byte destination store is the limit), `yuyv_to_rgb565` at 8 macropixels
+is **+8.3%**, and `Gain` at 32 is **+100.5%** — the *same* cliff its byte arm
+hits at the same width, so the register window sets that one, not the access.
+
+### Refuted, measured, reverted
+
+The `copysignf` bias replaced by a float select: exact for all 2^32 patterns,
+and **+2.0%** in a same-build A/B. The sign mask is cheaper than a float
+compare and select. It was priced ALONE only after being bundled once — where
+it read +6.5% / +0.2% / +2.2% against a 9.1% null arm and said nothing.
