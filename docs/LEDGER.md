@@ -479,3 +479,57 @@ byte-identity gate will both pass over an arm that never ran.
 One law confirmed twice in one pass: the accumulate loop had already been
 made 12 instructions and spill-free, and it was still the wrong loop. **A
 kernel you have optimised is not a kernel you have questioned.**
+
+### I10 addendum 2 — the byte-wise i16 access, PRICED (2026-09-19)
+
+I9 recorded this as "the largest lever left, and an architecture decision
+rather than an optimisation", and then asked for the decision **without a
+number attached**, which is the wrong order. This is the number.
+
+A throwaway same-build A/B, written entirely inside the probe so no library
+was touched and nothing had to be reverted: arm **A** is the shape the
+elements ship today (`i16::from_le_bytes([b[0], b[1]])` over a `&[u8]`, which
+is two `l8ui` plus a shift and an or), arm **B** is the identical loop, unroll
+and arithmetic over an aligned `&[i16]` — which is exactly what a safe
+alignment-checked cast hands you, with the check paid once per call.
+
+| kernel | bytes (A) | aligned (B) | ceiling |
+|---|---:|---:|---:|
+| `stereo_to_mono` | 271 125 | 112 301 | **−58.6%** |
+| `gain` | 188 550 | 98 704 | **−47.7%** |
+| `mono_to_stereo` | 101 922 | 58 880 | **−42.2%** |
+
+`ALIGNPROBE identical s2m=true gain=true m2s=true` — the arms were compared
+byte for byte before either number was read, because a measurement whose arms
+disagree is pricing two different kernels. Arm A tracks the shipping elements
+in the same build (271 125 vs 255 407; 101 922 vs 94 645), so the twins are
+representative; the shipping figures carry per-call overhead that will not
+shrink, so the realistic whole-kernel win is somewhat under the loop ceiling.
+
+**42–59%, on top of everything I9 and I10 already won.** That is larger than
+this entire campaign's per-kernel wins, and it is one decision rather than
+forty edits.
+
+**The seam that costs least.** `rusty_esp_core`, `rusty_esp_dsp` and
+`rusty_esp_audio-core` all carry `#![forbid(unsafe_code)]`, and audio-core's
+own module docs list it as principle 5. So the cheapest shape is the one this
+family already uses for the allocator: **put the decision in ONE crate.** A
+checked cast in `rusty_esp_core::pcm` —
+
+```rust
+pub fn as_i16(b: &[u8]) -> Option<&[i16]>;       // None when misaligned
+pub fn as_i16_mut(b: &mut [u8]) -> Option<&mut [i16]>;
+```
+
+— lets every element keep `forbid(unsafe_code)` *and* keep bytemuck out of its
+own manifest, and puts the `#[cfg(target_endian = "little")]` gate in exactly
+one place instead of in every kernel. Implemented with `bytemuck` it needs no
+`unsafe` anywhere (bytemuck is pure Rust, `no_std`, and has no dependencies of
+its own); implemented by hand it is one audited `align_to` behind a safe API.
+Either way the elements gain a fast arm and keep the byte loop as the oracle
+and the misaligned fallback — which is the same scalar-oracle shape every twin
+in this family already has.
+
+**Why it is still not taken here.** It is a dependency (or a lint relaxation)
+in the foundation crate of the family, and that is the user's call, not an
+optimiser's. What has changed is that it is now a call with a number on it.
