@@ -432,3 +432,50 @@ that did not survive two more crates entering the binary. The win is
   one byte each. −39.6%.
 - Unroll widths again, per kernel: `mono_to_stereo` won at 16, `gain` **fell
   off a cliff at 32 (+115.3%)** having won at 16, `agc` was flat at 8.
+
+### I10 addendum — `csi_wander` again, and an instrument that was lying
+
+Asked to look once more at the pass's most expensive kernel. Two things were
+hiding, and the second one invalidates numbers already recorded above.
+
+**The ring is a SLIDING WINDOW and the reduction was rebuilding it.** Exactly
+one frame leaves and one arrives per push, yet `compute_wander` recomputed
+both totals across all `W` frames every time: `W · n` multiply-accumulates,
+**2600** of them at W = 50 and 52 subcarriers, to fold in ONE new frame.
+Carrying `sum` and `sumsq` in the detector and updating them from the frame
+that changes is `n` updates instead of `W · n`.
+
+| | before | after | |
+|---|---:|---:|---:|
+| `csi_wander` | 10 933 894 | 2 818 616 | **−74.2%** |
+| reps in the same 100 ms | 176 | 683 | **3.9×** |
+
+**And the arithmetic predicts it, which is what makes it a finding rather than
+a number.** 2600 accumulate trips at 12 instructions plus 52 reductions at
+~150 is ~39 000 per push; 52 updates at ~15 plus the same 52 reductions is
+~8 600 — predicted −77.8%, measured −74.2%. What remains is `isqrt` and two
+divides per subcarrier, i.e. the inherent work, and the census confirms **no
+64-bit divide libcall survives**: dividing by the const generic `W` was
+already strength-reduced.
+
+**★★ The probe was measuring this kernel with its most expensive step switched
+OFF.** It pushed ONE `Features` over and over, so every frame in the window
+was identical, the population variance was exactly zero, `var_w2` was zero,
+and `isqrt(0)` returns on its first line. **Every earlier `csi_wander` number
+in I10 was taken that way, and the honest baseline is 9.0% higher.** The probe
+now cycles four distinct frames and prints `CSIPROBE wander=192 warm=true`, so
+a reader can see the reduction ran instead of short-circuiting — and that same
+line is what confirmed this change byte-identical on the chip, 192 either
+side.
+
+The general form, which is not specific to CSI: **a degenerate input can make
+a kernel skip its own hot path, and the probe will still report a number.**
+Feed a reduction constant data and its variance term vanishes; feed a codec
+a flat frame and its entropy coder idles; feed a filter silence and its
+saturation never fires. **Print something the kernel COMPUTED, not just how
+long it took** — a checksum, a verdict, a count — or the null arm and the
+byte-identity gate will both pass over an arm that never ran.
+
+One law confirmed twice in one pass: the accumulate loop had already been
+made 12 instructions and spill-free, and it was still the wrong loop. **A
+kernel you have optimised is not a kernel you have questioned.**

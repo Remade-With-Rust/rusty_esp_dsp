@@ -466,21 +466,50 @@ fn main() -> ! {
             .collect();
         let frame = CsiFrame { timestamp: Micros(0), rssi: -50, channel: 6, iq: &iq };
         let layout = Layout::LLTF_20MHZ;
+        fn feats_from(
+            iq: &[i8],
+            layout: &Layout,
+        ) -> rusty_esp_signal_core::radar::csi::Features {
+            CsiFrame { timestamp: Micros(0), rssi: -50, channel: 6, iq }
+                .features(layout)
+                .expect("features")
+        }
         let sc = layout.count() as u64;
         measure("csi_features", "subcarrier", sc, || {
             core::hint::black_box(frame.features(&layout).ok());
             Work { samples: sc, ..Work::ZERO }
         });
 
-        // The detector is 6.4 KiB of ring; box it rather than the stack.
-        let feats = frame.features(&layout).expect("features");
+        // FOUR distinct frames, cycled.
+        //
+        // Pushing one `Features` over and over makes every frame in the
+        // window identical, so the population variance is exactly zero,
+        // `var_w2` is zero, and `isqrt(0)` returns on its first line. That
+        // measures the reduction with its most expensive step switched OFF,
+        // and would price any change to the accumulate loop as a larger win
+        // than real data could ever see. Four variants give the window real
+        // spread; cycling an index costs one add per rep, where perturbing
+        // the block in place would cost a loop as long as the kernel.
+        let mut variants = [feats_from(&iq, &layout); 4];
+        for (k, v) in variants.iter_mut().enumerate() {
+            let mut shifted = iq.clone();
+            for (i, b) in shifted.iter_mut().enumerate() {
+                *b = b.wrapping_add(((i * 13 + k * 41) % 97) as i8);
+            }
+            *v = feats_from(&shifted, &layout);
+        }
         let mut det = alloc::boxed::Box::new(PresenceDetector::<50>::new(Config::default()));
         let mut t = 0u64;
+        let mut k = 0usize;
         measure("csi_wander", "subcarrier", sc, || {
             t += 20_000;
-            core::hint::black_box(det.push(&feats, Micros(t)));
+            k = (k + 1) & 3;
+            core::hint::black_box(det.push(&variants[k], Micros(t)));
             Work { samples: sc, ..Work::ZERO }
         });
+        // Say what the window actually holds, so a reader can see the
+        // reduction was exercised rather than short-circuited.
+        println!("CSIPROBE wander={} warm={}", det.wander(), det.warm());
         report_memory("after_csi");
     }
 
