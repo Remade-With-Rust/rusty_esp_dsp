@@ -586,3 +586,62 @@ the campaign was not wasted when the aligned arm landed on top of it.
 -47.7% and `mono_to_stereo` at -42.2% on the same basis, and `mix_i16`,
 `DcBlock`, `Biquad`, `Agc`, `Convert` and `LinearResampler` all read i16
 through the same byte path. None of them has been converted yet.
+
+### I12 — the alignment seam spent across all seven remaining i16 kernels (2026-09-19)
+
+`StereoToMono` (I11) proved the seam. These are the rest. Every one keeps its
+byte loop as the oracle and as what a misaligned or big-endian buffer gets.
+ESP32-S3, ~30 untouched kernels in the same build, **null arm 0.00% on every
+flash**:
+
+| kernel | before | after | |
+|---|---:|---:|---:|
+| `mix_i16` | 216 383 | 124 881 | **−42.3%** |
+| `pcm_i16_to_f32` | 348 446 | 209 293 | **−39.9%** |
+| `gain_i16` | 201 691 | 127 920 | **−36.6%** |
+| `pcm_f32_to_i16` | 786 858 | 534 990 | **−32.0%** |
+| `resample_16k_48k` | 2 207 759 | 1 691 237 | **−23.4%** |
+| `dc_block_mono` | 807 576 | 721 604 | **−10.6%** |
+| `biquad_mono` | 1 032 476 | 984 158 | **−4.7%** |
+| `agc_i16` | 1 193 621 | 1 139 770 | **−4.5%** |
+
+### ★★ The SPREAD is the finding: a lever is worth what the rest of the body is NOT
+
+Same change, same seam, same target, **42.3% down to 4.5%**. A kernel whose
+body is a load, an add and a store gets nearly everything from the access
+method. One carrying an int-to-float convert, a multiply and `round_sat16`
+gets almost nothing, because that float path is ~9× the cost and the two byte
+loads are noise beside it.
+
+That ratio is predictable *before* the edit, from the kernel's ps/unit next to
+a kernel of known shape: `agc_i16` at 1 193 621 against `gain_i16` at 201 691
+said the float path was ~9× everything else, and therefore that the alignment
+lever could be worth at most ~10% there. **Rank conversions by that ratio
+rather than converting in source order.**
+
+### The f32 side is worse than the i16 side
+
+`as_f32` / `as_f32_mut` joined `as_i16`, because a conversion pays the
+marshalling twice: an `i16` out of a `&[u8]` is two byte loads, a shift and an
+or; an `f32` is **four byte loads, three shifts and three ors**. That is why
+`pcm_i16_to_f32` (−39.9%) beats `gain_i16` (−36.6%) despite doing strictly
+more arithmetic.
+
+### The surprise: `LinearResampler`, −23.4%
+
+Its mono arm reads endpoints only when `idx` moves — a third of output frames
+at 16k → 48k — so the *loads* looked like a small target. But it **STORES on
+every output frame**, and that store was two byte writes. The store side is
+what paid. Its loop is now a free function so the byte and aligned paths
+cannot drift, and the Q32 phase division they share is one `frac_q32`.
+
+### The gate that matters here
+
+Every ordinary buffer is aligned, so a digest exercises only the FAST arm and
+would pass over a broken fallback forever. `arms_agree` drives BOTH for every
+converted element by sliding input and output one byte — twelve frame counts,
+both channel counts, and six gains spanning the Q15 range either side of where
+the product stops fitting `i32`. `convert` and `LinearResampler` get their own
+because their output length is not their input's; the `f32 → i16` corpus
+carries out-of-range values both ways and NaN, since `f32_to_i16` must
+saturate all of them identically down either path.
