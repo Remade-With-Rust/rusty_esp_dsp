@@ -99,3 +99,61 @@ oracle by construction (host `assert_eq!` tests); this row is their speed on the
 silicon they are meant to price. A SIMD `ee.*` kernel is worth writing where the
 row is slow and the pipeline share is real — `downscale2x_rgb565` and the SAD
 are the fat ones.
+
+## I6: the pixel kernels cracked open on the S3 (2026-09-19)
+
+A `codec-vectorize-kernel` pass over the pixel and block kernels, measured
+three ways: emitted asm from the crate build, disassembly of the FLASHED
+firmware, and throughput on a XIAO ESP32-S3 read over serial (esp-alloc arm,
+the I5 baseline). The three disagree, and the disagreements are the finding.
+
+### What shipped
+
+| change | flashed asm | on the S3 |
+|---|---|---:|
+| row slices + `chunks_exact` in both downscales | plain build −39 loop instrs, 9→6 guards; **LTO build byte-identical** | **0.00%** |
+| keep RGB565 pixels PACKED, widen one channel at a time | loop 122 → 119, **bit-ops 71 → 56 (−21%)**, loads 20 → 18, spills 10 → 9 | **−7.7%** |
+
+`downscale2x_rgb565`: **1,779,218 → 1,641,602 ps/px_out, 0.562 → 0.609
+Mpx/s.** Byte-identity gated by `tests/moved.rs`, which holds the pre-move
+implementations and demands identity over a generated corpus (26 tests green).
+
+**Null arm, free and unusually clean:** the seven kernels neither change
+touches reproduced across the two runs to 0.001% or exactly —
+`yuyv_to_rgb565` 569,369 both times, `rgb888_to_rgb565` 337,861 both times,
+`downscale2x_gray8` 289,075 both times, `sad_16x16` 21,573,560 → 21,573,347.
+So the −7.7% is the change, not drift.
+
+### Three instrument corrections, all of which changed a conclusion
+
+1. **Censusing the wrong build.** `cargo build --release` on the crate and the
+   firmware profile (`opt-level=3`, fat LTO, `codegen-units=1`) are different
+   programs — **257 vs 164 instructions** for this kernel. The row-slicing
+   restructure was worth −39 loop instructions in the first and produced a
+   byte-identical function in the second. Only the flashed ELF predicts the chip.
+2. **`s*` is not "store" on Xtensa.** Counting any `s`-prefixed mnemonic as a
+   store swept in `srli`/`slli` and reported **30 stores in a loop that writes
+   2 bytes**. That read as catastrophic spilling and aimed a whole change at a
+   problem that did not exist. The real loop is 8 pixel loads, 2 stores, 9
+   spill accesses and 56 bit-ops.
+3. **A back-edge is not a loop.** The smallest span picked a 14-instruction
+   slow-path loop over the 116-instruction pixel loop.
+
+### What is left, and where it goes
+
+The kernel is now 56 bit-ops and 427 cycles per output pixel (3.6 CPI) doing
+twelve 5/6-bit channel widenings — a SIMD shape. **ESP32-S3 PIE (128-bit) is
+reachable from Rust**, verified: under
+`#![cfg_attr(target_arch = "xtensa", feature(asm_experimental_arch))]` an
+`asm!` block emits `ee.zero.q` / `ee.vld.128.ip` / `ee.vadds.s8` /
+`ee.vst.128.ip` for `xtensa-esp32s3-none-elf` on the `esp-198` toolchain.
+Before a real twin: `ee.vld.128.ip` wants 16-byte alignment (unaligned is
+`ee.ld.128.usar.ip` + `ee.src.q`) and `ee.vunzip.8` lane semantics need the
+S3 TRM rather than a guess. `PieS3` still `delegate_to_scalar!`; a twin
+overrides one method there and is gated by `seam`'s differential harness.
+
+`sad_16x16` prices as 129 loop instructions, **33 loads, 0 bit-ops, 0
+spills** — purely load-bound, matching the standing finding that SAD does not
+reward wider SIMD. It is not the place to start.
+
+Instrument and the full laws: `rusty-esp-embedded` §21 + its `xtensa_census.py`.
