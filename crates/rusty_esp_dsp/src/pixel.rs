@@ -151,23 +151,33 @@ pub fn downscale2x_rgb565(src: &[u8], width: u32, height: u32, dst: &mut [u8]) -
     let (ow, oh) = (w / 2, h / 2);
     let out = Geometry::new(ow as u32, oh as u32, PixelFormat::Rgb565)?;
     expect_len(dst, ow * oh * 2)?;
-    let px = |x: usize, y: usize| -> [u8; 3] {
-        let i = (y * w + x) * 2;
-        unpack_rgb565(u16::from_le_bytes([src[i], src[i + 1]]))
-    };
+    // Hoist the two source rows and the destination row per output row, then
+    // walk them as fixed 4-byte (two-pixel) chunks. Indexing the whole `src`
+    // through a closure that re-derived `(y * w + x) * 2` cost four
+    // bounds-checked pairs of loads per output pixel; the gray8 twin has
+    // always sliced its rows, which is why it ran ~6x faster for the same
+    // shape of work. The arithmetic below is unchanged, so every output byte
+    // is identical.
+    let stride = w * 2;
+    let span = ow * 4; // the two-pixel columns this row actually reads
     for oy in 0..oh {
-        for ox in 0..ow {
-            let a = px(2 * ox, 2 * oy);
-            let b = px(2 * ox + 1, 2 * oy);
-            let c = px(2 * ox, 2 * oy + 1);
-            let d = px(2 * ox + 1, 2 * oy + 1);
+        let r0 = &src[(2 * oy) * stride..(2 * oy) * stride + span];
+        let r1 = &src[(2 * oy + 1) * stride..(2 * oy + 1) * stride + span];
+        let drow = &mut dst[oy * ow * 2..oy * ow * 2 + ow * 2];
+        for ((s0, s1), d) in r0
+            .chunks_exact(4)
+            .zip(r1.chunks_exact(4))
+            .zip(drow.chunks_exact_mut(2))
+        {
+            let p00 = unpack_rgb565(u16::from_le_bytes([s0[0], s0[1]]));
+            let p01 = unpack_rgb565(u16::from_le_bytes([s0[2], s0[3]]));
+            let p10 = unpack_rgb565(u16::from_le_bytes([s1[0], s1[1]]));
+            let p11 = unpack_rgb565(u16::from_le_bytes([s1[2], s1[3]]));
             let avg = |k: usize| {
-                ((u32::from(a[k]) + u32::from(b[k]) + u32::from(c[k]) + u32::from(d[k]) + 2) / 4)
-                    as u8
+                ((u32::from(p00[k]) + u32::from(p01[k]) + u32::from(p10[k]) + u32::from(p11[k]) + 2)
+                    / 4) as u8
             };
-            let p = pack_rgb565(avg(0), avg(1), avg(2)).to_le_bytes();
-            let o = (oy * ow + ox) * 2;
-            dst[o..o + 2].copy_from_slice(&p);
+            d.copy_from_slice(&pack_rgb565(avg(0), avg(1), avg(2)).to_le_bytes());
         }
     }
     Ok(out)
