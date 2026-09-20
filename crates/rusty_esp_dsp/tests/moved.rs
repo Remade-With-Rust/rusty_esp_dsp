@@ -267,10 +267,28 @@ fn dbfs_matches_the_audio_core_copy_bit_for_bit() {
         }
         let ours = rms_dbfs_i16(&bytes);
         let theirs = original::rms_dbfs_i16(&bytes);
-        assert_eq!(
-            ours.to_bits(),
-            theirs.to_bits(),
-            "round {round}: {ours} vs {theirs}"
+        // NOT bit-equality, and the change is deliberate (ledger R4).
+        //
+        // This gate's job is to prove a MOVE was faithful. For every other
+        // kernel here that is bit-equality, because nothing about them
+        // changed. `rms_dbfs_i16`'s float tail did change: it is single
+        // precision now, because the ESP32-S3's FPU is, and the `f64` it
+        // used to carry compiled to software routines costing ~48% of the
+        // one audio block that ships.
+        //
+        // Pinning an implementation choice with `assert_eq!` turned a
+        // refactor gate into a design gate and froze that cost in place. The
+        // contract that matters is the ERROR, and it is bounded far harder
+        // than this loop could: `tests/dbfs_tail_exhaustive.rs` walks all
+        // 520,093,697 inputs the tail can ever receive and reports a maximum
+        // of 1.526e-5 dB. The bound below is that figure with room, against
+        // a reference this test computes in f64.
+        //
+        // A VAD threshold is whole dB; a log line prints one decimal.
+        let err = f64::from(ours) - f64::from(theirs);
+        assert!(
+            err.abs() < 1.0e-4,
+            "round {round}: {ours} vs {theirs} (err {err:e} dB)"
         );
     }
     assert_eq!(rms_dbfs_i16(&[]), original::rms_dbfs_i16(&[]));

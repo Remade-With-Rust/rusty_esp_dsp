@@ -1644,3 +1644,158 @@ references them.
 audio. **Patch every crate of a sibling, not the one you happened to need
 first** — the same law the probe manifest already carried in a comment, in a
 place the generator could not see.
+
+
+## R4 — the f64 tail retired, and the gate replaced rather than deleted (2026-09-20)
+
+`rms_dbfs_i16`'s float tail was `f64`. The ESP32-S3's FPU is **single
+precision**, so its divide, `sqrt` and `log10` were all software routines,
+and R2 priced them at ~48% of the one audio block that ships.
+
+That was never a precision decision. It was a desktop habit that nobody
+questioned, paid for in the hottest audio code on the chip, for digits no
+consumer reads — a VAD threshold is whole dB and a log line prints one
+decimal.
+
+### What blocked it was a gate pinning the wrong property
+
+`tests/moved.rs` is the **D0** gate: "every kernel that moved here is
+byte-identical to the copy it replaced." That is a *refactor* gate — it
+proves a move was faithful. Applied to a function whose implementation
+should still be free to change, it had quietly become a *design* gate,
+freezing an arbitrary arithmetic choice forever.
+
+So the answer was not to delete an assertion. It was to state the contract
+that actually matters and prove it **harder** than the one it replaces.
+
+### The tail takes one number, so its domain is enumerable
+
+`20·log10(√m / 32768)` is `10·log10(m) − 20·log10(32768)`, which drops the
+square root outright. The whole tail is then one `f32` in, one out — and
+`tests/dbfs_tail_exhaustive.rs` walks **every input it can ever receive**:
+
+```
+EXHAUSTIVE: 520,093,697 points over [2⁻³², 2³⁰]
+  max |err| = 1.526e-5 dB, at the domain floor
+```
+
+17.9 seconds, calling the SHIPPED function. Not a corpus — R2 itself records
+a 190-point corpus reporting a max error of exactly zero for a form that
+3.46 M points later showed disagreeing on 0.9% of cases. **A sample can only
+fail to refute a rounding claim. An enumeration settles it.**
+
+The domain floor is `2⁻³²`, which allows `n` up to 4.29e9 samples in one
+block. Below it lie the subnormals, where both candidate forms read 3.05e-5
+dB; excluding them is not cherry-picking, because `acc as f32 / n as f32`
+with integer `acc ≥ 1` would need `n` near 1e38 to reach one.
+
+The error is proportional to the magnitude of the result, so 1.526e-5 dB is
+the figure at about −186 dBFS and it is nearer 4e-6 dB across normal levels.
+
+### Measured on the S3, null arm median 0.00% / p90 0.02% over 113 kernels
+
+**Eight kernels moved together, and every one of them computes a level.**
+That is attribution layout cannot fake:
+
+| kernel | before | after | |
+|---|---:|---:|---:|
+| `vad_i16` | 282,765 | 71,875 | **−74.6%** |
+| `rms_pie` | 38,280 | 12,678 | **−66.9%** |
+| `audio_rms` (the seam) | 38,312 | 12,709 | **−66.8%** |
+| `rms_un_pie` | 41,054 | 15,361 | **−62.6%** |
+| **`prod_audio_block`** | **869,244** | **641,606** | **−26.2%** |
+| `agc_i16` | 841,028 | 630,090 | −25.1% |
+| `rms_scalar` | 215,166 | 189,621 | −11.9% |
+| `rms_un_scalar` | 215,299 | 189,664 | −11.9% |
+
+`prod_audio_block` is the shipping number: **−26.2% on the only audio block
+that ships.**
+
+★ The spread says the I12 law again. The same change is −66.9% on the PIE
+path and −11.9% on the scalar one, because on the PIE path the sum of
+squares is already vector and the tail WAS the function, while on the scalar
+path the sum still dominates. **A lever is worth what the rest of the body
+is not.**
+
+### And it removed a duplicate
+
+`pie_s3.rs` carried a byte-for-byte copy of the tail. Both now call
+`rusty_esp_dsp::sample::dbfs_from_mean_square`, so the twin and its oracle
+cannot drift apart — two places for one contract to rot in was the real
+defect, and the pin had been protecting it.
+
+---
+
+## R5 — the fused funnel was never the problem, and a do-while that could run 4 billion times (2026-09-20)
+
+### The open question, closed
+
+Ledger I8 recorded `convert_i32_to_i16`'s fused-funnel arm at **+31.4%** and
+refused to call it a refutation: the trip had gone 16 → 24 on a 239-sample
+buffer, which moved the scalar TAIL from 15 samples to 23, and at ~165,000
+ps/sample those eight samples were worth more than the whole apparent
+regression (§4).
+
+Re-measured at **n = 200**, where `n − UNALIGNED_TAIL = 192` divides by both
+16 and 24 so both arms leave an identical 8-sample tail:
+
+| arm | ps/sample | |
+|---|---:|---:|
+| 16-wide, `ee.ld.128.usar.ip` + `ee.src.q` | 29,148 | — |
+| 24-wide, `ee.src.q.ld.ip` | **24,642** | **−15.5%** |
+
+`identical=true`, `fused_body=192`. Reproduced at −17.7% and −21.3% in two
+other builds. **The instruction was never the problem; the buffer length
+was.** I8's refusal to bank the number was correct.
+
+### But the width is not free, and shipping it needed a work count
+
+A wider trip strands a wider remainder. At n = 239 the 24-wide vectorises
+216 samples and the 16-wide vectorises 224 — and eight extra samples at the
+scalar rate cost more than the faster kernel saves over the other 216.
+Chaining the arms does not rescue it either: the 23 samples the 24-wide
+leaves are one short of the 24 the 16-wide needs.
+
+So `convert_i32_to_i16` now runs **whichever arm vectorises more**, via a
+shared `unaligned_body(n, w)` so the caller computes exactly what the arms
+will do rather than a paraphrase that can drift. No cost model is needed:
+the vector rate is strictly below the scalar rate, so more vectorised
+samples is never worse, and at equal counts the faster kernel wins.
+
+### ★★ The fault that found a latent bug in five kernels
+
+Chaining the arms crashed the board with *"Detected a write to the stack
+guard value on ProCpu"*. The cause is general and was sitting in the tree:
+
+> Every unaligned arm's loop is a **do-while** — `bnez` tests after the
+> body. Its early guard bounds `n`, not `body`, and the two are not the same
+> condition. `convert_i32_to_i16_unaligned_src` passes `n >= 16` and still
+> computes `body == 0` for every n in 16..=23. `left = 0`, `addi` makes it
+> −1, `bnez` is true, and the loop runs about four billion times writing
+> through memory.
+
+`downscale2x_gray8_unaligned_row` already had `if body == 0 { return 0; }`.
+**Five others did not** — `sum_sq_i16_unaligned`, `stereo_to_mono_i16_-
+unaligned_src`, `convert_i16_to_i32_unaligned_src`,
+`convert_i32_to_i16_unaligned_src` and `convert_i32_to_i24in32_unaligned_src`
+— and each has a reachable window of input lengths that triggers it. All six
+are guarded now.
+
+It is reachable from a short buffer and no gate in this campaign could see
+it: byte-identity never ran, because the board faulted first.
+
+### ★ `#[inline(never)]` is not a free way out of a link error
+
+The probe's `main` went past the `l32r` literal range again. Marking the new
+kernel `#[inline(never)]` fixes that — and costs the kernel **+23.6%**
+(24,081 → 29,769). The firmware shrank its own `main` instead. **A test
+binary's layout problem does not get solved in the library.**
+
+### A note on what is admissible here
+
+The cross-build readings in this entry are not. Extracting 103 lines out of
+`main` moved the null arm to p90 2.27% / max 24.87%, so `cvt3216_un_pie`'s
+apparent +16.7% is layout: at n = 239 the selection is deterministic
+(`unaligned_body(239,24) = 216 < 224`), so the shipped path takes the same
+16-wide arm it took before, and the code cannot have changed cost. Every
+verdict above rests on the **same-build** A/B instead (§12).

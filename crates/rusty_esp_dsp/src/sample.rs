@@ -128,6 +128,44 @@ pub fn peak_abs_i16(a: &[i16]) -> u16 {
     best
 }
 
+/// Level in dBFS from a mean square of `i16` samples, the float tail of
+/// [`rms_dbfs_i16`] — and the ONE place that arithmetic lives, so the PIE
+/// twin and the scalar cannot drift apart.
+///
+/// A non-positive mean square returns the same `-120.0` silence floor.
+///
+/// # Single precision, deliberately, with a proven bound
+///
+/// `20·log10(√m / 32768)` is `10·log10(m) − 20·log10(32768)`, which drops
+/// the square root outright. The whole tail then runs in `f32`.
+///
+/// This used to be `f64`. On an ESP32-S3 that was not a precision decision,
+/// it was a **cost** decision made by accident: the chip's FPU is single
+/// precision, so every `f64` operation here compiled to a software routine,
+/// and the tail measured ~48% of the function on the one audio block that
+/// ships. The precision being paid for did not exist in the hardware and no
+/// consumer read it — a VAD threshold is whole dB and a log line prints one
+/// decimal.
+///
+/// The bound is not a corpus figure. The tail takes one number, so its whole
+/// domain is enumerable and `tests/dbfs_tail_exhaustive.rs` walks it:
+/// **520,093,697 inputs — every value this function can ever be handed —
+/// with a maximum error of 1.526e-5 dB** against the `f64` form. The error is
+/// proportional to the magnitude of the result, so it is that large only at
+/// the quietest representable block (about −186 dBFS) and nearer 4e-6 dB
+/// across normal levels.
+///
+/// Ledger R4 has the reasoning and the measurement.
+#[must_use]
+pub fn dbfs_from_mean_square(mean_square: f32) -> f32 {
+    if !(mean_square > 0.0) {
+        return -120.0;
+    }
+    // 20·log10(32768), rounded once to f32 by the compiler.
+    const K: f32 = 90.308_998_699_194_36;
+    10.0 * libm::log10f(mean_square) - K
+}
+
 /// Level of an interleaved i16 block in dBFS (RMS over all channels).
 /// Digital silence returns `-120.0`.
 #[must_use]
@@ -136,10 +174,9 @@ pub fn rms_dbfs_i16(samples: &[u8]) -> f32 {
     if n == 0 || acc == 0 {
         return -120.0;
     }
-    // Exact in f64 up to 2^53; the final division and log are the only rounding.
-    let mean = acc as f64 / n as f64;
-    let rms = libm::sqrt(mean) / 32768.0;
-    (20.0 * libm::log10(rms)) as f32
+    // The sum is exact: `sum_sq_i16_le` accumulates in integers. Only this
+    // division and the log round, and both are bounded exhaustively.
+    dbfs_from_mean_square(acc as f32 / n as f32)
 }
 
 #[cfg(test)]

@@ -721,9 +721,11 @@ pub fn rms_dbfs_i16(samples: &[u8]) -> f32 {
     if n == 0 || acc == 0 {
         return -120.0;
     }
-    let mean = acc as f64 / n as f64;
-    let rms = libm::sqrt(mean) / 32768.0;
-    (20.0 * libm::log10(rms)) as f32
+    // The tail is NOT duplicated here. It lives in
+    // `rusty_esp_dsp::sample::dbfs_from_mean_square`, so the twin and its
+    // oracle cannot drift apart -- this file carried a byte-for-byte copy of
+    // it until R4, which is two places for one contract to rot in.
+    rusty_esp_dsp::sample::dbfs_from_mean_square(acc as f32 / n as f32)
 }
 
 /// Stereo to mono: `(l + r) >> 1` per frame, the arithmetic `StereoToMono`
@@ -949,6 +951,20 @@ pub fn downscale2x_gray8(src: &[u8], width: u32, height: u32, dst: &mut [u8]) ->
 /// scalar loop finishes the job.
 const UNALIGNED_TAIL: usize = 8;
 
+/// How many samples an unaligned arm of trip width `w` will vectorise from a
+/// block of `n`: it reserves [`UNALIGNED_TAIL`] for read-ahead and rounds the
+/// rest down to a whole number of trips.
+///
+/// Shared so a caller choosing between two arms computes exactly what those
+/// arms will do, rather than a paraphrase that can drift from them.
+const fn unaligned_body(n: usize, w: usize) -> usize {
+    if n < UNALIGNED_TAIL + w {
+        0
+    } else {
+        (n - UNALIGNED_TAIL) / w * w
+    }
+}
+
 /// `sum_sq_i16` for a buffer that is NOT 16-byte aligned.
 ///
 /// Until now any such buffer took the scalar path in full. The unaligned
@@ -981,6 +997,15 @@ fn sum_sq_i16_unaligned(a: &[i16]) -> i64 {
     // windows, 24 samples.
     let body = if n < 40 { 0 } else { (n - 16) / 24 * 24 };
     let mut total: i64 = 0;
+    // A do-while loop: `bnez` tests AFTER the body, so a zero trip count
+    // wraps to 4 billion iterations and walks off the end of memory. The
+    // early guards above bound `n`, not `body`, and the two are not the same
+    // condition -- `convert_i32_to_i16_unaligned_src` passes `n >= 16` and
+    // still computes `body == 0` for every n in 16..=23. Found by a stack
+    // guard fault on chip (ledger R5), not by a test.
+    if body == 0 {
+        return 0;
+    }
     let mut p = a.as_ptr().cast::<u8>();
     let mut left = body / 24;
 
@@ -1539,6 +1564,15 @@ fn stereo_to_mono_i16_unaligned_src(src: &[i16], dst: &mut [i16]) -> usize {
         return 0;
     }
     let body = (frames - UNALIGNED_TAIL) / 8 * 8;
+    // A do-while loop: `bnez` tests AFTER the body, so a zero trip count
+    // wraps to 4 billion iterations and walks off the end of memory. The
+    // early guards above bound `n`, not `body`, and the two are not the same
+    // condition -- `convert_i32_to_i16_unaligned_src` passes `n >= 16` and
+    // still computes `body == 0` for every n in 16..=23. Found by a stack
+    // guard fault on chip (ledger R5), not by a test.
+    if body == 0 {
+        return 0;
+    }
     let mut ps = src.as_ptr().cast::<u8>();
     let mut pd = dst.as_mut_ptr().cast::<u8>();
     let mut left = body / 8;
@@ -1947,8 +1981,32 @@ pub fn convert_i32_to_i16(src: &[i32], dst: &mut [i16]) {
     let start = if vectorable {
         body
     } else {
-        // Source at any offset, destination aligned.
-        convert_i32_to_i16_unaligned_src(src, dst)
+        // Source at any offset, destination aligned. TWO vector arms, and
+        // the choice between them is a work count, not a preference.
+        //
+        // The fused 24-wide body is -17.7% per vectorised sample against the
+        // 16-wide one (ledger R5: same build, byte-identical, equal work).
+        // But a wider trip strands a wider REMAINDER. Both arms reserve
+        // `UNALIGNED_TAIL` for read-ahead and then round down, so at n = 239
+        // the 24-wide vectorises 216 samples and the 16-wide vectorises 224
+        // -- and eight extra samples at the scalar rate cost more than the
+        // faster kernel saves over the other 216. Measured: the fused arm
+        // alone read +15.1% on that length.
+        //
+        // Chaining them does not rescue it either, because the 23 samples
+        // the 24-wide leaves are one short of the 24 the 16-wide needs.
+        //
+        // So: run whichever arm VECTORISES MORE, and prefer the fused one on
+        // a tie. No cost model is needed -- the vector rate is strictly
+        // below the scalar rate, so more vectorised samples is never worse,
+        // and at equal counts the faster kernel wins by definition.
+        let b24 = unaligned_body(n, 24);
+        let b16 = unaligned_body(n, 16);
+        if b24 >= b16 {
+            convert_i32_to_i16_unaligned_src_fused(src, dst)
+        } else {
+            convert_i32_to_i16_unaligned_src(src, dst)
+        }
     };
     for k in start..n {
         dst[k] = (src[k] >> 16) as i16;
@@ -2039,6 +2097,15 @@ fn convert_i16_to_i32_unaligned_src(src: &[i16], dst: &mut [i32]) -> usize {
     // whose window work is one or two instructions) and costs where it is
     // long -- this body's zip-and-two-stores read +37.5%. See the P7 entry.
     let body = (n - UNALIGNED_TAIL) / 16 * 16;
+    // A do-while loop: `bnez` tests AFTER the body, so a zero trip count
+    // wraps to 4 billion iterations and walks off the end of memory. The
+    // early guards above bound `n`, not `body`, and the two are not the same
+    // condition -- `convert_i32_to_i16_unaligned_src` passes `n >= 16` and
+    // still computes `body == 0` for every n in 16..=23. Found by a stack
+    // guard fault on chip (ledger R5), not by a test.
+    if body == 0 {
+        return 0;
+    }
     let mut ps = src.as_ptr().cast::<u8>();
     let mut pd = dst.as_mut_ptr().cast::<u8>();
     let mut left = body / 16;
@@ -2085,16 +2152,28 @@ fn convert_i32_to_i16_unaligned_src(src: &[i32], dst: &mut [i16]) -> usize {
     if n < UNALIGNED_TAIL + 8 || !aligned16(dst.as_ptr().cast::<u8>()) {
         return 0;
     }
-    // The fused funnel is NOT applied here, and this is an OPEN question
-    // rather than a refutation. It was tried and read +31.4% -- but the trip
-    // went from 16 samples to 24, which on this kernel's 239-sample test
-    // buffer moved the scalar TAIL from 15 samples to 23. At the scalar
-    // arm's ~165,000 ps/sample those eight samples add ~5,500 ps/sample by
-    // themselves, more than the whole apparent regression. The measurement
-    // did not hold work constant (`codec-measurement` §4), so it says
-    // nothing about the instruction. Re-test with a buffer whose length is
-    // a multiple of both trip widths before drawing any conclusion.
+    // ANSWERED (ledger R5), and this arm is now the SHORT-BLOCK fallback:
+    // `convert_i32_to_i16` tries the fused-funnel 24-wide version first.
+    //
+    // The fused funnel had read +31.4% and that number was thrown out rather
+    // than believed -- the trip went 16 -> 24 on a 239-sample buffer, which
+    // moved the scalar TAIL from 15 samples to 23, and at ~165,000
+    // ps/sample those eight samples were worth more than the whole apparent
+    // regression (`codec-measurement` §4). Re-measured on n = 200, where
+    // `n - UNALIGNED_TAIL` divides by both 16 and 24 so both arms leave an
+    // identical 8-sample tail, the fused form is **-21.3%** and
+    // byte-identical. The instruction was never the problem; the buffer
+    // length was.
     let body = (n - UNALIGNED_TAIL) / 16 * 16;
+    // A do-while loop: `bnez` tests AFTER the body, so a zero trip count
+    // wraps to 4 billion iterations and walks off the end of memory. The
+    // early guards above bound `n`, not `body`, and the two are not the same
+    // condition -- `convert_i32_to_i16_unaligned_src` passes `n >= 16` and
+    // still computes `body == 0` for every n in 16..=23. Found by a stack
+    // guard fault on chip (ledger R5), not by a test.
+    if body == 0 {
+        return 0;
+    }
     let mut ps = src.as_ptr().cast::<u8>();
     let mut pd = dst.as_mut_ptr().cast::<u8>();
     let mut left = body / 16;
@@ -2132,6 +2211,114 @@ fn convert_i32_to_i16_unaligned_src(src: &[i32], dst: &mut [i16]) -> usize {
     body
 }
 
+/// The FUSED-FUNNEL candidate for `convert_i32_to_i16` from an unaligned
+/// source — the open question from ledger I8, built so it can be priced
+/// with equal work counts.
+///
+/// `ee.src.q.ld.ip qu, as, imm, qx, qy` does the unaligned funnel AND the
+/// next block's load in one instruction, and needs SAR_BYTE set only once
+/// for the stream. Three of them close a register rotation: from
+/// `(q0, q1) = (block k, block k+1)` the roles return to `(q0, q1)` with the
+/// windows landing in q0, q1, q2 in turn.
+///
+/// i32→i16 needs window PAIRS, because `ee.vunzip.16` takes two registers to
+/// produce one store. Three windows per rotation will not pair evenly, so
+/// this runs TWO rotations — six windows, three pairs, three stores, **24
+/// samples a trip** — and the roles are back where they started.
+///
+/// Each window must also be copied aside before the next fused op, because
+/// that op's load target is the register the window is sitting in. That is
+/// the `ee.orq` per pair, and it is the price of the fusion here:
+///
+/// ```text
+///   16-wide, non-fused   4 ld + 4 src + 2 unzip + 2 st + 2   = 14 / 16 = 0.875
+///   24-wide, fused       6 fused + 3 orq + 3 unzip + 3 st + 2 = 17 / 24 = 0.708
+/// ```
+///
+/// Both arms read exactly four bytes per sample, so this is a fair trade of
+/// instructions at constant load traffic — which is the whole question, the
+/// campaign having crossed from instruction-bound to load-bound.
+///
+/// Deliberately NOT `#[inline(never)]`, though that was tried: it fixes the
+/// probe firmware's `l32r` link range and costs this kernel **+23.6%**
+/// (24,081 -> 29,769 ps/sample), which would have handed most of the win
+/// back to solve a test binary's layout problem in the library. The firmware
+/// shrinks its own `main` instead.
+#[allow(unsafe_code)]
+fn convert_i32_to_i16_unaligned_src_fused(src: &[i32], dst: &mut [i16]) -> usize {
+    let n = src.len().min(dst.len());
+    if n < UNALIGNED_TAIL + 24 || !aligned16(dst.as_ptr().cast::<u8>()) {
+        return 0;
+    }
+    let body = (n - UNALIGNED_TAIL) / 24 * 24;
+    // A do-while loop: `bnez` tests AFTER the body, so a zero trip count
+    // wraps to 4 billion iterations and walks off the end of memory. The
+    // early guards above bound `n`, not `body`, and the two are not the same
+    // condition -- `convert_i32_to_i16_unaligned_src` passes `n >= 16` and
+    // still computes `body == 0` for every n in 16..=23. Found by a stack
+    // guard fault on chip (ledger R5), not by a test.
+    if body == 0 {
+        return 0;
+    }
+    let mut ps = src.as_ptr().cast::<u8>();
+    let mut pd = dst.as_mut_ptr().cast::<u8>();
+    let mut left = body / 24;
+    // SAFETY: twenty-four samples a trip -- 96 source bytes consumed, 48
+    // written -- with the stream running at most two blocks (32 bytes) ahead
+    // of the last byte a window consumes, which `UNALIGNED_TAIL` reserves.
+    // `dst` is 16-byte aligned. q0-q4 only; SAR is restored.
+    unsafe {
+        core::arch::asm!(
+            "rsr.sar {sar}",
+            "ee.ld.128.usar.ip q0, {ps}, 16",  // block k, and set SAR_BYTE
+            "ee.vld.128.ip q1, {ps}, 16",      // block k+1
+            "33:",
+            // ---- rotation one: windows into q0, q1, q2 ----
+            "ee.src.q.ld.ip q2, {ps}, 16, q0, q1",  // q0 = W0, q2 = blk+2
+            "ee.orq q4, q0, q0",                    // W0 aside: q0 is next load
+            "ee.src.q.ld.ip q0, {ps}, 16, q1, q2",  // q1 = W1, q0 = blk+3
+            "ee.vunzip.16 q4, q1",                  // q1 = the eight high halfwords
+            "ee.vst.128.ip q1, {pd}, 16",
+            "ee.src.q.ld.ip q1, {ps}, 16, q2, q0",  // q2 = W2, q1 = blk+4
+            "ee.orq q4, q2, q2",
+            // ---- rotation two: roles are back at (q0, q1) ----
+            "ee.src.q.ld.ip q2, {ps}, 16, q0, q1",  // q0 = W3, q2 = blk+5
+            "ee.vunzip.16 q4, q0",
+            "ee.vst.128.ip q0, {pd}, 16",
+            "ee.src.q.ld.ip q0, {ps}, 16, q1, q2",  // q1 = W4, q0 = blk+6
+            "ee.orq q4, q1, q1",
+            "ee.src.q.ld.ip q1, {ps}, 16, q2, q0",  // q2 = W5, q1 = blk+7
+            "ee.vunzip.16 q4, q2",
+            "ee.vst.128.ip q2, {pd}, 16",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 33b",
+            "wsr.sar {sar}",
+            ps = inout(reg) ps,
+            pd = inout(reg) pd,
+            n = inout(reg) left => _,
+            sar = out(reg) _,
+            options(nostack),
+        );
+    }
+    let _ = (ps, pd);
+    body
+}
+
+/// The fused candidate behind a callable name, for the same-build A/B in the
+/// probe. **Experimental**: `convert_i32_to_i16` does not use it, and it is
+/// here to be priced against the shipped 16-wide arm on a buffer length that
+/// is a multiple of BOTH trip widths. See ledger I8 and R5.
+#[doc(hidden)]
+#[must_use]
+pub fn convert_i32_to_i16_fused_probe(src: &[i32], dst: &mut [i16]) -> usize {
+    let done = convert_i32_to_i16_unaligned_src_fused(src, dst);
+    let n = src.len().min(dst.len());
+    for i in done..n {
+        dst[i] = (src[i] >> 16) as i16;
+    }
+    done
+}
+
 /// `convert_i32_to_i24in32` from an unaligned source.
 #[allow(unsafe_code)]
 fn convert_i32_to_i24in32_unaligned_src(src: &[i32], dst: &mut [i32]) -> usize {
@@ -2147,6 +2334,15 @@ fn convert_i32_to_i24in32_unaligned_src(src: &[i32], dst: &mut [i32]) -> usize {
     // from `(q0, q1) = (block k, block k+1)` they leave `(block k+3,
     // block k+4)`, with the windows landing in q0, q1, q2 in turn.
     let body = if n < 28 { 0 } else { (n - 8) / 12 * 12 };
+    // A do-while loop: `bnez` tests AFTER the body, so a zero trip count
+    // wraps to 4 billion iterations and walks off the end of memory. The
+    // early guards above bound `n`, not `body`, and the two are not the same
+    // condition -- `convert_i32_to_i16_unaligned_src` passes `n >= 16` and
+    // still computes `body == 0` for every n in 16..=23. Found by a stack
+    // guard fault on chip (ledger R5), not by a test.
+    if body == 0 {
+        return 0;
+    }
     let mut ps = src.as_ptr().cast::<u8>();
     let mut pd = dst.as_mut_ptr().cast::<u8>();
     let mut left = body / 12;
