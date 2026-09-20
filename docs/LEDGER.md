@@ -1317,3 +1317,58 @@ them to EACH OTHER, not only each to its own scalar.
 The remaining aligned arms (`mix_i16`, `gain_i16`, the three converts) are
 still at eight samples a trip and are candidates for the same treatment —
 not claimed here, because none has been measured.
+
+## P5 — ten wins from unroll width alone, and one kernel that refused it
+
+Not one new kernel. Every win here is the same edit — the trip was too
+narrow and the body was mostly LOOP — applied to arms that P4's §2b finding
+said to look at.
+
+| kernel | before | after | | instr/elem |
+|---|---:|---:|---:|---|
+| `convert_i32_to_i24in32` | 39,042 | 24,873 | **−36.3%** | 1.25 → 0.875 |
+| `dot_i16` | 16,580 | 11,745 | **−29.2%** | 0.625 → 0.5 |
+| `yuyv_to_gray8` | 9,131 | 6,791 | **−25.6%** | ~0.44 → 0.31 |
+| `mix_i16` | 19,105 | 14,708 | **−23.0%** | 0.75 → 0.625 |
+| `convert_i32_to_i16` | 24,577 | 20,278 | **−17.5%** | 0.75 → 0.625 |
+| `convert_i16_to_i32` | 26,238 | 22,088 | **−15.8%** | 0.875 → 0.75 |
+| `mono_to_stereo` | 26,626 | 22,913 | **−13.9%** | 0.875 → 0.75 |
+| `convert_i32_to_i24in32` unal. | 48,889 | 43,286 | **−11.5%** | 1.75 → 1.375 |
+| `mix_i16` unaligned | 33,903 | 30,060 | **−11.3%** | 1.25 → 1.125 |
+| `dot_i16` unaligned | 26,389 | 23,830 | **−9.7%** | 1.125 → 1.0 |
+
+**These before/after pairs are CROSS-BUILD, which §12 says not to headline
+on its own.** So the instr/elem column is there as the second instrument:
+it is counted from the source, is exact, and needs no board. The two agree
+everywhere — predicted −10% measured −11.3%, predicted −14% measured −13.9%,
+predicted −17% measured −17.5%. Where they differ they differ in our favour
+(−20% predicted, −29.2% measured for `dot_i16`), which is what you expect
+when removing a loop-carried branch also helps the pipeline.
+
+`yuyv_to_gray8` was the worst shape of all and not because of its width:
+its loop was in **Rust**, around a four-instruction `asm!` block, so the
+block was re-entered every sixteen pixels and paid the Rust counter and
+branch on TOP of its own four instructions. Moving the loop inside the asm
+and going to 32 pixels a trip is the whole −25.6%.
+
+### ★★ REFUTED: `gain_i16` gets WORSE when you widen it
+
+Same edit, eleventh kernel, and the only one that refused. Widened to
+sixteen it read 27,329 against the eight-wide arm's 24,297 — reverted.
+
+**The instruction count went DOWN and the time went UP.** Predicted −12.5%
+on instructions per sample (1.0 → 0.875); measured worse. That can only be a
+stall, and the mechanism is named: **QACC is a single resource.** The body is
+
+    ee.zero.qacc -> vmulas -> vmulas -> ee.srcmb
+
+a chain, and the second half's `ee.zero.qacc` cannot start until the first
+half's `ee.srcmb` has read the accumulator. Widening doubles the serial
+chain to save two instructions of loop.
+
+The transferable form: **unrolling pays when the bodies are INDEPENDENT.**
+Every other kernel here works in q-registers, which are plentiful and
+renamable by hand — two loads and two adds are two independent chains.
+`gain_i16` works through the one accumulator, so its two halves are one
+chain, and instruction count stops predicting time. Count instructions to
+find the candidates; measure to keep them.

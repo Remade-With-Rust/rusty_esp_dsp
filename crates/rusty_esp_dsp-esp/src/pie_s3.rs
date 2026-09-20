@@ -77,7 +77,7 @@ pub fn yuyv_to_gray8(src: &[u8], dst: &mut [u8]) -> Result<usize> {
 
     // 32 source bytes -> 16 output bytes per trip, and both sides have to be
     // 16-byte aligned for the vector load and store.
-    let body = pixels / 16 * 16;
+    let body = pixels / 32 * 32;
     let use_simd = body != 0 && aligned16(src.as_ptr()) && aligned16(dst.as_ptr());
 
     let done = if use_simd {
@@ -110,34 +110,49 @@ pub fn yuyv_to_gray8(src: &[u8], dst: &mut [u8]) -> Result<usize> {
 }
 
 /// Gather the even bytes of `src` into `dst`; `src.len() == 2 * dst.len()`,
-/// both 16-byte aligned, and `dst.len()` a multiple of 16.
+/// both 16-byte aligned, and `dst.len()` a multiple of 32.
+///
+/// The loop lives INSIDE the asm block and runs 32 output pixels a trip.
+/// It used to be a Rust `for` around a four-instruction block, which is the
+/// worst of both: the block was re-entered every sixteen pixels and paid the
+/// Rust counter and branch on TOP of its own four instructions. Same
+/// arithmetic, same bytes out.
 #[allow(unsafe_code)]
 fn simd_even_bytes(src: &[u8], dst: &mut [u8]) {
     debug_assert_eq!(src.len(), dst.len() * 2);
-    debug_assert_eq!(dst.len() % 16, 0);
+    debug_assert_eq!(dst.len() % 32, 0);
     debug_assert!(aligned16(src.as_ptr()) && aligned16(dst.as_mut_ptr()));
 
     let mut s = src.as_ptr();
     let mut d = dst.as_mut_ptr();
-    let trips = dst.len() / 16;
-    for _ in 0..trips {
-        // SAFETY: `trips` is `dst.len() / 16` and the loop advances `s` by 32
-        // and `d` by 16 exactly once each, so the reads stay inside `src`
-        // (which is twice as long) and the writes inside `dst`. Both pointers
-        // are 16-byte aligned, which is what `ee.vld/vst.128` require, and
-        // the asm touches only q0 and q1, which nothing else holds live.
-        unsafe {
-            core::arch::asm!(
-                "ee.vld.128.ip q0, {s}, 16",
-                "ee.vld.128.ip q1, {s}, 16",
-                "ee.vunzip.8 q0, q1",
-                "ee.vst.128.ip q0, {d}, 16",
-                s = inout(reg) s,
-                d = inout(reg) d,
-                options(nostack),
-            );
-        }
+    let mut trips = dst.len() / 32;
+    if trips == 0 {
+        return;
     }
+    // SAFETY: each trip advances `s` by 64 and `d` by 32, exactly
+    // `dst.len() / 32` times, so the reads stay inside `src` (twice as long)
+    // and the writes inside `dst`. Both are 16-byte aligned, which is what
+    // `ee.vld/vst.128` require. q0-q3 only.
+    unsafe {
+        core::arch::asm!(
+            "26:",
+            "ee.vld.128.ip q0, {s}, 16",
+            "ee.vld.128.ip q1, {s}, 16",
+            "ee.vunzip.8 q0, q1",
+            "ee.vst.128.ip q0, {d}, 16",
+            "ee.vld.128.ip q2, {s}, 16",
+            "ee.vld.128.ip q3, {s}, 16",
+            "ee.vunzip.8 q2, q3",
+            "ee.vst.128.ip q2, {d}, 16",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 26b",
+            s = inout(reg) s,
+            d = inout(reg) d,
+            n = inout(reg) trips => _,
+            options(nostack),
+        );
+    }
+    let _ = (s, d);
 }
 
 /// `peak_abs_i16` on the PIE unit: the largest magnitude in the block.
@@ -491,7 +506,9 @@ pub fn sum_sq_i16(a: &[i16]) -> i64 {
 #[must_use]
 pub fn dot_i16(a: &[i16], b: &[i16]) -> i64 {
     let n = a.len().min(b.len());
-    let body = n / 8 * 8;
+    // SIXTEEN a trip; the body was one multiply-accumulate against two
+    // instructions of loop.
+    let body = n / 16 * 16;
     if body == 0 {
         return rusty_esp_dsp::sample::dot_i16(a, b);
     }
@@ -502,11 +519,13 @@ pub fn dot_i16(a: &[i16], b: &[i16]) -> i64 {
     let mut total: i64 = 0;
     let mut pa = a.as_ptr().cast::<u8>();
     let mut pb = b.as_ptr().cast::<u8>();
-    let mut left = body / 8;
+    let mut left = body / 16; // trips, two MACs each
     while left > 0 {
         // 16 instructions x 8 lanes = 128 products of at most 2^30, so the
         // partial peaks at 2^37 inside a 40-bit accumulator -- 4x headroom.
-        let batch = left.min(16);
+        // EIGHT trips = sixteen MACs = 128 products, peaking at 2^37 in
+        // the 40-bit accumulator.
+        let batch = left.min(8);
         left -= batch;
         let (lo, hi): (u32, u32);
         // SAFETY: the loop advances each pointer by 16 exactly `batch` times
@@ -518,7 +537,10 @@ pub fn dot_i16(a: &[i16], b: &[i16]) -> i64 {
                 "2:",
                 "ee.vld.128.ip q0, {pa}, 16",
                 "ee.vld.128.ip q1, {pb}, 16",
+                "ee.vld.128.ip q2, {pa}, 16",
+                "ee.vld.128.ip q3, {pb}, 16",
                 "ee.vmulas.s16.accx q0, q1",
+                "ee.vmulas.s16.accx q2, q3",
                 "addi {n}, {n}, -1",
                 "bnez {n}, 2b",
                 "rur.accx_0 {l}",
@@ -571,7 +593,8 @@ pub fn sum_sq_i16_le(samples: &[u8]) -> (i64, usize) {
 #[allow(unsafe_code)]
 pub fn mix_i16(a: &[i16], b: &[i16], out: &mut [i16]) {
     let n = a.len().min(b.len()).min(out.len());
-    let body = n / 8 * 8;
+    // SIXTEEN a trip; the body was one add against two instructions of loop.
+    let body = n / 16 * 16;
     let vectorable = body > 0
         && aligned16(a.as_ptr().cast::<u8>())
         && aligned16(b.as_ptr().cast::<u8>())
@@ -581,8 +604,8 @@ pub fn mix_i16(a: &[i16], b: &[i16], out: &mut [i16]) {
         let mut pa = a.as_ptr().cast::<u8>();
         let mut pb = b.as_ptr().cast::<u8>();
         let mut po = out.as_mut_ptr().cast::<u8>();
-        let mut left = body / 8;
-        // SAFETY: each pointer advances by 16 exactly `body / 8` times and
+        let mut left = body / 16;
+        // SAFETY: each pointer advances by 32 exactly `body / 16` times and
         // `body` is a multiple of 8 samples no longer than the shortest
         // slice, so every access stays in bounds. All three are 16-byte
         // aligned. q0/q1/q2 only.
@@ -591,7 +614,11 @@ pub fn mix_i16(a: &[i16], b: &[i16], out: &mut [i16]) {
                 "3:",
                 "ee.vld.128.ip q0, {pa}, 16",
                 "ee.vld.128.ip q1, {pb}, 16",
-                "ee.vadds.s16 q2, q0, q1",
+                "ee.vld.128.ip q2, {pa}, 16",
+                "ee.vld.128.ip q3, {pb}, 16",
+                "ee.vadds.s16 q0, q0, q1",
+                "ee.vadds.s16 q2, q2, q3",
+                "ee.vst.128.ip q0, {po}, 16",
                 "ee.vst.128.ip q2, {po}, 16",
                 "addi {n}, {n}, -1",
                 "bnez {n}, 3b",
@@ -628,7 +655,8 @@ pub fn mix_i16(a: &[i16], b: &[i16], out: &mut [i16]) {
 #[allow(unsafe_code)]
 pub fn mono_to_stereo_i16(src: &[i16], dst: &mut [i16]) {
     let n = src.len().min(dst.len() / 2);
-    let body = n / 8 * 8;
+    // SIXTEEN a trip.
+    let body = n / 16 * 16;
     let vectorable = body > 0
         && aligned16(src.as_ptr().cast::<u8>())
         && aligned16(dst.as_ptr().cast::<u8>());
@@ -636,8 +664,8 @@ pub fn mono_to_stereo_i16(src: &[i16], dst: &mut [i16]) {
     if vectorable {
         let mut ps = src.as_ptr().cast::<u8>();
         let mut pd = dst.as_mut_ptr().cast::<u8>();
-        let mut left = body / 8;
-        // SAFETY: the source advances 16 bytes and the destination 32 per
+        let mut left = body / 16;
+        // SAFETY: the source advances 32 bytes and the destination 64 per
         // trip, `body / 8` times; `body <= n` and `dst` holds `2 * n`
         // samples, so both stay in bounds. Both are 16-byte aligned.
         unsafe {
@@ -648,6 +676,11 @@ pub fn mono_to_stereo_i16(src: &[i16], dst: &mut [i16]) {
                 "ee.vzip.16 q0, q1",
                 "ee.vst.128.ip q0, {pd}, 16",
                 "ee.vst.128.ip q1, {pd}, 16",
+                "ee.vld.128.ip q2, {ps}, 0",
+                "ee.vld.128.ip q3, {ps}, 16",
+                "ee.vzip.16 q2, q3",
+                "ee.vst.128.ip q2, {pd}, 16",
+                "ee.vst.128.ip q3, {pd}, 16",
                 "addi {n}, {n}, -1",
                 "bnez {n}, 4b",
                 ps = inout(reg) ps,
@@ -1055,13 +1088,15 @@ fn dot_i16_unaligned(a: &[i16], b: &[i16]) -> i64 {
     if n < UNALIGNED_TAIL + 8 {
         return rusty_esp_dsp::sample::dot_i16(a, b);
     }
-    let body = (n - UNALIGNED_TAIL) / 8 * 8;
+    // SIXTEEN a trip, as the aligned arm now is.
+    let body = (n - UNALIGNED_TAIL) / 16 * 16;
     let mut total: i64 = 0;
     let mut done = 0usize;
 
     while done < body {
-        let batch = (body - done) / 8;
-        let batch = batch.min(16);
+        let batch = (body - done) / 16;
+        // EIGHT trips = sixteen MACs = 128 products, peaking at 2^37.
+        let batch = batch.min(8);
         let (lo, hi): (u32, u32);
         let mut pa = unsafe { a.as_ptr().cast::<u8>().add(done * 2) };
         let mut pb = unsafe { b.as_ptr().cast::<u8>().add(done * 2) };
@@ -1075,6 +1110,13 @@ fn dot_i16_unaligned(a: &[i16], b: &[i16]) -> i64 {
                 "ee.ld.128.usar.ip q0, {pa}, 16",
                 "ee.ld.128.usar.ip q2, {pb}, 16",
                 "9:",
+                "ee.ld.128.usar.ip q1, {pa}, 0",
+                "ee.src.q q4, q0, q1",       // SAR_BYTE is a's, set just above
+                "ee.ld.128.usar.ip q3, {pb}, 0",
+                "ee.src.q q0, q2, q3",       // and now b's
+                "ee.vmulas.s16.accx q4, q0",
+                "ee.ld.128.usar.ip q0, {pa}, 16",
+                "ee.ld.128.usar.ip q2, {pb}, 16",
                 "ee.ld.128.usar.ip q1, {pa}, 0",
                 "ee.src.q q4, q0, q1",       // SAR_BYTE is a's, set just above
                 "ee.ld.128.usar.ip q3, {pb}, 0",
@@ -1100,7 +1142,7 @@ fn dot_i16_unaligned(a: &[i16], b: &[i16]) -> i64 {
         // Forty bits, and a dot product can be negative: mask and sign-extend.
         let raw = (u64::from(hi & 0xff) << 32) | u64::from(lo);
         total += ((raw << 24) as i64) >> 24;
-        done += batch * 8;
+        done += batch * 16;
     }
 
     for k in done..n {
@@ -1333,14 +1375,15 @@ fn simd_even_bytes_unaligned_src(src: &[u8], dst: &mut [u8]) {
 #[allow(unsafe_code)]
 fn mix_i16_unaligned_src(a: &[i16], b: &[i16], out: &mut [i16]) -> usize {
     let n = a.len().min(b.len()).min(out.len());
-    if n < UNALIGNED_TAIL + 8 || !aligned16(out.as_ptr().cast::<u8>()) {
+    if n < UNALIGNED_TAIL + 16 || !aligned16(out.as_ptr().cast::<u8>()) {
         return 0;
     }
-    let body = (n - UNALIGNED_TAIL) / 8 * 8;
+    // SIXTEEN a trip, as the aligned arm now is.
+    let body = (n - UNALIGNED_TAIL) / 16 * 16;
     let mut pa = a.as_ptr().cast::<u8>();
     let mut pb = b.as_ptr().cast::<u8>();
     let mut po = out.as_mut_ptr().cast::<u8>();
-    let mut left = body / 8;
+    let mut left = body / 16;
     // SAFETY: each trip consumes 16 bytes of each source and writes 16, and
     // reads at most one 16-byte block beyond what it consumes -- which is
     // what `UNALIGNED_TAIL` reserves in both inputs. `out` is 16-byte
@@ -1351,6 +1394,14 @@ fn mix_i16_unaligned_src(a: &[i16], b: &[i16], out: &mut [i16]) -> usize {
             "ee.ld.128.usar.ip q0, {pa}, 16",
             "ee.ld.128.usar.ip q2, {pb}, 16",
             "13:",
+            "ee.ld.128.usar.ip q1, {pa}, 0",
+            "ee.src.q q4, q0, q1",           // a's window, at a's offset
+            "ee.ld.128.usar.ip q3, {pb}, 0",
+            "ee.src.q q5, q2, q3",           // b's window, at b's offset
+            "ee.vadds.s16 q4, q4, q5",
+            "ee.vst.128.ip q4, {po}, 16",
+            "ee.ld.128.usar.ip q0, {pa}, 16",
+            "ee.ld.128.usar.ip q2, {pb}, 16",
             "ee.ld.128.usar.ip q1, {pa}, 0",
             "ee.src.q q4, q0, q1",           // a's window, at a's offset
             "ee.ld.128.usar.ip q3, {pb}, 0",
@@ -1617,6 +1668,12 @@ pub fn gain_i16(src: &[i16], q15: i32, dst: &mut [i16]) {
     struct C([i16; 4]);
     let c = C([q15 as i16, 16384, 1, 0]);
 
+    // EIGHT a trip, and MEASURED so. Sixteen read 27,329 against this
+    // arm's 24,297 ps/sample -- +12.5% WORSE -- because QACC is a single
+    // resource: the second half's `ee.zero.qacc` waits on the first half's
+    // `ee.srcmb`, so widening doubles a serial dependency chain to save two
+    // instructions of loop. The unrolling that paid in seven other kernels
+    // does not pay where the body is a chain through one accumulator.
     let body = n / 8 * 8;
     let aligned = body > 0
         && aligned16(src.as_ptr().cast::<u8>())
@@ -1729,7 +1786,11 @@ fn gain_i16_unaligned_src(src: &[i16], c: &[i16; 4], dst: &mut [i16]) -> usize {
 #[allow(unsafe_code)]
 pub fn convert_i16_to_i32(src: &[i16], dst: &mut [i32]) {
     let n = src.len().min(dst.len());
-    let body = n / 8 * 8;
+    // SIXTEEN a trip, not the width this was first written at. The body was
+    // mostly LOOP: see the `sum_sq_i16` note and `codec-measurement` 2b --
+    // the unaligned arms had been written wider and were measuring faster
+    // despite doing more work per element.
+    let body = n / 16 * 16;
     let vectorable = body > 0
         && aligned16(src.as_ptr().cast::<u8>())
         && aligned16(dst.as_ptr().cast::<u8>());
@@ -1737,18 +1798,23 @@ pub fn convert_i16_to_i32(src: &[i16], dst: &mut [i32]) {
     if vectorable {
         let mut ps = src.as_ptr().cast::<u8>();
         let mut pd = dst.as_mut_ptr().cast::<u8>();
-        let mut left = body / 8;
-        // SAFETY: eight samples a trip -- 16 bytes read, 32 written --
+        let mut left = body / 16;
+        // SAFETY: sixteen samples a trip -- 32 bytes read, 64 written --
         // `body / 8` times, and `body` is within both slices. Both are
         // 16-byte aligned. q0 and q1 only.
         unsafe {
             core::arch::asm!(
                 "19:",
                 "ee.vld.128.ip q0, {ps}, 16",
+                "ee.vld.128.ip q2, {ps}, 16",
                 "ee.zero.q q1",
+                "ee.zero.q q3",
                 "ee.vzip.16 q1, q0",         // [0,x0,0,x1,..] = x<<16 per i32
+                "ee.vzip.16 q3, q2",
                 "ee.vst.128.ip q1, {pd}, 16",
                 "ee.vst.128.ip q0, {pd}, 16",
+                "ee.vst.128.ip q3, {pd}, 16",
+                "ee.vst.128.ip q2, {pd}, 16",
                 "addi {n}, {n}, -1",
                 "bnez {n}, 19b",
                 ps = inout(reg) ps,
@@ -1782,7 +1848,11 @@ pub fn convert_i16_to_i32(src: &[i16], dst: &mut [i32]) {
 #[allow(unsafe_code)]
 pub fn convert_i32_to_i16(src: &[i32], dst: &mut [i16]) {
     let n = src.len().min(dst.len());
-    let body = n / 8 * 8;
+    // SIXTEEN a trip, not the width this was first written at. The body was
+    // mostly LOOP: see the `sum_sq_i16` note and `codec-measurement` 2b --
+    // the unaligned arms had been written wider and were measuring faster
+    // despite doing more work per element.
+    let body = n / 16 * 16;
     let vectorable = body > 0
         && aligned16(src.as_ptr().cast::<u8>())
         && aligned16(dst.as_ptr().cast::<u8>());
@@ -1790,8 +1860,8 @@ pub fn convert_i32_to_i16(src: &[i32], dst: &mut [i16]) {
     if vectorable {
         let mut ps = src.as_ptr().cast::<u8>();
         let mut pd = dst.as_mut_ptr().cast::<u8>();
-        let mut left = body / 8;
-        // SAFETY: eight samples a trip -- 32 bytes read, 16 written --
+        let mut left = body / 16;
+        // SAFETY: sixteen samples a trip -- 64 bytes read, 32 written --
         // `body / 8` times, within both slices, both 16-byte aligned.
         // q0 and q1 only.
         unsafe {
@@ -1799,8 +1869,12 @@ pub fn convert_i32_to_i16(src: &[i32], dst: &mut [i16]) {
                 "20:",
                 "ee.vld.128.ip q0, {ps}, 16",
                 "ee.vld.128.ip q1, {ps}, 16",
+                "ee.vld.128.ip q2, {ps}, 16",
+                "ee.vld.128.ip q3, {ps}, 16",
                 "ee.vunzip.16 q0, q1",       // q1 = the eight high halfwords
+                "ee.vunzip.16 q2, q3",
                 "ee.vst.128.ip q1, {pd}, 16",
+                "ee.vst.128.ip q3, {pd}, 16",
                 "addi {n}, {n}, -1",
                 "bnez {n}, 20b",
                 ps = inout(reg) ps,
@@ -1832,7 +1906,13 @@ pub fn convert_i32_to_i16(src: &[i32], dst: &mut [i16]) {
 #[allow(unsafe_code)]
 pub fn convert_i32_to_i24in32(src: &[i32], dst: &mut [i32]) {
     let n = src.len().min(dst.len());
-    let body = n / 4 * 4;
+    // SIXTEEN a trip, not the width this was first written at. The body was
+    // mostly LOOP: see the `sum_sq_i16` note and `codec-measurement` 2b --
+    // the unaligned arms had been written wider and were measuring faster
+    // despite doing more work per element.
+    // This one was the narrowest of all at FOUR: a load, an and and a
+    // store against two instructions of loop -- forty per cent overhead.
+    let body = n / 16 * 16;
     let vectorable = body > 0
         && aligned16(src.as_ptr().cast::<u8>())
         && aligned16(dst.as_ptr().cast::<u8>());
@@ -1840,7 +1920,7 @@ pub fn convert_i32_to_i24in32(src: &[i32], dst: &mut [i32]) {
     if vectorable {
         let mut ps = src.as_ptr().cast::<u8>();
         let mut pd = dst.as_mut_ptr().cast::<u8>();
-        let mut left = body / 4;
+        let mut left = body / 16;
         // SAFETY: four samples a trip -- 16 bytes read and written --
         // `body / 4` times, within both slices, both 16-byte aligned.
         // q0, q6 and q7 only; SAR is restored.
@@ -1853,8 +1933,17 @@ pub fn convert_i32_to_i24in32(src: &[i32], dst: &mut [i32]) {
                 "ee.vsl.32 q7, q7",          // 0xffff_ff00 per 32-bit lane
                 "21:",
                 "ee.vld.128.ip q0, {ps}, 16",
+                "ee.vld.128.ip q1, {ps}, 16",
+                "ee.vld.128.ip q2, {ps}, 16",
+                "ee.vld.128.ip q3, {ps}, 16",
                 "ee.andq q0, q0, q7",
+                "ee.andq q1, q1, q7",
+                "ee.andq q2, q2, q7",
+                "ee.andq q3, q3, q7",
                 "ee.vst.128.ip q0, {pd}, 16",
+                "ee.vst.128.ip q1, {pd}, 16",
+                "ee.vst.128.ip q2, {pd}, 16",
+                "ee.vst.128.ip q3, {pd}, 16",
                 "addi {n}, {n}, -1",
                 "bnez {n}, 21b",
                 "wsr.sar {sar}",
@@ -1963,14 +2052,15 @@ fn convert_i32_to_i16_unaligned_src(src: &[i32], dst: &mut [i16]) -> usize {
 #[allow(unsafe_code)]
 fn convert_i32_to_i24in32_unaligned_src(src: &[i32], dst: &mut [i32]) -> usize {
     let n = src.len().min(dst.len());
-    if n < UNALIGNED_TAIL + 4 || !aligned16(dst.as_ptr().cast::<u8>()) {
+    if n < UNALIGNED_TAIL + 16 || !aligned16(dst.as_ptr().cast::<u8>()) {
         return 0;
     }
-    let body = (n - UNALIGNED_TAIL) / 4 * 4;
+    // SIXTEEN a trip: this body was five instructions against two of loop.
+    let body = (n - UNALIGNED_TAIL) / 16 * 16;
     let mut ps = src.as_ptr().cast::<u8>();
     let mut pd = dst.as_mut_ptr().cast::<u8>();
-    let mut left = body / 4;
-    // SAFETY: four samples a trip -- 16 bytes consumed and written --
+    let mut left = body / 16;
+    // SAFETY: sixteen samples a trip -- 64 bytes consumed and written --
     // reading at most one block beyond, reserved by `UNALIGNED_TAIL`. `dst`
     // is 16-byte aligned. q0-q2 and q6/q7 only; SAR is restored.
     unsafe {
@@ -1982,6 +2072,21 @@ fn convert_i32_to_i24in32_unaligned_src(src: &[i32], dst: &mut [i32]) -> usize {
             "ee.vsl.32 q7, q7",          // 0xffff_ff00 per 32-bit lane
             "ee.ld.128.usar.ip q0, {ps}, 16",
             "24:",
+            "ee.ld.128.usar.ip q1, {ps}, 0",
+            "ee.src.q q2, q0, q1",
+            "ee.andq q2, q2, q7",
+            "ee.vst.128.ip q2, {pd}, 16",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "ee.ld.128.usar.ip q1, {ps}, 0",
+            "ee.src.q q2, q0, q1",
+            "ee.andq q2, q2, q7",
+            "ee.vst.128.ip q2, {pd}, 16",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "ee.ld.128.usar.ip q1, {ps}, 0",
+            "ee.src.q q2, q0, q1",
+            "ee.andq q2, q2, q7",
+            "ee.vst.128.ip q2, {pd}, 16",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
             "ee.ld.128.usar.ip q1, {ps}, 0",
             "ee.src.q q2, q0, q1",
             "ee.andq q2, q2, q7",
