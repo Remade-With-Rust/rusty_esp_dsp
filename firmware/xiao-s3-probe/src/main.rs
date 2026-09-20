@@ -558,6 +558,82 @@ fn main() -> ! {
             Work { samples: npx, ..Work::ZERO }
         });
 
+        // --- semantics of the SECOND instruction tier, off the silicon ----
+        //
+        // The assembler accepts 31 more `ee.*` forms than the five patterns
+        // the first ten twins used: broadcast loads, lane multiplies, 32-bit
+        // lane arithmetic, lane shifts, compares. Every one of them would be
+        // guessable and every guess would return a plausible wrong number,
+        // so each is run on bytes whose answer is known before any kernel
+        // depends on it.
+        {
+            #[repr(align(16))]
+            struct Q([u8; 16]);
+            macro_rules! p2 {
+                ($name:literal, $pre:literal, $insn:literal, $a:expr, $b:expr) => {{
+                    let a = Q($a);
+                    let b = Q($b);
+                    let mut o0 = Q([0u8; 16]);
+                    let mut o1 = Q([0u8; 16]);
+                    let mut o2 = Q([0u8; 16]);
+                    // SAFETY: five 16-byte aligned buffers, two read and
+                    // three written; q0-q2 are not live across this block.
+                    unsafe {
+                        core::arch::asm!(
+                            "ee.vld.128.ip q0, {pa}, 0",
+                            "ee.vld.128.ip q1, {pb}, 0",
+                            "ee.zero.q q2",
+                            $pre,
+                            $insn,
+                            "ee.vst.128.ip q0, {p0}, 0",
+                            "ee.vst.128.ip q1, {p1}, 0",
+                            "ee.vst.128.ip q2, {p2}, 0",
+                            pa = inout(reg) a.0.as_ptr() => _,
+                            pb = inout(reg) b.0.as_ptr() => _,
+                            p0 = inout(reg) o0.0.as_mut_ptr() => _,
+                            p1 = inout(reg) o1.0.as_mut_ptr() => _,
+                            p2 = inout(reg) o2.0.as_mut_ptr() => _,
+                            options(nostack),
+                        );
+                    }
+                    println!("P2 {:<16} q0={:02x?}", $name, o0.0);
+                    println!("P2 {:<16} q1={:02x?}", "", o1.0);
+                    println!("P2 {:<16} q2={:02x?}", "", o2.0);
+                }};
+            }
+            // i16 lanes 0x0100,0x0302,... so a lane's value names its place.
+            const R: [u8; 16] = [
+                0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+            ];
+            // i16 lanes: 2, -2, 256, -256, 1, -1, 32767, -32768
+            const V: [u8; 16] = [
+                0x02, 0x00, 0xfe, 0xff, 0x00, 0x01, 0x00, 0xff,
+                0x01, 0x00, 0xff, 0xff, 0xff, 0x7f, 0x00, 0x80,
+            ];
+            // i16 lanes all 3, so a multiply's scale is unmistakable
+            const T: [u8; 16] = [
+                3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0,
+            ];
+            println!("P2 == second tier ==");
+            // Does the shift take its amount from SAR, and is it arithmetic?
+            p2!("vsr.32 sar=4", "ssai 4", "ee.vsr.32 q2, q0", V, R);
+            p2!("vsl.32 sar=4", "ssai 4", "ee.vsl.32 q2, q0", V, R);
+            p2!("vsr.32 sar=0", "ssai 0", "ee.vsr.32 q2, q0", V, R);
+            // Lane multiply: what width, and does it saturate?
+            p2!("vmul.s16", "", "ee.vmul.s16 q2, q0, q1", V, T);
+            // 32-bit lanes -- the widening add `stereo_to_mono` needs
+            p2!("vadds.s32", "", "ee.vadds.s32 q2, q0, q1", V, V);
+            p2!("vsubs.s32", "", "ee.vsubs.s32 q2, q0, q1", V, R);
+            // Compare masks: all-ones or a bitfield?
+            p2!("vcmp.lt.s16", "", "ee.vcmp.lt.s16 q2, q0, q1", V, T);
+            p2!("vcmp.gt.s16", "", "ee.vcmp.gt.s16 q2, q0, q1", V, T);
+            // 32-bit lane interleave, for widening i16 -> i32
+            p2!("vzip.32", "", "ee.vzip.32 q0, q1", R, V);
+            p2!("vunzip.32", "", "ee.vunzip.32 q0, q1", R, V);
+            p2!("notq", "", "ee.notq q2, q0", R, V);
+            println!("P2 == end ==");
+        }
+
         // --- how WIDE is ACCX, and what does `rur.accx_1` put above it? --
         //
         // `sum_sq_i16` never had to ask: a sum of squares is non-negative, so
@@ -748,6 +824,78 @@ fn main() -> ! {
                 };
                 rusty_esp_dsp_esp::pie_s3::mono_to_stereo_i16(&iv[..half], o);
                 Work { samples: halfu, ..Work::ZERO }
+            });
+        }
+
+        // --- downscale2x_gray8: 64x32 over the gray bytes just produced ---
+        //
+        // `gd` already holds 2048 gray8 pixels from the yuyv arm, so the
+        // downscale reads real sensor-derived bytes rather than a ramp. The
+        // PIE destination is the FRONT OF `ys`, which is 16-byte aligned;
+        // `reference` is a plain `Vec<u8>` and would have sent the twin down
+        // its scalar arm silently, which is what a FLAT reading looks like.
+        {
+            const DW: u32 = 64;
+            const DH: u32 = 32;
+            let oute = (DW as usize / 2) * (DH as usize / 2);
+            let _ = pixel::downscale2x_gray8(gd, DW, DH, &mut reference[..oute]);
+            let _ = rusty_esp_dsp_esp::pie_s3::downscale2x_gray8(gd, DW, DH, &mut ys[..oute]);
+            println!(
+                "PIEKERNEL downscale2x_gray8 identical={} src_align={} dst_align={}",
+                reference[..oute] == ys[..oute],
+                gd.as_ptr() as usize % 16,
+                ys.as_ptr() as usize % 16
+            );
+            let ou = oute as u64;
+            measure("dscale_gray_scalar", "px_out", ou, || {
+                let _ = pixel::downscale2x_gray8(gd, DW, DH, &mut reference[..oute]);
+                Work { pixels: ou, ..Work::ZERO }
+            });
+            measure("dscale_gray_pie", "px_out", ou, || {
+                let _ = rusty_esp_dsp_esp::pie_s3::downscale2x_gray8(gd, DW, DH, &mut ys[..oute]);
+                Work { pixels: ou, ..Work::ZERO }
+            });
+        }
+
+        // --- stereo_to_mono: gated against the StereoToMono element -------
+        {
+            use rusty_esp_audio_core::elements::StereoToMono;
+            use rusty_esp_audio_core::pipeline::Element;
+            use rusty_esp_dsp::esp_core::pcm::{PcmBlock, PcmFormat, SampleFormat};
+            use rusty_esp_dsp::esp_core::time::Micros;
+            let f_stereo = PcmFormat::new(16_000, 2, SampleFormat::I16).expect("fmt");
+            let fr = NMIX / 2; // 256 frames in, 256 mono samples out
+            let fru = fr as u64;
+            let mut e = StereoToMono;
+            // SAFETY: byte views of the two aligned scratch buffers.
+            let (dref, dpie) = unsafe {
+                (
+                    core::slice::from_raw_parts_mut(msrc.as_mut_ptr().cast::<u8>(), NMIX * 2),
+                    core::slice::from_raw_parts_mut(psrc.as_mut_ptr().cast::<u8>(), NMIX * 2),
+                )
+            };
+            let blk = PcmBlock::new(f_stereo, Micros(0), &ibytes[..fr * 4]).expect("blk");
+            let _ = e.process(blk, dref).expect("downmix scalar");
+            rusty_esp_dsp_esp::pie_s3::stereo_to_mono_i16(&iv[..fr * 2], unsafe {
+                // SAFETY: `dpie` is the byte view of an aligned `Vec<u128>`.
+                core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
+            });
+            println!(
+                "PIEKERNEL stereo_to_mono identical={}",
+                dref[..fr * 2] == dpie[..fr * 2]
+            );
+            measure("downmix_scalar", "sample", fru, || {
+                let blk = PcmBlock::new(f_stereo, Micros(0), &ibytes[..fr * 4]).expect("blk");
+                let _ = e.process(blk, dref);
+                Work { samples: fru, ..Work::ZERO }
+            });
+            measure("downmix_pie", "sample", fru, || {
+                // SAFETY: as above.
+                let o = unsafe {
+                    core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
+                };
+                rusty_esp_dsp_esp::pie_s3::stereo_to_mono_i16(&iv[..fr * 2], o);
+                Work { samples: fru, ..Work::ZERO }
             });
         }
 

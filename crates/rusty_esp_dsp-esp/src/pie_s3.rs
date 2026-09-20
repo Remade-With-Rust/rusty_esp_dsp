@@ -17,6 +17,35 @@
 //! So every kernel below checks alignment once and hands anything else to the
 //! oracle — the same shape the byte and aligned arms take everywhere else in
 //! this family.
+//!
+//! # The second instruction tier, also read off the silicon
+//!
+//! | form | what it does |
+//! |---|---|
+//! | `ssai N` + `ee.vsr.32 qd, qs` | ARITHMETIC right shift, four 32-bit lanes, amount from SAR |
+//! | `ssai N` + `ee.vsl.32 qd, qs` | left shift, four 32-bit lanes, wrapping |
+//! | `ee.vmul.s16 qd, qa, qb` | eight lanes, low half, **WRAPS** -- 32767 x 3 reads 32765 |
+//! | `ee.vadds.s32` / `ee.vsubs.s32` | four 32-bit lanes, saturating |
+//! | `ee.vcmp.lt.s16` / `.gt` / `.eq` | eight lanes, all-ones where true, all-zeros where false |
+//! | `ee.vzip.32` / `ee.vunzip.32` | interleave / deinterleave 32-bit lanes across the pair |
+//! | `ee.notq qd, qs` | bitwise complement |
+//! | `rur.accx_0` / `rur.accx_1` | ACCX is FORTY bits; `accx_1` is bits 32..=39, ZERO-extended |
+//!
+//! Three consequences shape the kernels below.
+//!
+//! **There is no 16-bit shift.** Dividing i16 lanes by a power of two means
+//! widening to 32 bits, shifting, and narrowing back.
+//!
+//! **`ee.vmul.s16` cannot be used where the scalar saturates**, because it
+//! truncates to the low half instead. A saturating multiply has to go
+//! through 32-bit lanes, or through QACC and `ee.srcmb.s16.qacc`.
+//!
+//! **Sign-extending i16 -> i32 costs two instructions.**
+//! `ee.vcmp.lt.s16 qs, qv, qzero` puts all-ones in every negative lane,
+//! which IS the high half of the sign-extended value, and `ee.vzip.16 qv, qs`
+//! interleaves the two into correct 32-bit lanes. Narrowing back is
+//! `ee.vunzip.16`, which collects the low halves. Where the values are known
+//! non-negative, zip against a ZERO register instead and skip the compare.
 
 use rusty_esp_core::error::{Error, Result};
 use rusty_esp_dsp::expect_len_pub as expect_len;
@@ -605,4 +634,206 @@ pub fn rms_dbfs_i16(samples: &[u8]) -> f32 {
     let mean = acc as f64 / n as f64;
     let rms = libm::sqrt(mean) / 32768.0;
     (20.0 * libm::log10(rms)) as f32
+}
+
+/// Stereo to mono: `(l + r) >> 1` per frame, the arithmetic `StereoToMono`
+/// does.
+///
+/// The obvious `ee.vadds.s16` is WRONG here and quietly so: two samples near
+/// full scale sum past the i16 range, the instruction clamps to 32767, and
+/// the shifted result is half what the scalar reports. The sum has to happen
+/// in 32-bit lanes, which is what the sign-extending widen is for --
+/// `ee.vcmp.lt.s16` against zero gives each lane's sign, `ee.vzip.16`
+/// interleaves value with sign into correct i32 lanes, `ee.vadds.s32` cannot
+/// saturate at these magnitudes, `ee.vsr.32` is an arithmetic shift and so
+/// matches Rust's `>>` on a negative value, and `ee.vunzip.16` takes the low
+/// halves back down. Eight frames a trip.
+///
+/// The block saves and restores SAR. `ssai` writes it, inline `asm!` on
+/// Xtensa has no way to declare it clobbered, and the shift the compiler
+/// emits on the other side of this block is entitled to assume it survived.
+#[allow(unsafe_code)]
+pub fn stereo_to_mono_i16(src: &[i16], dst: &mut [i16]) {
+    let frames = (src.len() / 2).min(dst.len());
+    let body = frames / 8 * 8;
+    let vectorable = body > 0
+        && aligned16(src.as_ptr().cast::<u8>())
+        && aligned16(dst.as_ptr().cast::<u8>());
+
+    if vectorable {
+        let mut ps = src.as_ptr().cast::<u8>();
+        let mut pd = dst.as_mut_ptr().cast::<u8>();
+        let mut left = body / 8;
+        // SAFETY: each trip reads 32 source bytes (8 frames) and writes 16,
+        // `body / 8` times; `body <= src.len() / 2` and `body <= dst.len()`,
+        // so both stay in bounds. Both are 16-byte aligned. q0-q3 and q6 are
+        // the only vector registers touched, and SAR is restored.
+        unsafe {
+            core::arch::asm!(
+                "rsr.sar {sar}",
+                "ee.zero.q q6",              // the zero the sign compare needs
+                "ssai 1",
+                "5:",
+                "ee.vld.128.ip q0, {ps}, 16",
+                "ee.vld.128.ip q1, {ps}, 16",
+                "ee.vunzip.16 q0, q1",       // q0 = the eight L, q1 = the eight R
+                "ee.vcmp.lt.s16 q2, q0, q6", // all-ones where L is negative
+                "ee.vcmp.lt.s16 q3, q1, q6",
+                "ee.vzip.16 q0, q2",         // L widened to i32, low then high
+                "ee.vzip.16 q1, q3",
+                "ee.vadds.s32 q0, q0, q1",   // cannot saturate: |l+r| <= 65536
+                "ee.vadds.s32 q2, q2, q3",
+                "ee.vsr.32 q0, q0",          // arithmetic, so it floors like >>
+                "ee.vsr.32 q2, q2",
+                "ee.vunzip.16 q0, q2",       // low halves: the eight mono samples
+                "ee.vst.128.ip q0, {pd}, 16",
+                "addi {n}, {n}, -1",
+                "bnez {n}, 5b",
+                "wsr.sar {sar}",
+                ps = inout(reg) ps,
+                pd = inout(reg) pd,
+                n = inout(reg) left => _,
+                sar = out(reg) _,
+                options(nostack),
+            );
+        }
+        let _ = (ps, pd);
+    }
+
+    let start = if vectorable { body } else { 0 };
+    for k in start..frames {
+        let l = i32::from(src[k * 2]);
+        let r = i32::from(src[k * 2 + 1]);
+        dst[k] = ((l + r) >> 1) as i16;
+    }
+}
+
+/// 2x box downscale of a gray8 image: `(a + b + c + d + 2) / 4` per output
+/// pixel.
+///
+/// Sixteen output pixels a trip, which is what makes the tail a 16-byte
+/// store rather than a half-store of eight. The shape is: widen bytes to i16
+/// against zero (`ee.vzip.8`, exact because the values are 0..=255), add the
+/// two source rows, then `ee.vunzip.16` splits even columns from odd so that
+/// one `ee.vadds.s16` finishes the horizontal pair. Sums reach 1020 and
+/// cannot saturate an i16 lane.
+///
+/// The divide is the awkward part, because **there is no 16-bit shift**. The
+/// sums widen again to 32-bit lanes -- against ZERO rather than a sign mask,
+/// since a sum of four bytes is never negative -- take `+2`, shift right by
+/// two, and come back through `ee.vunzip.16` and then `ee.vunzip.8`, whose
+/// even bytes are the low byte of each result.
+///
+/// The constant 2 is BUILT rather than loaded: `ee.vcmp.eq.s16 q7, q6, q6`
+/// is all-ones, `0 - (-1)` is one per 32-bit lane, and one left shift makes
+/// it two. That avoids depending on `ee.vldbc.32`, whose semantics this
+/// module has not measured.
+#[allow(unsafe_code)]
+pub fn downscale2x_gray8(src: &[u8], width: u32, height: u32, dst: &mut [u8]) -> Result<(), ()> {
+    let (w, h) = (width as usize, height as usize);
+    let (ow, oh) = (w / 2, h / 2);
+    if src.len() < w * h || dst.len() < ow * oh {
+        return Err(());
+    }
+
+    for oy in 0..oh {
+        let r0 = &src[(2 * oy) * w..(2 * oy) * w + ow * 2];
+        let r1 = &src[(2 * oy + 1) * w..(2 * oy + 1) * w + ow * 2];
+        let drow = &mut dst[oy * ow..oy * ow + ow];
+
+        // Per ROW, because a row's alignment depends on the stride and the
+        // caller's base together. A row that does not qualify takes the
+        // scalar arm; the image does not have to be all one or all the other.
+        let body =
+            if aligned16(r0.as_ptr()) && aligned16(r1.as_ptr()) && aligned16(drow.as_ptr()) {
+                ow / 16 * 16
+            } else {
+                0
+            };
+
+        if body > 0 {
+            let mut p0 = r0.as_ptr();
+            let mut p1 = r1.as_ptr();
+            let mut pd = drow.as_mut_ptr();
+            let mut left = body / 16;
+            // SAFETY: each trip reads 32 bytes from each source row and
+            // writes 16 to the destination, `body / 16` times. `body <= ow`
+            // and each source row is sliced to exactly `ow * 2` bytes, so
+            // every access is inside the three slices. All three are 16-byte
+            // aligned. q0-q7 are the only vector registers used, and SAR is
+            // restored.
+            unsafe {
+                core::arch::asm!(
+                    "rsr.sar {sar}",
+                    "ee.zero.q q6",
+                    "ee.vcmp.eq.s16 q7, q6, q6", // every lane equal -> all ones
+                    "ee.vsubs.s32 q7, q6, q7",   // 0 - (-1) = 1 per 32-bit lane
+                    "ssai 1",
+                    "ee.vsl.32 q7, q7",          // ... and now 2, the round term
+                    "ssai 2",
+                    "6:",
+                    // columns 0..=15 of the row pair -> outputs 0..=7
+                    "ee.vld.128.ip q0, {p0}, 16",
+                    "ee.vld.128.ip q1, {p1}, 16",
+                    "ee.zero.q q2",
+                    "ee.vzip.8 q0, q2",          // q0 = a0..a7, q2 = a8..a15
+                    "ee.zero.q q3",
+                    "ee.vzip.8 q1, q3",
+                    "ee.vadds.s16 q0, q0, q1",   // the two rows, columns 0..=7
+                    "ee.vadds.s16 q2, q2, q3",   // columns 8..=15
+                    "ee.vunzip.16 q0, q2",       // even columns / odd columns
+                    "ee.vadds.s16 q4, q0, q2",   // eight horizontal pairs <= 1020
+                    // columns 16..=31 -> outputs 8..=15
+                    "ee.vld.128.ip q0, {p0}, 16",
+                    "ee.vld.128.ip q1, {p1}, 16",
+                    "ee.zero.q q2",
+                    "ee.vzip.8 q0, q2",
+                    "ee.zero.q q3",
+                    "ee.vzip.8 q1, q3",
+                    "ee.vadds.s16 q0, q0, q1",
+                    "ee.vadds.s16 q2, q2, q3",
+                    "ee.vunzip.16 q0, q2",
+                    "ee.vadds.s16 q5, q0, q2",
+                    // (sum + 2) >> 2, in 32-bit lanes because there is no
+                    // 16-bit shift; the sums are non-negative so ZERO, not a
+                    // sign mask, is the correct high half
+                    "ee.zero.q q0",
+                    "ee.vzip.16 q4, q0",
+                    "ee.zero.q q1",
+                    "ee.vzip.16 q5, q1",
+                    "ee.vadds.s32 q4, q4, q7",
+                    "ee.vadds.s32 q0, q0, q7",
+                    "ee.vadds.s32 q5, q5, q7",
+                    "ee.vadds.s32 q1, q1, q7",
+                    "ee.vsr.32 q4, q4",
+                    "ee.vsr.32 q0, q0",
+                    "ee.vsr.32 q5, q5",
+                    "ee.vsr.32 q1, q1",
+                    "ee.vunzip.16 q4, q0",       // back to i16: outputs 0..=7
+                    "ee.vunzip.16 q5, q1",       // outputs 8..=15
+                    "ee.vunzip.8 q4, q5",        // low byte of each: the pixels
+                    "ee.vst.128.ip q4, {pd}, 16",
+                    "addi {n}, {n}, -1",
+                    "bnez {n}, 6b",
+                    "wsr.sar {sar}",
+                    p0 = inout(reg) p0,
+                    p1 = inout(reg) p1,
+                    pd = inout(reg) pd,
+                    n = inout(reg) left => _,
+                    sar = out(reg) _,
+                    options(nostack),
+                );
+            }
+            let _ = (p0, p1, pd);
+        }
+
+        for ox in body..ow {
+            let s = u32::from(r0[2 * ox])
+                + u32::from(r0[2 * ox + 1])
+                + u32::from(r1[2 * ox])
+                + u32::from(r1[2 * ox + 1]);
+            drow[ox] = ((s + 2) / 4) as u8;
+        }
+    }
+    Ok(())
 }
