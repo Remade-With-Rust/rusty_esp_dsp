@@ -155,7 +155,11 @@ fn simd_even_bytes(src: &[u8], dst: &mut [u8]) {
 #[allow(unsafe_code)]
 #[must_use]
 pub fn peak_abs_i16(a: &[i16]) -> u16 {
-    let body = a.len() / 8 * 8;
+    // SIXTEEN samples a trip; see the note on `sum_sq_i16`. Here the gap
+    // was larger still -- the unaligned arm read 13,735 against this one's
+    // 16,288 ps/sample -- because the body is three instructions of work
+    // against two of loop.
+    let body = a.len() / 16 * 16;
     if body == 0 {
         return rusty_esp_dsp::sample::peak_abs_i16(a);
     }
@@ -170,7 +174,7 @@ pub fn peak_abs_i16(a: &[i16]) -> u16 {
     let mut hi = Q([i16::MIN; 8]);
     let mut lo = Q([i16::MAX; 8]);
     let p = a.as_ptr().cast::<u8>();
-    let trips = body / 8;
+    let trips = body / 16;
     // SAFETY: `trips * 8` elements is `body`, which is at most `a.len()`, so
     // the loads stay inside `a`; `p` is 16-byte aligned as `ee.vld.128`
     // requires and advances by exactly 16 per trip. q0-q2 are the only
@@ -182,8 +186,11 @@ pub fn peak_abs_i16(a: &[i16]) -> u16 {
             "ee.vld.128.ip q2, {lo}, 0",
             "2:",
             "ee.vld.128.ip q0, {p}, 16",
+            "ee.vld.128.ip q3, {p}, 16",
             "ee.vmax.s16 q1, q1, q0",
             "ee.vmin.s16 q2, q2, q0",
+            "ee.vmax.s16 q1, q1, q3",
+            "ee.vmin.s16 q2, q2, q3",
             "addi {n}, {n}, -1",
             "bnez {n}, 2b",
             "ee.vst.128.ip q1, {hi}, 0",
@@ -407,7 +414,13 @@ pub fn sad_8x8(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
 #[allow(unsafe_code)]
 #[must_use]
 pub fn sum_sq_i16(a: &[i16]) -> i64 {
-    let body = a.len() / 8 * 8;
+    // SIXTEEN samples a trip, not eight. At eight the body was one load,
+    // one multiply-accumulate and two instructions of loop -- fifty per cent
+    // overhead -- and the UNALIGNED arm, which does three MORE instructions
+    // per window but unrolls to sixteen, measured FASTER (14,279 against
+    // 14,960 ps/sample). A slower-per-byte path beating a faster one is the
+    // instrument pointing at loop shape, not at the loads.
+    let body = a.len() / 16 * 16;
     if body == 0 {
         return rusty_esp_dsp::sample::sum_sq_i16(a);
     }
@@ -418,9 +431,11 @@ pub fn sum_sq_i16(a: &[i16]) -> i64 {
 
     let mut total: i64 = 0;
     let mut p = a.as_ptr().cast::<u8>();
-    let mut left = body / 8; // multiply-accumulates still to do
+    let mut left = body / 16; // trips still to do, two MACs each
     while left > 0 {
-        let batch = left.min(16);
+        // EIGHT trips = sixteen multiply-accumulates = 128 products of at
+        // most 2^30, which peaks at 2^37 inside the 40-bit accumulator.
+        let batch = left.min(8);
         left -= batch;
         let (lo, hi): (u32, u32);
         // SAFETY: `batch <= left` and the loop advances `p` by 16 per trip,
@@ -431,7 +446,9 @@ pub fn sum_sq_i16(a: &[i16]) -> i64 {
                 "ee.zero.accx",
                 "2:",
                 "ee.vld.128.ip q0, {p}, 16",
+                "ee.vld.128.ip q1, {p}, 16",
                 "ee.vmulas.s16.accx q0, q0",
+                "ee.vmulas.s16.accx q1, q1",
                 "addi {n}, {n}, -1",
                 "bnez {n}, 2b",
                 "rur.accx_0 {l}",

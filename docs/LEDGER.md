@@ -1264,3 +1264,56 @@ the twelve reductions and element-wise kernels, both SADs, the luma gather
 and the gray downscale. The only kernels without one are those whose
 DESTINATION can be misaligned, and that is not a gap — `ee.vst.128` requires
 alignment and the alternatives cost a lane extract and a byte store each.
+
+### rotate90_gray8, and the two that the numbers themselves asked for
+
+| kernel | scalar | PIE | |
+|---|---:|---:|---:|
+| `rotate90_gray8` | 201,137 | 9,332 | **−95.4%** (21.6×) |
+| `sum_sq_i16` widened | 14,960 | 10,005 | **−33.1%** |
+| `peak_abs_i16` widened | 16,288 | 11,005 | **−32.4%** |
+
+`rotate90_gray8` is the campaign's largest margin. Two things did it. The
+destination column is REVERSED (`h - 1 - y`) and this unit has no byte
+reverse — but loading a tile's eight source rows BOTTOM-TO-TOP emits the
+transposed bytes in exactly the order the destination run wants, so the term
+never appears in the kernel. And the 8×8 byte transpose is eight
+instructions: `ee.vzip.8/16/32` are a perfect shuffle across the register
+PAIR, which is precisely a transpose's three stages at 1-, 2- and 4-byte
+granularity.
+
+Note it against the 4×4 refutation above. That family also needed a
+transpose and lost — because a 4×4 **i32** transpose must recombine 64-bit
+halves through memory. The 8×8 **byte** transpose never touches memory
+beyond the loads and stores it would need anyway. **The refutation was about
+the memory round trip, not about transposes.**
+
+### ★★ The last two wins were sitting in the results table, unread
+
+| | aligned | unaligned |
+|---|---:|---:|
+| `sum_sq_i16` | 14,960 | **14,279** |
+| `peak_abs_i16` | 16,288 | **13,735** |
+
+The unaligned arm does THREE MORE instructions per window — two loads and a
+funnel where the aligned arm does one load — and it was **faster, in both
+kernels.** That cannot be true of the loads, so it was never about the
+loads: the unaligned arms unroll to sixteen samples a trip and the aligned
+arms only did eight, so the aligned loops paid `addi`+`bnez` twice as often.
+At eight samples `sum_sq`'s body was one load, one MAC and two instructions
+of loop — **fifty per cent overhead**.
+
+Widening both aligned arms to sixteen samples a trip: −33.1% and −32.4%,
+and the ordering inverts back to aligned-faster-than-unaligned, which is the
+check that the anomaly is actually resolved rather than merely moved.
+
+**Two numbers in a table I had already published, in a comparison I had
+already made.** §7 says an impossible number is the instrument asking for
+help; this is the softer version — a number that is merely *backwards*, sat
+in the ledger for two passes before anyone read the two columns against each
+other. Worth a standing habit: when the same kernel has two arms, compare
+them to EACH OTHER, not only each to its own scalar.
+
+The remaining aligned arms (`mix_i16`, `gain_i16`, the three converts) are
+still at eight samples a trip and are candidates for the same treatment —
+not claimed here, because none has been measured.
