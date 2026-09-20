@@ -1696,6 +1696,111 @@ fn main() -> ! {
             });
         }
 
+        // --- convert, from sources at an arbitrary offset ---------------
+        {
+            use rusty_esp_dsp::esp_core::pcm::{PcmBlock, PcmFormat, SampleFormat};
+            use rusty_esp_dsp::esp_core::time::Micros;
+            use rusty_esp_dsp::sample::pcm::convert;
+            let cn = 240usize;
+            let cnu = cn as u64;
+            let f16 = PcmFormat::new(16_000, 1, SampleFormat::I16).expect("fmt");
+            let f32f = PcmFormat::new(16_000, 1, SampleFormat::I32).expect("fmt");
+            let ua = &iv[1..];
+            let uab = &ibytes[2..];
+            // SAFETY: byte views of the two aligned scratch buffers.
+            let (dref, dpie) = unsafe {
+                (
+                    core::slice::from_raw_parts_mut(msrc.as_mut_ptr().cast::<u8>(), NMIX * 2),
+                    core::slice::from_raw_parts_mut(psrc.as_mut_ptr().cast::<u8>(), NMIX * 2),
+                )
+            };
+            println!("PIEUNALIGNED cvt16 src={}", ua.as_ptr() as usize % 16);
+
+            let blk = PcmBlock::new(f16, Micros(0), &uab[..cn * 2]).expect("blk");
+            let _ = convert(blk, SampleFormat::I32, dref).expect("conv scalar");
+            rusty_esp_dsp_esp::pie_s3::convert_i16_to_i32(&ua[..cn], unsafe {
+                // SAFETY: `dpie` is the byte view of an aligned `Vec<u128>`.
+                core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i32>(), cn)
+            });
+            println!(
+                "PIEKERNEL convert_i16_to_i32_unaligned identical={}",
+                dref[..cn * 4] == dpie[..cn * 4]
+            );
+            measure("cvt1632_un_scalar", "sample", cnu, || {
+                let blk = PcmBlock::new(f16, Micros(0), &uab[..cn * 2]).expect("blk");
+                let _ = convert(blk, SampleFormat::I32, dref);
+                Work { samples: cnu, ..Work::ZERO }
+            });
+            measure("cvt1632_un_pie", "sample", cnu, || {
+                // SAFETY: as above.
+                let o = unsafe {
+                    core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i32>(), cn)
+                };
+                rusty_esp_dsp_esp::pie_s3::convert_i16_to_i32(&ua[..cn], o);
+                Work { samples: cnu, ..Work::ZERO }
+            });
+
+            // An i32 source one element in, so the base moves four bytes.
+            let cm = cn - 1;
+            let cmu = cm as u64;
+            // SAFETY: `dref` holds `cn` little-endian i32 written just above;
+            // skipping one leaves `cm` of them, at four bytes past an aligned
+            // base -- which is exactly the misalignment under test.
+            let i32u = unsafe {
+                core::slice::from_raw_parts(dref.as_ptr().cast::<i32>().add(1), cm)
+            };
+            println!("PIEUNALIGNED cvt32 src={}", i32u.as_ptr() as usize % 16);
+            let mut back = alloc::vec![0u8; cm * 2];
+            let blk = PcmBlock::new(f32f, Micros(0), &dref[4..4 + cm * 4]).expect("blk");
+            let _ = convert(blk, SampleFormat::I16, &mut back).expect("conv scalar");
+            rusty_esp_dsp_esp::pie_s3::convert_i32_to_i16(i32u, unsafe {
+                // SAFETY: as above.
+                core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
+            });
+            println!(
+                "PIEKERNEL convert_i32_to_i16_unaligned identical={}",
+                back[..cm * 2] == dpie[..cm * 2]
+            );
+            measure("cvt3216_un_scalar", "sample", cmu, || {
+                let blk = PcmBlock::new(f32f, Micros(0), &dref[4..4 + cm * 4]).expect("blk");
+                let _ = convert(blk, SampleFormat::I16, &mut back);
+                Work { samples: cmu, ..Work::ZERO }
+            });
+            measure("cvt3216_un_pie", "sample", cmu, || {
+                // SAFETY: as above.
+                let o = unsafe {
+                    core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
+                };
+                rusty_esp_dsp_esp::pie_s3::convert_i32_to_i16(i32u, o);
+                Work { samples: cmu, ..Work::ZERO }
+            });
+
+            let mut w24 = alloc::vec![0u8; cm * 4];
+            let blk = PcmBlock::new(f32f, Micros(0), &dref[4..4 + cm * 4]).expect("blk");
+            let _ = convert(blk, SampleFormat::I24In32, &mut w24).expect("conv scalar");
+            rusty_esp_dsp_esp::pie_s3::convert_i32_to_i24in32(i32u, unsafe {
+                // SAFETY: as above.
+                core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i32>(), cm)
+            });
+            println!(
+                "PIEKERNEL convert_i32_to_i24in32_unaligned identical={}",
+                w24[..cm * 4] == dpie[..cm * 4]
+            );
+            measure("cvt3224_un_scalar", "sample", cmu, || {
+                let blk = PcmBlock::new(f32f, Micros(0), &dref[4..4 + cm * 4]).expect("blk");
+                let _ = convert(blk, SampleFormat::I24In32, &mut w24);
+                Work { samples: cmu, ..Work::ZERO }
+            });
+            measure("cvt3224_un_pie", "sample", cmu, || {
+                // SAFETY: as above.
+                let o = unsafe {
+                    core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i32>(), cm)
+                };
+                rusty_esp_dsp_esp::pie_s3::convert_i32_to_i24in32(i32u, o);
+                Work { samples: cmu, ..Work::ZERO }
+            });
+        }
+
         report_memory("after_pie");
     }
 

@@ -1743,7 +1743,12 @@ pub fn convert_i16_to_i32(src: &[i16], dst: &mut [i32]) {
         let _ = (ps, pd);
     }
 
-    let start = if vectorable { body } else { 0 };
+    let start = if vectorable {
+        body
+    } else {
+        // Source at any offset, destination aligned.
+        convert_i16_to_i32_unaligned_src(src, dst)
+    };
     for k in start..n {
         dst[k] = i32::from(src[k]) << 16;
     }
@@ -1790,7 +1795,12 @@ pub fn convert_i32_to_i16(src: &[i32], dst: &mut [i16]) {
         let _ = (ps, pd);
     }
 
-    let start = if vectorable { body } else { 0 };
+    let start = if vectorable {
+        body
+    } else {
+        // Source at any offset, destination aligned.
+        convert_i32_to_i16_unaligned_src(src, dst)
+    };
     for k in start..n {
         dst[k] = (src[k] >> 16) as i16;
     }
@@ -1841,9 +1851,135 @@ pub fn convert_i32_to_i24in32(src: &[i32], dst: &mut [i32]) {
         let _ = (ps, pd);
     }
 
-    let start = if vectorable { body } else { 0 };
+    let start = if vectorable {
+        body
+    } else {
+        // Source at any offset, destination aligned.
+        convert_i32_to_i24in32_unaligned_src(src, dst)
+    };
     for k in start..n {
         let b = src[k].to_le_bytes();
         dst[k] = i32::from_le_bytes([0, b[1], b[2], b[3]]);
     }
+}
+
+/// `convert_i16_to_i32` from an unaligned source.
+#[allow(unsafe_code)]
+fn convert_i16_to_i32_unaligned_src(src: &[i16], dst: &mut [i32]) -> usize {
+    let n = src.len().min(dst.len());
+    if n < UNALIGNED_TAIL + 8 || !aligned16(dst.as_ptr().cast::<u8>()) {
+        return 0;
+    }
+    let body = (n - UNALIGNED_TAIL) / 8 * 8;
+    let mut ps = src.as_ptr().cast::<u8>();
+    let mut pd = dst.as_mut_ptr().cast::<u8>();
+    let mut left = body / 8;
+    // SAFETY: eight samples a trip -- 16 source bytes consumed, 32 written --
+    // reading at most one 16-byte block beyond, reserved by `UNALIGNED_TAIL`.
+    // `dst` is 16-byte aligned. q0-q3 only; SAR is restored.
+    unsafe {
+        core::arch::asm!(
+            "rsr.sar {sar}",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "22:",
+            "ee.ld.128.usar.ip q1, {ps}, 0",
+            "ee.src.q q2, q0, q1",
+            "ee.zero.q q3",
+            "ee.vzip.16 q3, q2",
+            "ee.vst.128.ip q3, {pd}, 16",
+            "ee.vst.128.ip q2, {pd}, 16",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 22b",
+            "wsr.sar {sar}",
+            ps = inout(reg) ps,
+            pd = inout(reg) pd,
+            n = inout(reg) left => _,
+            sar = out(reg) _,
+            options(nostack),
+        );
+    }
+    let _ = (ps, pd);
+    body
+}
+
+/// `convert_i32_to_i16` from an unaligned source.
+#[allow(unsafe_code)]
+fn convert_i32_to_i16_unaligned_src(src: &[i32], dst: &mut [i16]) -> usize {
+    let n = src.len().min(dst.len());
+    if n < UNALIGNED_TAIL + 8 || !aligned16(dst.as_ptr().cast::<u8>()) {
+        return 0;
+    }
+    let body = (n - UNALIGNED_TAIL) / 8 * 8;
+    let mut ps = src.as_ptr().cast::<u8>();
+    let mut pd = dst.as_mut_ptr().cast::<u8>();
+    let mut left = body / 8;
+    // SAFETY: eight samples a trip -- 32 source bytes consumed, 16 written --
+    // reading at most one block beyond, reserved by `UNALIGNED_TAIL`. `dst`
+    // is 16-byte aligned. q0-q3 only; SAR is restored.
+    unsafe {
+        core::arch::asm!(
+            "rsr.sar {sar}",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "23:",
+            "ee.ld.128.usar.ip q1, {ps}, 16",
+            "ee.src.q q2, q0, q1",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "ee.src.q q3, q1, q0",
+            "ee.vunzip.16 q2, q3",       // q3 = the eight high halfwords
+            "ee.vst.128.ip q3, {pd}, 16",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 23b",
+            "wsr.sar {sar}",
+            ps = inout(reg) ps,
+            pd = inout(reg) pd,
+            n = inout(reg) left => _,
+            sar = out(reg) _,
+            options(nostack),
+        );
+    }
+    let _ = (ps, pd);
+    body
+}
+
+/// `convert_i32_to_i24in32` from an unaligned source.
+#[allow(unsafe_code)]
+fn convert_i32_to_i24in32_unaligned_src(src: &[i32], dst: &mut [i32]) -> usize {
+    let n = src.len().min(dst.len());
+    if n < UNALIGNED_TAIL + 4 || !aligned16(dst.as_ptr().cast::<u8>()) {
+        return 0;
+    }
+    let body = (n - UNALIGNED_TAIL) / 4 * 4;
+    let mut ps = src.as_ptr().cast::<u8>();
+    let mut pd = dst.as_mut_ptr().cast::<u8>();
+    let mut left = body / 4;
+    // SAFETY: four samples a trip -- 16 bytes consumed and written --
+    // reading at most one block beyond, reserved by `UNALIGNED_TAIL`. `dst`
+    // is 16-byte aligned. q0-q2 and q6/q7 only; SAR is restored.
+    unsafe {
+        core::arch::asm!(
+            "rsr.sar {sar}",
+            "ee.zero.q q6",
+            "ee.vcmp.eq.s16 q7, q6, q6",
+            "ssai 8",
+            "ee.vsl.32 q7, q7",          // 0xffff_ff00 per 32-bit lane
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "24:",
+            "ee.ld.128.usar.ip q1, {ps}, 0",
+            "ee.src.q q2, q0, q1",
+            "ee.andq q2, q2, q7",
+            "ee.vst.128.ip q2, {pd}, 16",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 24b",
+            "wsr.sar {sar}",
+            ps = inout(reg) ps,
+            pd = inout(reg) pd,
+            n = inout(reg) left => _,
+            sar = out(reg) _,
+            options(nostack),
+        );
+    }
+    let _ = (ps, pd);
+    body
 }

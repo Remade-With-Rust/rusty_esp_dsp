@@ -1202,3 +1202,65 @@ inserts a general register into a chosen lane.
 a 3-way deinterleave and PIE has only 2-way `zip`/`unzip` with no general
 byte permute. This is a refutation about the INSTRUCTION SET, not about the
 kernel, and it does not expire when the surrounding code changes.
+
+## P4 — twelve more, and the 4x4 block family REFUTED
+
+| kernel | scalar | PIE | |
+|---|---:|---:|---:|
+| `convert_i32_to_i24in32` | 477,487 | 39,042 | **−91.8%** |
+| `convert_i32_to_i24in32` unaligned | 479,685 | 48,889 | **−89.8%** |
+| `convert_i16_to_i32` | 178,978 | 26,238 | **−85.3%** |
+| `convert_i16_to_i32` unaligned | 179,335 | 30,334 | **−83.1%** |
+| `convert_i32_to_i16` | 162,852 | 24,577 | **−84.9%** |
+| `convert_i32_to_i16` unaligned | 164,975 | 33,291 | **−79.8%** |
+| `gain_i16` | 134,920 | 24,297 | **−82.0%** |
+| `gain_i16` unaligned | 134,939 | 32,912 | **−75.6%** |
+| `mix_i16` unaligned | 111,154 | 33,903 | **−69.5%** |
+| `mono_to_stereo` unaligned | 65,415 | 31,325 | **−52.1%** |
+| `stereo_to_mono` unaligned | 99,812 | 49,235 | **−50.7%** |
+| `downscale2x_gray8` unaligned | 225,563 | 135,181 | **−40.1%** |
+
+### ★★ REFUTED: the 4x4 block family does not pay on this unit
+
+Three kernels built, gated `identical=true`, and every one measured WORSE.
+Recording per §12 which kind of revert this is: **measured worse, not inside
+the noise.**
+
+| kernel | scalar | PIE | |
+|---|---:|---:|---:|
+| `residual_4x4` | 4,417,156 | 5,203,715 | **+17.8%** |
+| `satd_4x4` | 4,827,934 | 6,056,077 | **+25.4%** |
+| `satd_4x4_sum` | 2,611,044 | 4,000,359 | **+53.2%** |
+
+**Four bytes a row is a poor fit for a sixteen-byte register**, and the
+unaligned funnel spends three instructions to deliver four useful bytes.
+`residual_4x4` said so first. The obvious rescue was arithmetic density —
+`satd_4x4` does about six times the work per loaded byte, two butterfly
+passes and sixteen magnitudes and a reduction — and it did NOT rescue it.
+`satd_4x4_sum`, which amortises the per-call setup over 64 blocks, was worse
+still, which says the cost is not per-call overhead either.
+
+That is three probes varied along the axis that could have flipped the answer
+(low density, high density, amortised), so §11 is satisfied and this is a
+real refutation rather than one measurement.
+
+**The mechanism that is left is the transpose.** A 4x4 i32 transpose has no
+shuffle instruction on this unit: two `ee.vzip.32`s pair the lanes and the
+64-bit halves must be recombined THROUGH MEMORY with `ee.vld.l.64` /
+`ee.vld.h.64`. Four stores immediately followed by eight loads of the same
+addresses is a store-to-load hazard on an in-order core, and it sits in the
+middle of the dependency chain where nothing can hide it.
+
+**This refutation is provisional, not permanent** (§12): it would expire if a
+register-level 64-bit half-swap were found. `ee.src.q` with SAR_BYTE = 8
+funnels a pair by eight bytes and might serve — SAR_BYTE is settable only by
+`ee.ld.128.usar.ip` from an address, so it would take a dummy load from an
+address ≡ 8 (mod 16). Untried.
+
+### The seam that IS exhausted
+
+Every kernel in this module now has an unaligned arm where one is possible:
+the twelve reductions and element-wise kernels, both SADs, the luma gather
+and the gray downscale. The only kernels without one are those whose
+DESTINATION can be misaligned, and that is not a gap — `ee.vst.128` requires
+alignment and the alternatives cost a lane extract and a byte store each.
