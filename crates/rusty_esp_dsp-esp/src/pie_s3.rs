@@ -2321,20 +2321,34 @@ pub fn rotate90_gray8(src: &[u8], width: u32, height: u32, dst: &mut [u8]) -> Re
     Ok(())
 }
 
-/// `sad_4x4` on the PIE unit — backlog B6, and a LOW expectation going in:
-/// the 4x4 geometry has been refuted twice (`residual_4x4` +17.8%,
-/// `satd_4x4` +25.4% then +7.6%), because four bytes a row is a poor fit for
-/// a sixteen-byte register. It is here because it costs almost nothing to
-/// try — the body is `sad_8x8`'s with four rows — and a backlog item closed
-/// by a measurement beats one closed by an assumption.
+/// `sad_4x4` on the PIE unit — backlog B6.
 ///
-/// Only the first four lanes of each widened row carry data; lanes 4..=7
-/// hold whatever followed the row in memory and accumulate garbage that is
-/// simply never read. That costs one instruction of widening and no
-/// correctness.
+/// The first version streamed rows like `sad_8x8` does and measured −11.8%.
+/// That left half the machine idle: a 4x4 row is FOUR bytes, so a sixteen-
+/// byte vector load fetched four useful bytes and the widening, subtract,
+/// magnitude and accumulate that followed all ran on four live lanes out of
+/// eight, four times over.
 ///
-/// **Requires 16 bytes of slack past the oracle's bound**, because the row
-/// load reads sixteen bytes to use four.
+/// This version GATHERS the block first. `ee.movi.32.q` inserts a general
+/// register into a chosen 32-bit lane, so four `l32i`/insert pairs pack the
+/// whole 4x4 — sixteen bytes, every one of them real — into one register.
+/// The arithmetic then runs ONCE across two full registers instead of four
+/// times across half-empty ones:
+///
+/// ```text
+///   gather      11 instructions per operand   (was 4 loads)
+///   arithmetic  11 instructions total         (was 8 x 4 = 32)
+/// ```
+///
+/// The load side gets seven instructions worse and the arithmetic side
+/// twenty-one better. There is no loop left to pay for either.
+///
+/// `l32i` needs 4-byte alignment, which the existing preconditions already
+/// guarantee: the base is 16-byte aligned and the stride is a multiple of
+/// 16, so every row start is too.
+///
+/// **Requires 4 bytes of slack past the oracle's bound** — down from 16,
+/// because a row read is now exactly the four bytes the row has.
 #[allow(unsafe_code)]
 pub fn sad_4x4(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
     expect_len(a, 3 * sa + 4)?;
@@ -2354,42 +2368,62 @@ pub fn sad_4x4(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
     let mut acc = Q([0; 8]);
     let mut pa = a.as_ptr();
     let mut pb = b.as_ptr();
-    let mut rows = 4u32;
-    // SAFETY: the bound checked above guarantees `3*stride + 16` readable
-    // bytes from each base, and the loop reads exactly 16 at
-    // `base + r*stride` for r in 0..4. Both bases and strides are 16-byte
-    // aligned. q0-q4 and q6 only.
+    // SAFETY: `expect_len` guarantees `3*stride + 4` readable bytes from
+    // each base, and the block reads exactly four at `base + r*stride` for
+    // r in 0..4 -- the last of them ending at `3*stride + 4`. Both bases are
+    // 16-byte aligned and both strides are multiples of 16, so every `l32i`
+    // is 4-byte aligned. q0-q3 and q6 only.
     unsafe {
         core::arch::asm!(
-            "ee.zero.q q4",
-            "ee.zero.q q6",
-            "28:",
+            // Pair the rows with `ee.vzip.32`, which interleaves 32-BIT
+            // lanes: zipping row r with row r+1 puts their four-byte rows
+            // side by side in the low half, so ONE widening covers both and
+            // every lane is live. No general-register transfer anywhere --
+            // the `ee.movi.32.q` gather this replaced cut fourteen
+            // instructions and bought one per cent, because those transfers
+            // are latency, not issue slots.
             "ee.vld.128.xp q0, {pa}, {sa}",
+            "ee.vld.128.xp q1, {pa}, {sa}",
+            "ee.vzip.32 q0, q1",             // q0[0..8] = row0 ++ row1
+            "ee.vld.128.xp q2, {pa}, {sa}",
+            "ee.vld.128.xp q3, {pa}, {sa}",
+            "ee.vzip.32 q2, q3",             // q2[0..8] = row2 ++ row3
+            "ee.zero.q q4",
+            "ee.vzip.8 q0, q4",              // eight live i16: rows 0 and 1
+            "ee.zero.q q5",
+            "ee.vzip.8 q2, q5",              // rows 2 and 3
             "ee.vld.128.xp q1, {pb}, {sb}",
-            "ee.zero.q q2",
-            "ee.vzip.8 q0, q2",          // lanes 0..=3 are the row
-            "ee.zero.q q3",
-            "ee.vzip.8 q1, q3",
+            "ee.vld.128.xp q4, {pb}, {sb}",
+            "ee.vzip.32 q1, q4",
+            "ee.vld.128.xp q3, {pb}, {sb}",
+            "ee.vld.128.xp q5, {pb}, {sb}",
+            "ee.vzip.32 q3, q5",
+            "ee.zero.q q7",
+            "ee.vzip.8 q1, q7",
+            "ee.zero.q q7",
+            "ee.vzip.8 q3, q7",
+            // exact in s16: 0..=255 minus 0..=255 cannot saturate
             "ee.vsubs.s16 q0, q0, q1",
+            "ee.vsubs.s16 q2, q2, q3",
+            "ee.zero.q q6",
             "ee.vsubs.s16 q1, q6, q0",
             "ee.vmax.s16 q0, q0, q1",
-            "ee.vadds.s16 q4, q4, q0",
-            "addi {n}, {n}, -1",
-            "bnez {n}, 28b",
-            "ee.vst.128.ip q4, {lo}, 0",
+            "ee.vsubs.s16 q3, q6, q2",
+            "ee.vmax.s16 q2, q2, q3",
+            "ee.vadds.s16 q0, q0, q2",       // 8 lanes, each at most 510
+            "ee.vst.128.ip q0, {lo}, 0",
             pa = inout(reg) pa,
             pb = inout(reg) pb,
             sa = in(reg) sa,
             sb = in(reg) sb,
-            n = inout(reg) rows,
             lo = inout(reg) acc.0.as_mut_ptr() => _,
             options(nostack),
         );
     }
-    let _ = (pa, pb, rows);
-    // FOUR lanes, not eight: the rest accumulated bytes past the row.
+    let _ = (pa, pb);
+    // EIGHT lanes now, and every one of them real.
     let mut total = 0u32;
-    for k in 0..4 {
+    for k in 0..8 {
         total += u32::from(acc.0[k] as u16);
     }
     Ok(total)
