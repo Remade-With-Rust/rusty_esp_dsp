@@ -558,6 +558,101 @@ fn main() -> ! {
             Work { samples: npx, ..Work::ZERO }
         });
 
+        // --- how WIDE is ACCX, and what does `rur.accx_1` put above it? --
+        //
+        // `sum_sq_i16` never had to ask: a sum of squares is non-negative, so
+        // recomposing the two halves as an unsigned 64-bit value is exact.
+        // `dot_i16` read the low word right and the high word wrong, which
+        // says the accumulator is NARROWER than 64 bits and `accx_1` is not
+        // 32 bits of sign. Feed it accumulators whose value is KNOWN and read
+        // the halves back -- the same method that produced the lane tables.
+        {
+            #[repr(align(16))]
+            struct Q([i16; 8]);
+            for (label, av, bv) in [
+                ("-1", -1i16, 1i16),
+                ("-2", -2, 1),
+                ("+1", 1, 1),
+                ("-32768*32767", i16::MIN, i16::MAX),
+            ] {
+                let a = Q([av, 0, 0, 0, 0, 0, 0, 0]);
+                let b = Q([bv, 0, 0, 0, 0, 0, 0, 0]);
+                let (lo, hi): (u32, u32);
+                // SAFETY: two 16-byte aligned 16-byte buffers, read only;
+                // q0/q1 and ACCX are not live across this block.
+                unsafe {
+                    core::arch::asm!(
+                        "ee.zero.accx",
+                        "ee.vld.128.ip q0, {pa}, 0",
+                        "ee.vld.128.ip q1, {pb}, 0",
+                        "ee.vmulas.s16.accx q0, q1",
+                        "rur.accx_0 {l}",
+                        "rur.accx_1 {h}",
+                        pa = inout(reg) a.0.as_ptr() => _,
+                        pb = inout(reg) b.0.as_ptr() => _,
+                        l = out(reg) lo,
+                        h = out(reg) hi,
+                        options(nostack),
+                    );
+                }
+                println!("ACCXW value={label} accx_0={lo:#010x} accx_1={hi:#010x}");
+            }
+        }
+
+        // --- dot_i16: the one kernel here whose RESULT can be negative ---
+        //
+        // `dot_i16(iv, iv)` would be a sum of squares and could never test
+        // the sign reconstruction, which is the only thing about this twin
+        // that is not already proved by `sum_sq_i16`. So the second operand
+        // is built to OPPOSE the first: the running total crosses zero and
+        // the final answer is negative.
+        let mut jsrc: alloc::vec::Vec<u128> = alloc::vec![0; NPX / 8];
+        // SAFETY: as for `isrc` above -- a `Vec<u128>` is 16-byte aligned
+        // and initialised, and `i16` is POD.
+        let jv = unsafe {
+            core::slice::from_raw_parts_mut(jsrc.as_mut_ptr().cast::<i16>(), NPX)
+        };
+        for (k, v) in jv.iter_mut().enumerate() {
+            *v = match k % 4 {
+                0 => i16::MAX,        // x i16::MIN -> the most negative product
+                1 => i16::MIN,
+                _ => (((k as i32) * 2731) % 65536 - 32768) as i16,
+            };
+        }
+        let dref = rusty_esp_dsp::sample::dot_i16(iv, jv);
+        let dpie = rusty_esp_dsp_esp::pie_s3::dot_i16(iv, jv);
+        println!(
+            "PIEKERNEL dot_i16 identical={} negative={} scalar={dref} pie={dpie}",
+            dref == dpie,
+            dref < 0
+        );
+        measure("dot_scalar", "sample", npx, || {
+            core::hint::black_box(rusty_esp_dsp::sample::dot_i16(iv, jv));
+            Work { samples: npx, ..Work::ZERO }
+        });
+        measure("dot_pie", "sample", npx, || {
+            core::hint::black_box(rusty_esp_dsp_esp::pie_s3::dot_i16(iv, jv));
+            Work { samples: npx, ..Work::ZERO }
+        });
+
+        // --- sum_sq_i16_le: the byte-slice form `rms_dbfs_i16` calls ---
+        // SAFETY: `iv` is a live `[i16]`; viewing it as bytes is POD, and
+        // the length is exactly twice as many.
+        let ibytes = unsafe {
+            core::slice::from_raw_parts(iv.as_ptr().cast::<u8>(), NPX * 2)
+        };
+        let lref = rusty_esp_dsp::sample::sum_sq_i16_le(ibytes);
+        let lpie = rusty_esp_dsp_esp::pie_s3::sum_sq_i16_le(ibytes);
+        println!("PIEKERNEL sum_sq_i16_le identical={} scalar={lref:?} pie={lpie:?}", lref == lpie);
+        measure("sumsq_le_scalar", "sample", npx, || {
+            core::hint::black_box(rusty_esp_dsp::sample::sum_sq_i16_le(ibytes));
+            Work { samples: npx, ..Work::ZERO }
+        });
+        measure("sumsq_le_pie", "sample", npx, || {
+            core::hint::black_box(rusty_esp_dsp_esp::pie_s3::sum_sq_i16_le(ibytes));
+            Work { samples: npx, ..Work::ZERO }
+        });
+
         report_memory("after_pie");
     }
 

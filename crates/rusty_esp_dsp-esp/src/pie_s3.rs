@@ -393,7 +393,14 @@ pub fn sum_sq_i16(a: &[i16]) -> i64 {
         }
         // A sum of squares is never negative, so the two halves compose
         // without sign extension.
-        total += ((u64::from(hi) << 32) | u64::from(lo)) as i64;
+        // ACCX is FORTY bits, and `rur.accx_1` delivers bits 32..=39
+        // ZERO-extended into a 32-bit register -- an accumulator of -1 reads
+        // back `accx_1 = 0x0000_00ff`, not `0xffff_ffff` (measured, see the
+        // module table). So the two halves compose into 40 bits and the sign
+        // has to be put back by hand. `sum_sq_i16` is exempt only because a
+        // sum of squares is never negative; copy THIS one, not that one.
+        let raw = (u64::from(hi & 0xff) << 32) | u64::from(lo);
+        total += ((raw << 24) as i64) >> 24;
     }
 
     // The tail the vector body did not cover, by the oracle's own arithmetic.
@@ -402,4 +409,85 @@ pub fn sum_sq_i16(a: &[i16]) -> i64 {
         total += i64::from(v * v);
     }
     total
+}
+
+/// `dot_i16` on the PIE unit, by the same accumulator as [`sum_sq_i16`].
+///
+/// Two loads and one multiply-accumulate per eight samples. The one
+/// difference that matters: a dot product can be NEGATIVE, so the two halves
+/// of the accumulator are recomposed as a signed 64-bit value rather than an
+/// unsigned one — and the flush batch is sized for the magnitude either way,
+/// since `|a*b| <= 2^30` and sixteen instructions add 128 of them.
+#[allow(unsafe_code)]
+#[must_use]
+pub fn dot_i16(a: &[i16], b: &[i16]) -> i64 {
+    let n = a.len().min(b.len());
+    let body = n / 8 * 8;
+    if body == 0
+        || !aligned16(a.as_ptr().cast::<u8>())
+        || !aligned16(b.as_ptr().cast::<u8>())
+    {
+        return rusty_esp_dsp::sample::dot_i16(a, b);
+    }
+
+    let mut total: i64 = 0;
+    let mut pa = a.as_ptr().cast::<u8>();
+    let mut pb = b.as_ptr().cast::<u8>();
+    let mut left = body / 8;
+    while left > 0 {
+        // 16 instructions x 8 lanes = 128 products of at most 2^30, so the
+        // partial peaks at 2^37 inside a 40-bit accumulator -- 4x headroom.
+        let batch = left.min(16);
+        left -= batch;
+        let (lo, hi): (u32, u32);
+        // SAFETY: the loop advances each pointer by 16 exactly `batch` times
+        // and `batch` never exceeds what remains of `body`, so both stay
+        // inside their slices. Both are 16-byte aligned. q0/q1 and ACCX only.
+        unsafe {
+            core::arch::asm!(
+                "ee.zero.accx",
+                "2:",
+                "ee.vld.128.ip q0, {pa}, 16",
+                "ee.vld.128.ip q1, {pb}, 16",
+                "ee.vmulas.s16.accx q0, q1",
+                "addi {n}, {n}, -1",
+                "bnez {n}, 2b",
+                "rur.accx_0 {l}",
+                "rur.accx_1 {h}",
+                pa = inout(reg) pa,
+                pb = inout(reg) pb,
+                n = inout(reg) batch => _,
+                l = out(reg) lo,
+                h = out(reg) hi,
+                options(nostack),
+            );
+        }
+        // ACCX is FORTY bits, and `rur.accx_1` delivers bits 32..=39
+        // ZERO-extended into a 32-bit register -- an accumulator of -1 reads
+        // back `accx_1 = 0x0000_00ff`, not `0xffff_ffff` (measured on the
+        // part). So the halves compose into 40 bits and the sign has to be
+        // put back by hand. `sum_sq_i16` got away without this only because
+        // a sum of squares is never negative.
+        let raw = (u64::from(hi & 0xff) << 32) | u64::from(lo);
+        total += ((raw << 24) as i64) >> 24;
+    }
+
+    for k in body..n {
+        total += i64::from(i32::from(a[k]) * i32::from(b[k]));
+    }
+    total
+}
+
+/// `sum_sq_i16_le` on the PIE unit: the same reduction over little-endian
+/// bytes, which is the form `rms_dbfs_i16` (and therefore the VAD and the
+/// AGC) actually calls.
+///
+/// The byte buffer IS a run of `i16`s, so when it views as one this is
+/// [`sum_sq_i16`] and nothing else.
+#[must_use]
+pub fn sum_sq_i16_le(samples: &[u8]) -> (i64, usize) {
+    match rusty_esp_core::pcm::as_i16(samples) {
+        Some(v) if aligned16(samples.as_ptr()) => (sum_sq_i16(v), v.len()),
+        _ => rusty_esp_dsp::sample::sum_sq_i16_le(samples),
+    }
 }
