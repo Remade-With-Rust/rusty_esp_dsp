@@ -1503,6 +1503,86 @@ fn main() -> ! {
             println!("P4 == end ==");
         }
 
+        // --- Gain: a lane-wise fixed-point multiply, QACC's job ---------
+        //
+        // Gated against the element at an EXACT q15 (`Gain::from_q15`), so
+        // the two arms cannot differ by a constructor's rounding. 16422 is
+        // about -6 dB, inside the |g| <= 32767 domain the broadcast lane
+        // imposes; a louder gain takes the oracle and is not measured here.
+        {
+            use rusty_esp_audio_core::elements::Gain;
+            use rusty_esp_audio_core::pipeline::Element;
+            use rusty_esp_dsp::esp_core::pcm::{PcmBlock, PcmFormat, SampleFormat};
+            use rusty_esp_dsp::esp_core::time::Micros;
+            let f_mono = PcmFormat::new(16_000, 1, SampleFormat::I16).expect("fmt");
+            const GQ: i32 = 16422;
+            let mut g = Gain::from_q15(GQ);
+            let gn = NMIX - 8;
+            let gnu = gn as u64;
+            // SAFETY: byte views of the two aligned scratch buffers.
+            let (dref, dpie) = unsafe {
+                (
+                    core::slice::from_raw_parts_mut(msrc.as_mut_ptr().cast::<u8>(), NMIX * 2),
+                    core::slice::from_raw_parts_mut(psrc.as_mut_ptr().cast::<u8>(), NMIX * 2),
+                )
+            };
+            println!("PIEKERNEL gain q15={} element_q15={}", GQ, g.q15());
+
+            // aligned
+            let blk = PcmBlock::new(f_mono, Micros(0), &ibytes[..gn * 2]).expect("blk");
+            let _ = g.process(blk, dref).expect("gain scalar");
+            rusty_esp_dsp_esp::pie_s3::gain_i16(&iv[..gn], GQ, unsafe {
+                // SAFETY: `dpie` is the byte view of an aligned `Vec<u128>`.
+                core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
+            });
+            println!(
+                "PIEKERNEL gain_i16 identical={} align={}",
+                dref[..gn * 2] == dpie[..gn * 2],
+                iv.as_ptr() as usize % 16
+            );
+            measure("gain_scalar", "sample", gnu, || {
+                let blk = PcmBlock::new(f_mono, Micros(0), &ibytes[..gn * 2]).expect("blk");
+                let _ = g.process(blk, dref);
+                Work { samples: gnu, ..Work::ZERO }
+            });
+            measure("gain_pie", "sample", gnu, || {
+                // SAFETY: as above.
+                let o = unsafe {
+                    core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
+                };
+                rusty_esp_dsp_esp::pie_s3::gain_i16(&iv[..gn], GQ, o);
+                Work { samples: gnu, ..Work::ZERO }
+            });
+
+            // unaligned source, aligned destination
+            let ua = &iv[1..];
+            let uab = &ibytes[2..];
+            let blk = PcmBlock::new(f_mono, Micros(0), &uab[..gn * 2]).expect("blk");
+            let _ = g.process(blk, dref).expect("gain scalar");
+            rusty_esp_dsp_esp::pie_s3::gain_i16(&ua[..gn], GQ, unsafe {
+                // SAFETY: as above.
+                core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
+            });
+            println!(
+                "PIEKERNEL gain_i16_unaligned identical={} src_off={}",
+                dref[..gn * 2] == dpie[..gn * 2],
+                ua.as_ptr() as usize % 16
+            );
+            measure("gain_un_scalar", "sample", gnu, || {
+                let blk = PcmBlock::new(f_mono, Micros(0), &uab[..gn * 2]).expect("blk");
+                let _ = g.process(blk, dref);
+                Work { samples: gnu, ..Work::ZERO }
+            });
+            measure("gain_un_pie", "sample", gnu, || {
+                // SAFETY: as above.
+                let o = unsafe {
+                    core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
+                };
+                rusty_esp_dsp_esp::pie_s3::gain_i16(&ua[..gn], GQ, o);
+                Work { samples: gnu, ..Work::ZERO }
+            });
+        }
+
         report_memory("after_pie");
     }
 

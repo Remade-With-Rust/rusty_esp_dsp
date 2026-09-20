@@ -1559,3 +1559,140 @@ fn downscale2x_gray8_unaligned_row(r0: &[u8], r1: &[u8], drow: &mut [u8]) -> usi
     let _ = (p0, p1, pd);
     body
 }
+
+/// `Gain`'s per-sample arithmetic: `(x * g + (1 << 14)) >> 15`, clamped to
+/// i16.
+///
+/// This is a lane-wise fixed-point multiply, which on this unit is QACC's
+/// job and not `ee.vmul.s16`'s — that instruction keeps the low half and
+/// **wraps**, so it is wrong everywhere the scalar clamps.
+///
+/// The whole expression is three instructions for eight samples:
+/// `ee.vmulas.s16.qacc q, qG` accumulates `x * g` into eight 40-bit lanes,
+/// a second MAC of `16384 x 1` adds the rounding term to every lane, and
+/// `ee.srcmb.s16.qacc` shifts right by 15 and clamps to i16 in one go. It
+/// **floors**, which is what Rust's `>>` does on a negative value, so the
+/// rounding matches at every sign — measured on the part, not assumed.
+///
+/// **Domain: `|q15| <= 32767`.** The multiplier has to live in an i16 lane.
+/// The scalar's narrow path admits `|g| < 65536`, so gains above unity by
+/// more than a hair take the oracle; attenuation, which is what an AGC
+/// spends its life doing, is entirely inside the domain. Above 32767 the
+/// caller gets the scalar arm and the same bytes.
+///
+/// In-domain no clamp can ever fire: `|x| <= 32768` and `|g| <= 32767` give
+/// `|x*g| <= 2^30`, and `(2^30 + 2^14) >> 15 < 32768`. The clamp is kept
+/// because it is free — `ee.srcmb` does it as part of the shift.
+#[allow(unsafe_code)]
+pub fn gain_i16(src: &[i16], q15: i32, dst: &mut [i16]) {
+    let n = src.len().min(dst.len());
+    if q15.unsigned_abs() > 32767 {
+        for k in 0..n {
+            let y = (i32::from(src[k]) * q15 + (1 << 14)) >> 15;
+            dst[k] = y.clamp(-32768, 32767) as i16;
+        }
+        return;
+    }
+
+    // The three broadcast sources, adjacent so one register plus an offset
+    // reaches them all.
+    #[repr(align(16))]
+    struct C([i16; 4]);
+    let c = C([q15 as i16, 16384, 1, 0]);
+
+    let body = n / 8 * 8;
+    let aligned = body > 0
+        && aligned16(src.as_ptr().cast::<u8>())
+        && aligned16(dst.as_ptr().cast::<u8>());
+
+    let done = if aligned {
+        let mut ps = src.as_ptr().cast::<u8>();
+        let mut pd = dst.as_mut_ptr().cast::<u8>();
+        let mut left = body / 8;
+        // SAFETY: eight samples a trip, `body / 8` times, and `body <= n <=`
+        // both slice lengths; both are 16-byte aligned. `c` is a live local
+        // read two bytes at a time at offsets 0, 2 and 4 of four. q0/q1 and
+        // q5-q7 only.
+        unsafe {
+            core::arch::asm!(
+                "ee.vldbc.16 q5, {pg}",       // the gain, in every lane
+                "addi {pg}, {pg}, 2",
+                "ee.vldbc.16 q6, {pg}",       // 16384, the rounding term
+                "addi {pg}, {pg}, 2",
+                "ee.vldbc.16 q7, {pg}",       // 1, its multiplicand
+                "17:",
+                "ee.zero.qacc",
+                "ee.vld.128.ip q0, {ps}, 16",
+                "ee.vmulas.s16.qacc q0, q5",  // x * g, eight 40-bit lanes
+                "ee.vmulas.s16.qacc q6, q7",  // + (1 << 14) in every lane
+                "ee.srcmb.s16.qacc q1, {sh}, 0", // >> 15, floored, clamped
+                "ee.vst.128.ip q1, {pd}, 16",
+                "addi {n}, {n}, -1",
+                "bnez {n}, 17b",
+                pg = inout(reg) c.0.as_ptr() => _,
+                ps = inout(reg) ps,
+                pd = inout(reg) pd,
+                sh = in(reg) 15u32,
+                n = inout(reg) left => _,
+                options(nostack),
+            );
+        }
+        let _ = (ps, pd);
+        body
+    } else {
+        gain_i16_unaligned_src(src, &c.0, dst)
+    };
+
+    for k in done..n {
+        let y = (i32::from(src[k]) * q15 + (1 << 14)) >> 15;
+        dst[k] = y.clamp(-32768, 32767) as i16;
+    }
+}
+
+/// `gain_i16` for a source at any offset with an aligned destination.
+#[allow(unsafe_code)]
+fn gain_i16_unaligned_src(src: &[i16], c: &[i16; 4], dst: &mut [i16]) -> usize {
+    let n = src.len().min(dst.len());
+    if n < UNALIGNED_TAIL + 8 || !aligned16(dst.as_ptr().cast::<u8>()) {
+        return 0;
+    }
+    let body = (n - UNALIGNED_TAIL) / 8 * 8;
+    let mut ps = src.as_ptr().cast::<u8>();
+    let mut pd = dst.as_mut_ptr().cast::<u8>();
+    let mut left = body / 8;
+    // SAFETY: eight samples a trip, reading at most one 16-byte block past
+    // what is consumed -- reserved by `UNALIGNED_TAIL`. `dst` is 16-byte
+    // aligned. q0-q2 and q5-q7 only; SAR is restored.
+    unsafe {
+        core::arch::asm!(
+            "rsr.sar {sar}",
+            "ee.vldbc.16 q5, {pg}",
+            "addi {pg}, {pg}, 2",
+            "ee.vldbc.16 q6, {pg}",
+            "addi {pg}, {pg}, 2",
+            "ee.vldbc.16 q7, {pg}",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "18:",
+            "ee.zero.qacc",
+            "ee.ld.128.usar.ip q1, {ps}, 0",
+            "ee.src.q q2, q0, q1",
+            "ee.vmulas.s16.qacc q2, q5",
+            "ee.vmulas.s16.qacc q6, q7",
+            "ee.srcmb.s16.qacc q2, {sh}, 0",
+            "ee.vst.128.ip q2, {pd}, 16",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 18b",
+            "wsr.sar {sar}",
+            pg = inout(reg) c.as_ptr() => _,
+            ps = inout(reg) ps,
+            pd = inout(reg) pd,
+            sh = in(reg) 15u32,
+            n = inout(reg) left => _,
+            sar = out(reg) _,
+            options(nostack),
+        );
+    }
+    let _ = (ps, pd);
+    body
+}
