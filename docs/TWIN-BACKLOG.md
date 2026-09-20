@@ -58,7 +58,7 @@ destination its chip arm declines by precondition.
 |---|---|---|---|
 | ~~B1~~ | ~~`downscale2x_rgb565`~~ | `rusty_esp_dsp` | **DONE, −65.5%** (1,330,835 → 458,773 ps/px_out). 28.5 instructions per output pixel against the scalar's ~287 cycles. |
 | ~~B2~~ | ~~`yuyv_to_rgb565`~~ | `rusty_esp_dsp` | **DONE, −63.2%** (399,135 → 146,995 ps/px). 10.1 instructions per pixel. |
-| ~~B3~~ | ~~`find_start_code`~~ | `rusty_esp_dsp` (kernel) | **DONE, −93.4%** (119,815 → 7,911 ps/byte, 15.1×) as `pie_s3::find_start_code3`. **Not yet wired** into `rusty_esp_video-core`, which is the remaining delivery step. |
+| ~~B3~~ | ~~`find_start_code`~~ | `rusty_esp_dsp` + `rusty_esp_video-core` | **DONE AND WIRED, −93.2%** (119,820 → 8,089 ps/byte, 14.8×) as `pie_s3::find_start_code3`, reached through `annexb::nal_spans` at **−86.4%** (138,622 → 18,861). See P8. |
 | ~~B4~~ | ~~`jpeg::find_eoi`~~ | `rusty_esp_image-core` | **DROPPED on inspection.** It scans BACKWARDS from the end and a well-formed JPEG has `FF D9` as its last two bytes, so it exits on the first iteration. Its recorded 175,274 ps/byte is a pathological-input number, not the production cost. Vectorising an O(1)-in-practice loop buys nothing. |
 | ~~B5~~ | ~~`csi::amplitudes`~~ | `rusty_esp_signal-core` | **PRUNED on arithmetic, no kernel written.** Two arms: the full loop 1,319,368 ps/subcarrier, the same loop without the `isqrt` 217,933. **`isqrt` is 83.5%** — it is Newton's method over 32-bit DIVIDES, sequential, and PIE has no divide. Making the whole vectorisable remainder FREE caps a twin at 16.5%. |
 | ~~B6~~ | ~~`sad_4x4`~~ | `rusty_esp_dsp` | **DONE, −15.8%** (4,053,875 → 3,414,401), after two revisions. See below. |

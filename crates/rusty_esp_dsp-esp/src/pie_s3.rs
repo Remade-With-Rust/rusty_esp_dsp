@@ -2911,22 +2911,16 @@ fn first_zero_block(bytes: &[u8], from: usize, nblocks: usize) -> usize {
     }
 }
 
-/// Index of the first `00 00 01` in `bytes` — the Annex-B start code scan,
-/// backlog B3.
-///
-/// A start code must BEGIN with a zero byte, so a sixteen-byte block with no
-/// zero in it cannot contain one and is skipped whole. Only a block that
-/// does hold a zero is walked byte by byte, and the walk reads two bytes
-/// past its end so a code straddling the boundary is still found.
-#[must_use]
-pub fn find_start_code3(bytes: &[u8]) -> Option<usize> {
+/// The block-skipping scan, for a slice whose base is already 16-byte
+/// aligned. [`find_start_code3`] is the entry point that guarantees that.
+fn aligned_scan(bytes: &[u8]) -> Option<usize> {
     let n = bytes.len();
     if n < 3 {
         return None;
     }
     let hit = |i: usize| i + 2 < n && bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1;
     let nblocks = n / 16;
-    if !aligned16(bytes.as_ptr()) || nblocks == 0 {
+    if nblocks == 0 {
         return (0..n - 2).find(|&i| hit(i));
     }
     let mut b = 0usize;
@@ -2946,4 +2940,46 @@ pub fn find_start_code3(bytes: &[u8]) -> Option<usize> {
     }
     // Whatever is left past the last whole block.
     ((nblocks * 16)..n - 2).find(|&i| hit(i))
+}
+
+/// Index of the first `00 00 01` in `bytes` — the Annex-B start code scan,
+/// backlog B3.
+///
+/// A start code must BEGIN with a zero byte, so a sixteen-byte block with no
+/// zero in it cannot contain one and is skipped whole. Only a block that
+/// does hold a zero is walked byte by byte, and the walk reads two bytes
+/// past its end so a code straddling the boundary is still found.
+///
+/// # Any slice, not just an aligned one
+///
+/// The vector load needs a 16-byte aligned base, and **the caller this
+/// kernel exists for cannot give it one**: `annexb::NalSpans` scans
+/// `&stream[pos..]`, where `pos` is wherever the previous NAL ended. An
+/// `!aligned16 => scalar` guard would therefore have handed back the oracle
+/// on nearly every real call while every gate still read `identical=true` —
+/// the same self-inflicted reachability defect that hid eight wins earlier
+/// in this campaign.
+///
+/// So the prefix up to the first boundary is walked scalar-ly — at most
+/// fifteen byte tests, once — and the vector scan takes the rest. The prefix
+/// walk reads two bytes past `i` like every other walk here, so a code
+/// straddling the boundary is found by it rather than lost between the arms.
+#[must_use]
+pub fn find_start_code3(bytes: &[u8]) -> Option<usize> {
+    let n = bytes.len();
+    if n < 3 {
+        return None;
+    }
+    let hit = |i: usize| i + 2 < n && bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1;
+    let off = bytes.as_ptr().align_offset(16);
+    // No reachable alignment, or not one whole block past it: not worth it.
+    if off == usize::MAX || off + 16 > n {
+        return (0..n - 2).find(|&i| hit(i));
+    }
+    for i in 0..off {
+        if hit(i) {
+            return Some(i);
+        }
+    }
+    aligned_scan(&bytes[off..]).map(|i| i + off)
 }

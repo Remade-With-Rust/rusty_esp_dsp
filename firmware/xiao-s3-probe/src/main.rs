@@ -1838,6 +1838,7 @@ fn main() -> ! {
         pie_b1(ys, gd, &mut reference);
         pie_b2(ys, gd, &mut reference);
         pie_b3();
+        b3_seam_reach();
         pie_fused_family_probe();
 
         report_memory("after_pie");
@@ -3069,6 +3070,20 @@ fn pie_b3() {
     let p = rusty_esp_dsp_esp::pie_s3::find_start_code3(b);
     println!("PIEKERNEL find_start_code3 identical={} scalar={r:?} pie={p:?}", r == p);
 
+    // EVERY alignment, because the caller this kernel exists for cannot give
+    // it an aligned base: `NalSpans` scans `&stream[pos..]`. Until the twin
+    // handled the prefix itself, each of these fell back to the oracle while
+    // still printing identical=true -- a correct answer from the wrong arm.
+    let mut off_ok = true;
+    for off in [1usize, 2, 3, 7, 8, 15, 16, 17] {
+        let t = &b[off..];
+        if scalar(t) != rusty_esp_dsp_esp::pie_s3::find_start_code3(t) {
+            off_ok = false;
+            println!("PIEKERNEL find_start_code3 MISMATCH at off={off}");
+        }
+    }
+    println!("PIEKERNEL find_start_code3 all_offsets_identical={off_ok}");
+
     let nu = N as u64;
     measure("nalscan_scalar", "byte", nu, || {
         core::hint::black_box(scalar(b));
@@ -3077,5 +3092,111 @@ fn pie_b3() {
     measure("nalscan_pie", "byte", nu, || {
         core::hint::black_box(rusty_esp_dsp_esp::pie_s3::find_start_code3(b));
         Work { bytes: nu, ..Work::ZERO }
+    });
+    // An UNALIGNED base, which is what production actually hands it. If this
+    // reads like `nalscan_scalar` rather than like `nalscan_pie`, the prefix
+    // walk is not working and the twin is unreachable in the field.
+    let un = (N - 1) as u64;
+    measure("nalscan_pie_unaligned", "byte", un, || {
+        core::hint::black_box(rusty_esp_dsp_esp::pie_s3::find_start_code3(&b[1..]));
+        Work { bytes: un, ..Work::ZERO }
+    });
+}
+
+/// B3's REACHABILITY arm: `annexb::nal_spans` is the production call site,
+/// and this is what proves the seam reaches the twin rather than the oracle.
+///
+/// The stream is shaped like real Annex-B -- a four-byte start code every
+/// 512 bytes and non-zero payload in between -- because the twin's whole
+/// advantage is that a block with no zero byte in it cannot hold a start
+/// code, and a stream of zeros would hand it none of that.
+///
+/// Three numbers, the campaign's usual shape: the seam, the twin alone, and
+/// a probe-local walk built on the scalar scan, which is what the seam cost
+/// before it was wired. The seam carries the iterator's own bookkeeping on
+/// top of the scan, so it is expected to sit slightly above the bare twin --
+/// and an order of magnitude below the oracle.
+#[inline(never)]
+fn b3_seam_reach() {
+    use rusty_esp_video_core::annexb;
+
+    // 4 KB, not more: `MEM stage=buffers` reports ~23 KB free with the frame
+    // buffers live, and an 8 KB 16-byte-aligned request failed outright.
+    const SN: usize = 4096;
+    const STRIDE: usize = 512;
+    let mut sv: alloc::vec::Vec<u128> = alloc::vec![0; SN / 16];
+    // SAFETY: a `Vec<u128>` is 16-byte aligned and initialised, and `SN` is
+    // exactly the byte length of `SN / 16` u128 elements.
+    let st = unsafe { core::slice::from_raw_parts_mut(sv.as_mut_ptr().cast::<u8>(), SN) };
+    for (k, v) in st.iter_mut().enumerate() {
+        *v = 1 + (k.wrapping_mul(167) % 255) as u8; // never zero
+    }
+    let mut planted = 0usize;
+    let mut k = 0usize;
+    while k + 6 <= SN {
+        st[k] = 0;
+        st[k + 1] = 0;
+        st[k + 2] = 0;
+        st[k + 3] = 1;
+        st[k + 4] = 0x65; // an IDR slice NAL header
+        planted += 1;
+        k += STRIDE;
+    }
+
+    // The oracle walk: the same traversal `NalSpans` performs, over the scan
+    // this module used before the twin existed.
+    let scalar3 = |x: &[u8]| -> Option<usize> {
+        if x.len() < 3 {
+            return None;
+        }
+        (0..x.len() - 2).find(|&i| x[i] == 0 && x[i + 1] == 0 && x[i + 2] == 1)
+    };
+    let oracle_walk = |x: &[u8]| -> u32 {
+        let mut pos = match scalar3(x) {
+            Some(i) => i + 3,
+            None => return 0,
+        };
+        let mut n = 0u32;
+        while pos < x.len() {
+            let next = match scalar3(&x[pos..]) {
+                Some(i) => pos + i + 3,
+                None => break,
+            };
+            n += 1;
+            pos = next;
+        }
+        n + 1
+    };
+
+    let wired = annexb::nal_spans(st).count();
+    let oracle = oracle_walk(st);
+    println!(
+        "PIEB3SEAM nals_seam={wired} nals_oracle={oracle} planted={planted} agree={}",
+        wired as u32 == oracle
+    );
+
+    let su = SN as u64;
+    measure("b3_seam_nal_spans", "byte", su, || {
+        core::hint::black_box(annexb::nal_spans(st).count());
+        Work { bytes: su, ..Work::ZERO }
+    });
+    measure("b3_twin_direct", "byte", su, || {
+        let mut pos = 0usize;
+        let mut n = 0u32;
+        while pos < SN {
+            match rusty_esp_dsp_esp::pie_s3::find_start_code3(&st[pos..]) {
+                Some(i) => {
+                    n += 1;
+                    pos += i + 3;
+                }
+                None => break,
+            }
+        }
+        core::hint::black_box(n);
+        Work { bytes: su, ..Work::ZERO }
+    });
+    measure("b3_oracle_walk", "byte", su, || {
+        core::hint::black_box(oracle_walk(st));
+        Work { bytes: su, ..Work::ZERO }
     });
 }

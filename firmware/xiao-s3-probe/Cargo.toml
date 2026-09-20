@@ -44,6 +44,10 @@ rusty_esp_audio-core = { path = "../../../rusty_esp_audio/crates/rusty_esp_audio
 rusty_esp_signal-core = { path = "../../../rusty_esp_signal/crates/rusty_esp_signal-core", default-features = false, features = ["alloc"] }
 # The three pixel kernels the DSP crate did NOT take: crop, rotate90, rotate180.
 rusty_esp_image-core = { path = "../../../rusty_esp_image/crates/rusty_esp_image-core", default-features = false, features = ["alloc", "pie-s3"] }
+# The Annex-B start-code scan (B3) and, more to the point, the SEAM that
+# reaches it: `annexb::nal_spans` is the production call site, so measuring
+# it is what turns a twin with a gate into a twin with a caller.
+rusty_esp_video-core = { path = "../../../rusty_esp_video/crates/rusty_esp_video-core", default-features = false, features = ["pie-s3"] }
 
 [features]
 # The allocator arm. Exactly one, and the default is esp-hal's standard so
@@ -89,3 +93,8 @@ rusty_esp_dsp = { path = "../../crates/rusty_esp_dsp" }
 # oracle while looking wired. Patch every crate of a sibling, not the one you
 # happened to need first.
 rusty_esp_dsp-esp = { path = "../../crates/rusty_esp_dsp-esp" }
+
+# video-core takes rusty_esp_image-core from git and this probe takes it by
+# path; without this the graph carries two copies of it for the same reason.
+[patch."https://github.com/Remade-With-Rust/rusty_esp_image"]
+rusty_esp_image-core = { path = "../../../rusty_esp_image/crates/rusty_esp_image-core" }

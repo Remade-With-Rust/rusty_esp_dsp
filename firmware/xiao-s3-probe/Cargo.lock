@@ -1526,6 +1526,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusty_esp_video-core"
+version = "0.1.0"
+dependencies = [
+ "rusty_esp_core",
+ "rusty_esp_dsp-esp",
+ "rusty_esp_image-core",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1986,6 +1995,7 @@ dependencies = [
  "rusty_esp_dsp-esp",
  "rusty_esp_image-core",
  "rusty_esp_signal-core",
+ "rusty_esp_video-core",
 ]
 
 [[package]]

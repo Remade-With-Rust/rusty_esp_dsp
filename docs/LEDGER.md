@@ -1560,3 +1560,87 @@ reservation land on 2016 pixels at BOTH trip widths, so its tail was
 identical and its number is clean. **When a change alters the vector/scalar
 split, the per-element average is measuring the split, not the change.**
 Re-test with a buffer length that is a multiple of both trip widths.
+
+
+## P8 — B3 delivered: the start-code scan, and the guard that would have made it unreachable (2026-09-20)
+
+Backlog B3 had a measured twin and no caller. Wiring it took one seam in
+`rusty_esp_video-core` — and found, on the way, that the kernel as written
+could not have served that caller at all.
+
+### The defect: an alignment guard against a caller that cannot align
+
+`find_start_code3` began `if !aligned16(bytes.as_ptr()) { return the_oracle }`.
+Its one intended caller is `annexb::NalSpans`, which scans
+`&stream[pos..]` where `pos` is wherever the previous NAL ended — an
+arbitrary offset, essentially never a multiple of sixteen.
+
+So the twin would have returned the correct answer from the scalar arm on
+nearly every real call, while `identical=true` and every host test passed.
+**This is the third time in this campaign that an alignment precondition has
+been the reachability defect** (P2 found eight wins behind the same shape),
+and the first time it was caught before the number was banked rather than
+after.
+
+The fix is the prefix walk: `align_offset(16)` gives the distance to the
+first boundary, at most fifteen bytes are tested scalar-ly — reading two past
+each index, so a code straddling the boundary is found there and not lost
+between the arms — and the vector scan takes the rest.
+
+### Measured on the S3, over serial, null arm max 0.02% across 91 kernels
+
+| arm | ps/byte | vs its oracle |
+|---|---:|---:|
+| `nalscan_scalar` | 119,820 | — |
+| `nalscan_pie` (aligned base) | 8,089 | **−93.2%**, 14.8× |
+| `nalscan_pie_unaligned` (base+1, the production shape) | 8,540 | **−92.9%**, 14.0× |
+| `b3_oracle_walk` (`NalSpans`-shaped walk, scalar scan) | 138,622 | — |
+| `b3_twin_direct` (same walk, twin) | 16,032 | −88.4% |
+| `b3_seam_nal_spans` (**the production call site**) | 18,861 | **−86.4%**, 7.35× |
+
+The unaligned arm is the one that matters: at 8,540 against 8,089 the prefix
+costs 5.6%, and against the oracle's 119,820 it is still 14.0×. Had the
+guard survived, that row would have read ~119,820 and nothing else in the
+table would have changed.
+
+**The seam sits 17.6% above the bare twin, not 7× above it.** That gap is
+`NalSpans`' own bookkeeping — the backwards walk over leading zeros, the
+`NalSpan` construction, the access-unit bookkeeping — and it is what a wired
+seam is supposed to look like. An unwired one reads like `b3_oracle_walk`.
+
+Work-count parity checked, not assumed: `PIEB3SEAM nals_seam=8
+nals_oracle=8 planted=8 agree=true` (§4).
+
+### Gated twice, because the chip gate cannot run on a laptop
+
+`pie_s3` is `cfg(target_arch = "xtensa")`, so a host test cannot call the
+twin. Two gates instead:
+
+- **On chip**, `all_offsets_identical=true` — the twin against the scalar
+  scan at offsets 1, 2, 3, 7, 8, 15, 16, 17, which is every distinct
+  `align_offset` case. This is the real gate.
+- **On host**, `rusty_esp_dsp-esp/tests/start_code_model.rs` carries the same
+  control flow with the one vector step replaced by a scalar equivalent and
+  fuzzes it against a naive scan over 128,000 cases at every alignment, plus
+  a planted straddle at all 96 positions. That gates the prefix walk, the
+  block skip, the two-past-the-end read and the tail — everything that is not
+  the assembly.
+- And in `rusty_esp_video-core`, `the_split_scan_matches_the_scan_it_replaced`
+  fuzzes `find_start_code` against a verbatim copy of its pre-split body, at
+  every offset into every buffer, so the split itself is gated by the thing
+  it replaced rather than by a restatement of itself.
+
+### One more build-graph reachability bug, found by looking
+
+`rusty_esp_image` and `rusty_esp_audio` both consume `rusty_esp_dsp-esp`
+behind `pie-s3`, and neither repo's generated `.cargo/config.toml` patched
+it — only the scalar half. `cargo check -p rusty_esp_image-core --features
+pie-s3` was resolving the chip half to **the published crate at origin/main**,
+which has none of this campaign in it. It compiled only because the twin
+calls sit behind `cfg(target_arch = "xtensa")` and a host build never
+references them.
+
+`tools/gen-sibling-patches.py` now lists both halves for image, video and
+audio. **Patch every crate of a sibling, not the one you happened to need
+first** — the same law the probe manifest already carried in a comment, in a
+place the generator could not see.
