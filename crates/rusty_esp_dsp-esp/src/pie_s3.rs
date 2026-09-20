@@ -2825,3 +2825,91 @@ pub fn yuyv_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     }
     Ok(pixels)
 }
+
+/// Index of the first 16-byte block at or after `from` that contains a zero
+/// byte, or `nblocks` if there is none.
+///
+/// PIE has `ee.vcmp.eq.s8` but **no movemask** — nothing turns a lane mask
+/// into a scalar bitfield — so "which lane matched" would cost a store and a
+/// scalar walk, which is what the scan already was. "Did ANY lane match" is
+/// cheap and stays in registers: the mask lanes are 0 or −1, so accumulating
+/// them against a broadcast one puts −(count) in ACCX, and `ee.srs.accx`
+/// hands that to a general register to branch on.
+#[allow(unsafe_code)]
+fn first_zero_block(bytes: &[u8], from: usize, nblocks: usize) -> usize {
+    if from >= nblocks {
+        return nblocks;
+    }
+    let mut p = unsafe { bytes.as_ptr().add(from * 16) };
+    let mut left = (nblocks - from) as u32;
+    let r: u32;
+    // SAFETY: `nblocks` is `bytes.len() / 16`, so the loop reads at most
+    // `nblocks * 16 <= bytes.len()` bytes starting at `from * 16`, sixteen
+    // at a time. `p` is 16-byte aligned because the caller checked the base
+    // and `from * 16` keeps it so. q0-q3 and ACCX only.
+    unsafe {
+        core::arch::asm!(
+            "ee.zero.q q1",
+            "ee.vcmp.eq.s8 q2, q1, q1",   // all ones
+            "ee.vsubs.s8 q2, q1, q2",     // 0 - (-1) = +1 per s8 lane
+            "31:",
+            "ee.vld.128.ip q0, {p}, 16",
+            "ee.vcmp.eq.s8 q3, q0, q1",   // -1 in every lane that is zero
+            "ee.zero.accx",
+            "ee.vmulas.s8.accx q3, q2",   // ACCX = -(zeros in this block)
+            "ee.srs.accx {r}, {sh0}, 0",
+            "bnez {r}, 32f",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 31b",
+            "32:",
+            p = inout(reg) p,
+            n = inout(reg) left,
+            r = out(reg) r,
+            sh0 = in(reg) 0u32,
+            options(nostack),
+        );
+    }
+    let _ = p;
+    if r == 0 {
+        nblocks
+    } else {
+        nblocks - left as usize
+    }
+}
+
+/// Index of the first `00 00 01` in `bytes` — the Annex-B start code scan,
+/// backlog B3.
+///
+/// A start code must BEGIN with a zero byte, so a sixteen-byte block with no
+/// zero in it cannot contain one and is skipped whole. Only a block that
+/// does hold a zero is walked byte by byte, and the walk reads two bytes
+/// past its end so a code straddling the boundary is still found.
+#[must_use]
+pub fn find_start_code3(bytes: &[u8]) -> Option<usize> {
+    let n = bytes.len();
+    if n < 3 {
+        return None;
+    }
+    let hit = |i: usize| i + 2 < n && bytes[i] == 0 && bytes[i + 1] == 0 && bytes[i + 2] == 1;
+    let nblocks = n / 16;
+    if !aligned16(bytes.as_ptr()) || nblocks == 0 {
+        return (0..n - 2).find(|&i| hit(i));
+    }
+    let mut b = 0usize;
+    while b < nblocks {
+        let k = first_zero_block(bytes, b, nblocks);
+        if k >= nblocks {
+            break;
+        }
+        let start = k * 16;
+        let end = (start + 16).min(n - 2);
+        for i in start..end {
+            if hit(i) {
+                return Some(i);
+            }
+        }
+        b = k + 1;
+    }
+    // Whatever is left past the last whole block.
+    ((nblocks * 16)..n - 2).find(|&i| hit(i))
+}

@@ -12,9 +12,10 @@
 //! the intrinsics stubbed to scalar, and on the board with them live (D2's
 //! board row).
 //!
-//! **Seven of the seam's thirteen kernels now run real `ee.*` twins on an
+//! **Nine of the seam's thirteen kernels now run real `ee.*` twins on an
 //! ESP32-S3** -- `yuyv_to_gray8`, `downscale2x_gray8`, `dot_i16`,
-//! `sum_sq_i16`, `peak_abs_i16`, `sad_8x8` and `sad_16x16`. The rest
+//! `sum_sq_i16`, `peak_abs_i16`, `sad_8x8`, `sad_16x16`, `yuyv_to_rgb565`
+//! and `downscale2x_rgb565`. The rest
 //! delegate to the oracle, either because no twin exists yet or because one
 //! was built and MEASURED WORSE (`satd_4x4_sum`; see the ledger's P4 and P6
 //! entries) or is impossible on this unit (`rgb565_to_rgb888` and
@@ -145,10 +146,16 @@ impl PixelKernels for PieS3 {
         Scalar.yuyv_to_rgb888(src, dst)
     }
 
-    /// Oracle: no twin yet. The last untwinned kernel with high arithmetic
-    /// intensity, and the one place with headroom left.
+    /// TWIN (backlog B2, -63.2%).
     fn yuyv_to_rgb565(&self, src: &[u8], dst: &mut [u8]) -> Result<usize> {
-        Scalar.yuyv_to_rgb565(src, dst)
+        #[cfg(target_arch = "xtensa")]
+        {
+            pie_s3::yuyv_to_rgb565(src, dst)
+        }
+        #[cfg(not(target_arch = "xtensa"))]
+        {
+            Scalar.yuyv_to_rgb565(src, dst)
+        }
     }
 
     /// TWIN.
@@ -200,7 +207,9 @@ impl PixelKernels for PieS3 {
         }
     }
 
-    /// Oracle: no twin yet.
+    /// TWIN (backlog B1, -65.5%). As for `downscale2x_gray8`, the twin
+    /// reports only success or a length failure, so the geometry the seam
+    /// owes its caller is built here.
     fn downscale2x_rgb565(
         &self,
         src: &[u8],
@@ -208,7 +217,21 @@ impl PixelKernels for PieS3 {
         height: u32,
         dst: &mut [u8],
     ) -> Result<Geometry> {
-        Scalar.downscale2x_rgb565(src, width, height, dst)
+        #[cfg(target_arch = "xtensa")]
+        {
+            match pie_s3::downscale2x_rgb565(src, width, height, dst) {
+                Ok(()) => Geometry::new(
+                    width / 2,
+                    height / 2,
+                    rusty_esp_core::frame::PixelFormat::Rgb565,
+                ),
+                Err(()) => Scalar.downscale2x_rgb565(src, width, height, dst),
+            }
+        }
+        #[cfg(not(target_arch = "xtensa"))]
+        {
+            Scalar.downscale2x_rgb565(src, width, height, dst)
+        }
     }
 }
 

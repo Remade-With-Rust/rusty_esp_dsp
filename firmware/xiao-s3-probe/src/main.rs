@@ -1837,6 +1837,7 @@ fn main() -> ! {
         b1_extract_probe();
         pie_b1(ys, gd, &mut reference);
         pie_b2(ys, gd, &mut reference);
+        pie_b3();
         pie_fused_family_probe();
 
         report_memory("after_pie");
@@ -3037,5 +3038,44 @@ fn pie_b2(ys: &[u8], gd: &mut [u8], reference: &mut [u8]) {
     measure("yuyv565_pie", "px", n, || {
         let _ = rusty_esp_dsp_esp::pie_s3::yuyv_to_rgb565(src, &mut gd[..px * 2]);
         Work { pixels: n, ..Work::ZERO }
+    });
+}
+
+/// B3: the Annex-B start-code scan. Gated against the byte-at-a-time loop it
+/// replaces, on a stream shaped like real H.264 -- mostly non-zero payload
+/// with start codes at intervals, because the whole point of the twin is
+/// that it skips blocks with no zero byte, and a corpus full of zeros would
+/// measure the fallback instead of the kernel.
+#[inline(never)]
+fn pie_b3() {
+    const N: usize = 4096;
+    let mut buf: alloc::vec::Vec<u128> = alloc::vec![0; N / 16];
+    // SAFETY: a `Vec<u128>` is 16-byte aligned and initialised.
+    let b = unsafe { core::slice::from_raw_parts_mut(buf.as_mut_ptr().cast::<u8>(), N) };
+    for (k, v) in b.iter_mut().enumerate() {
+        // never zero, so the only zeros are the ones placed below
+        *v = 1 + (k.wrapping_mul(167) % 255) as u8;
+    }
+    // a start code near the end, so the scan has to cross most of the buffer
+    let at = 3000usize;
+    b[at] = 0;
+    b[at + 1] = 0;
+    b[at + 2] = 1;
+
+    let scalar = |s: &[u8]| -> Option<usize> {
+        (0..s.len() - 2).find(|&i| s[i] == 0 && s[i + 1] == 0 && s[i + 2] == 1)
+    };
+    let r = scalar(b);
+    let p = rusty_esp_dsp_esp::pie_s3::find_start_code3(b);
+    println!("PIEKERNEL find_start_code3 identical={} scalar={r:?} pie={p:?}", r == p);
+
+    let nu = N as u64;
+    measure("nalscan_scalar", "byte", nu, || {
+        core::hint::black_box(scalar(b));
+        Work { bytes: nu, ..Work::ZERO }
+    });
+    measure("nalscan_pie", "byte", nu, || {
+        core::hint::black_box(rusty_esp_dsp_esp::pie_s3::find_start_code3(b));
+        Work { bytes: nu, ..Work::ZERO }
     });
 }
