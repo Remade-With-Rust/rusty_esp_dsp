@@ -29,6 +29,7 @@ checksum = "05c8b63e8d9609db387f0324918f81d68fe27748f084ef092fb35954d0539a85"
 [[package]]
 name = "rusty_esp_core"
 version = "0.1.0"
+source = "git+https://github.com/Remade-With-Rust/rusty_esp_core#c9f235f831bd14cc45d88d95d7a428198125d978"
 
 [[package]]
 name = "rusty_esp_dsp"
@@ -49,9 +50,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264-common"
-version = "0.14.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ac00c7ea77d77ebdb9e6c546954d058e5c55d3fca07adc7994136628c217919"
+checksum = "aaf982ae23ecf8f13015ec1c5576fe2935f4e4296b097ebc4233b5872623af2a"
 dependencies = [
  "bytemuck",
  "once_cell",
