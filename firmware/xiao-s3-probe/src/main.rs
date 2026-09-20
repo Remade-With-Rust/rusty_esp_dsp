@@ -17,6 +17,9 @@
 
 #![no_std]
 #![no_main]
+// `ee.*` reaches Rust only through inline asm, and Xtensa asm is still
+// experimental. The `esp` toolchain is nightly, so this is available.
+#![cfg_attr(target_arch = "xtensa", feature(asm_experimental_arch))]
 
 extern crate alloc;
 
@@ -26,6 +29,138 @@ use esp_hal::time::Instant;
 use esp_println::println;
 use rusty_esp_dsp::pixel;
 use rusty_esp_dsp::probe::Work;
+
+// ---- PIE semantics prober -----------------------------------------------
+//
+// The ESP32-S3's 128-bit PIE unit is documented in the TRM, and the TRM is
+// not on this machine. It does not need to be: the chip is, and an
+// instruction run on known bytes reports its own semantics more exactly than
+// prose does. Every lane layout below is READ OFF THE SILICON.
+//
+// The assembler accepts 30 of the 32 `ee.*` forms tried (no `ee.vabs.*`, so
+// absolute value has to be built from max/min or compare-and-select). What
+// this arm establishes is (a) that Rust's `asm!` reaches them at all, and
+// (b) what each one does to each lane.
+#[cfg(target_arch = "xtensa")]
+mod pie {
+    use esp_println::println;
+
+    /// A 16-byte buffer at the alignment `ee.vld.128.ip` requires.
+    #[repr(align(16))]
+    #[derive(Clone, Copy)]
+    pub struct Q(pub [u8; 16]);
+
+    /// Load `a` into q0 and `b` into q1, run `$insn`, then report ALL THREE
+    /// of q0, q1 and q2 -- several PIE instructions write their operands in
+    /// place, and which ones do is exactly what is being measured.
+    macro_rules! probe {
+        ($name:literal, $insn:literal, $a:expr, $b:expr) => {{
+            let a = Q($a);
+            let b = Q($b);
+            let mut o0 = Q([0u8; 16]);
+            let mut o1 = Q([0u8; 16]);
+            let mut o2 = Q([0u8; 16]);
+            // SAFETY: three 16-byte, 16-byte-aligned buffers; the block reads
+            // two and writes three, touches no memory beyond them, and uses
+            // only q0-q2 which nothing else in this firmware holds live.
+            unsafe {
+                core::arch::asm!(
+                    "ee.vld.128.ip q0, {pa}, 0",
+                    "ee.vld.128.ip q1, {pb}, 0",
+                    "ee.zero.q q2",
+                    $insn,
+                    "ee.vst.128.ip q0, {p0}, 0",
+                    "ee.vst.128.ip q1, {p1}, 0",
+                    "ee.vst.128.ip q2, {p2}, 0",
+                    pa = inout(reg) a.0.as_ptr() => _,
+                    pb = inout(reg) b.0.as_ptr() => _,
+                    p0 = inout(reg) o0.0.as_mut_ptr() => _,
+                    p1 = inout(reg) o1.0.as_mut_ptr() => _,
+                    p2 = inout(reg) o2.0.as_mut_ptr() => _,
+                    options(nostack),
+                );
+            }
+            println!(
+                "PIE {:<18} a={:02x?}",
+                $name, a.0
+            );
+            println!("PIE {:<18} b={:02x?}", "", b.0);
+            println!("PIE {:<18} q0={:02x?}", "", o0.0);
+            println!("PIE {:<18} q1={:02x?}", "", o1.0);
+            println!("PIE {:<18} q2={:02x?}", "", o2.0);
+        }};
+    }
+
+    /// 0x00..0x0f, so every lane is identifiable by its own value.
+    const RAMP: [u8; 16] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f,
+    ];
+    /// 0x10..0x1f, distinguishable from RAMP at a glance.
+    const RAMP2: [u8; 16] = [
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+        0x1f,
+    ];
+    /// Values that saturate both ways in s8 and are recognisable in s16.
+    const SAT: [u8; 16] = [
+        0x7f, 0x7f, 0x80, 0x80, 0x01, 0xff, 0x7f, 0x01, 0x80, 0xff, 0x00, 0x00, 0x40, 0x40, 0xc0,
+        0xc0,
+    ];
+
+    pub fn run() {
+        println!("PIE == semantics, read off the silicon ==");
+        // 1. Does the mechanism work at all? q0 must come back as `a`.
+        probe!("ld/st roundtrip", "", RAMP, RAMP2);
+        // 2. The deinterleave a YUYV -> gray8 kernel needs.
+        probe!("vunzip.8", "ee.vunzip.8 q0, q1", RAMP, RAMP2);
+        probe!("vzip.8", "ee.vzip.8 q0, q1", RAMP, RAMP2);
+        probe!("vunzip.16", "ee.vunzip.16 q0, q1", RAMP, RAMP2);
+        // 3. Saturating arithmetic: which width, and does it saturate?
+        probe!("vadds.s8", "ee.vadds.s8 q2, q0, q1", SAT, SAT);
+        probe!("vsubs.s8", "ee.vsubs.s8 q2, q0, q1", RAMP2, RAMP);
+        probe!("vadds.s16", "ee.vadds.s16 q2, q0, q1", SAT, SAT);
+        // 4. Lane-wise max/min -- what `peak_abs_i16` would be built from.
+        probe!("vmax.s8", "ee.vmax.s8 q2, q0, q1", SAT, RAMP);
+        probe!("vmax.s16", "ee.vmax.s16 q2, q0, q1", SAT, RAMP);
+        probe!("vmin.s8", "ee.vmin.s8 q2, q0, q1", SAT, RAMP);
+        // 5. Bitwise, for masking and for building abs without ee.vabs.
+        probe!("andq", "ee.andq q2, q0, q1", RAMP, SAT);
+        probe!("xorq", "ee.xorq q2, q0, q1", RAMP, SAT);
+        // The 40-bit-per-lane accumulator: what a dot product, a sum of
+        // squares and a SAD would all be built on. `ee.zero.qacc` clears it,
+        // `ee.vmulas.*.qacc` multiply-accumulates into it, and the two
+        // `ee.st.qacc_*` forms read it back. How many lanes it holds and how
+        // wide each is are exactly what this reports.
+        {
+            let a = Q(RAMP);
+            let b = Q(RAMP2);
+            let mut lo = Q([0u8; 16]);
+            let mut hi = Q([0u8; 16]);
+            // SAFETY: two 16-byte aligned inputs read, two written; only
+            // q0/q1 and the accumulator are touched.
+            unsafe {
+                core::arch::asm!(
+                    "ee.vld.128.ip q0, {pa}, 0",
+                    "ee.vld.128.ip q1, {pb}, 0",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q0, q1",
+                    "ee.st.qacc_l.l.128.ip {plo}, 0",
+                    "ee.st.qacc_h.h.32.ip {phi}, 0",
+                    pa = inout(reg) a.0.as_ptr() => _,
+                    pb = inout(reg) b.0.as_ptr() => _,
+                    plo = inout(reg) lo.0.as_mut_ptr() => _,
+                    phi = inout(reg) hi.0.as_mut_ptr() => _,
+                    options(nostack),
+                );
+            }
+            println!("PIE qacc.s16 a={:02x?}", a.0);
+            println!("PIE {:<18} b={:02x?}", "", b.0);
+            println!("PIE {:<18} qacc_l={:02x?}", "", lo.0);
+            println!("PIE {:<18} qacc_h={:02x?}", "", hi.0);
+        }
+        println!("PIE == end ==");
+    }
+}
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -176,6 +311,8 @@ fn main() -> ! {
     println!("PROBE allocator={ALLOCATOR} heap_bytes={HEAP_BYTES}");
     println!("PROBE frame={W}x{H} px={PX} budget_us={BUDGET_US}");
     report_memory("boot");
+    #[cfg(target_arch = "xtensa")]
+    pie::run();
 
     let mut yuyv = vec![0u8; PX * 2];
     let mut rgb888 = vec![0u8; PX * 3];
@@ -228,6 +365,87 @@ fn main() -> ! {
         let _ = pixel::downscale2x_rgb565(&rgb565, W, H, &mut small);
         Work::pixels(out_px)
     });
+
+    // ---- PIE twin vs scalar, same binary ---------------------------------
+    // `ee.vld/vst.128` need 16-byte alignment and a `Vec<u8>` does not
+    // promise it, so these buffers come from a `Vec<u128>`. Without that the
+    // twin would quietly take its scalar fallback and the A/B would read
+    // FLAT -- the "prove the fast path ran" trap, in its most inviting form.
+    //
+    // 2048 pixels, not a whole frame: the frame buffers above already hold
+    // 172 800 of the 196 608-byte heap, and a per-pixel figure does not care
+    // how many pixels it averaged over. The first attempt asked for a full
+    // frame's worth and the allocator aborted the firmware.
+    {
+        const NPX: usize = 2048;
+        let npx = NPX as u64;
+        let mut ysrc: alloc::vec::Vec<u128> = alloc::vec![0; NPX * 2 / 16];
+        let mut gdst: alloc::vec::Vec<u128> = alloc::vec![0; NPX / 16];
+        let mut reference = vec![0u8; NPX];
+        // SAFETY: a `Vec<u128>` is 16-byte aligned and its bytes are
+        // initialised; viewing them as `u8` is a reinterpretation of POD.
+        let (ys, gd) = unsafe {
+            (
+                core::slice::from_raw_parts_mut(ysrc.as_mut_ptr().cast::<u8>(), NPX * 2),
+                core::slice::from_raw_parts_mut(gdst.as_mut_ptr().cast::<u8>(), NPX),
+            )
+        };
+        ys.copy_from_slice(&yuyv[..NPX * 2]);
+
+        // Byte-identity BEFORE either number is read, and the alignment the
+        // fast arm needs printed beside it.
+        let _ = pixel::yuyv_to_gray8(ys, &mut reference);
+        let _ = rusty_esp_dsp_esp::pie_s3::yuyv_to_gray8(ys, gd);
+        println!(
+            "PIEKERNEL yuyv_to_gray8 identical={} src_align={} dst_align={}",
+            reference[..] == gd[..],
+            ys.as_ptr() as usize % 16,
+            gd.as_ptr() as usize % 16
+        );
+
+        measure("yuyv_gray8_scalar", "px", npx, || {
+            let _ = pixel::yuyv_to_gray8(ys, gd);
+            Work { pixels: npx, ..Work::ZERO }
+        });
+        measure("yuyv_gray8_pie", "px", npx, || {
+            let _ = rusty_esp_dsp_esp::pie_s3::yuyv_to_gray8(ys, gd);
+            Work { pixels: npx, ..Work::ZERO }
+        });
+        // --- peak_abs_i16: PIE vs scalar, same buffers ---
+        let mut isrc: alloc::vec::Vec<u128> = alloc::vec![0; NPX / 8];
+        // SAFETY: a `Vec<u128>` is 16-byte aligned and initialised; viewing
+        // its bytes as `i16` is a reinterpretation of POD.
+        let iv = unsafe {
+            core::slice::from_raw_parts_mut(isrc.as_mut_ptr().cast::<i16>(), NPX)
+        };
+        for (k, v) in iv.iter_mut().enumerate() {
+            // reaches i16::MIN, which is the one input where a saturating
+            // negate would give the wrong magnitude
+            *v = match k % 5 {
+                0 => i16::MIN,
+                1 => i16::MAX,
+                2 => 0,
+                _ => (((k as i32) * 7919) % 65536 - 32768) as i16,
+            };
+        }
+        let sref = rusty_esp_dsp::sample::peak_abs_i16(iv);
+        let spie = rusty_esp_dsp_esp::pie_s3::peak_abs_i16(iv);
+        println!(
+            "PIEKERNEL peak_abs_i16 identical={} scalar={sref} pie={spie} align={}",
+            sref == spie,
+            iv.as_ptr() as usize % 16
+        );
+        measure("peak_abs_scalar", "sample", npx, || {
+            core::hint::black_box(rusty_esp_dsp::sample::peak_abs_i16(iv));
+            Work { samples: npx, ..Work::ZERO }
+        });
+        measure("peak_abs_pie", "sample", npx, || {
+            core::hint::black_box(rusty_esp_dsp_esp::pie_s3::peak_abs_i16(iv));
+            Work { samples: npx, ..Work::ZERO }
+        });
+
+        report_memory("after_pie");
+    }
 
     // one whole frame of 16x16 blocks against a shifted copy of itself
     let blocks_x = (W / 16) as usize;

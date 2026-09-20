@@ -1476,6 +1476,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusty_esp_dsp-esp"
+version = "0.1.0"
+dependencies = [
+ "rusty_esp_core",
+ "rusty_esp_dsp",
+]
+
+[[package]]
 name = "rusty_esp_image-core"
 version = "0.1.0"
 dependencies = [
@@ -1972,6 +1980,7 @@ dependencies = [
  "rusty_esp_alloc",
  "rusty_esp_audio-core",
  "rusty_esp_dsp",
+ "rusty_esp_dsp-esp",
  "rusty_esp_image-core",
  "rusty_esp_signal-core",
 ]

@@ -48,6 +48,14 @@ use rusty_esp_core::error::{Error, Result};
 /// Crate version, for capability manifests and logs.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// [`expect_len`] for the twin crate, which must reject a short buffer with
+/// the same error the oracle does or a "byte-identical" claim is only true
+/// for the inputs that succeed.
+#[inline]
+pub fn expect_len_pub<T>(buf: &[T], needed: usize) -> Result<()> {
+    expect_len(buf, needed)
+}
+
 /// `Ok` when `buf` holds at least `needed` elements; the family's one way of
 /// saying "your buffer is too small, and this is how big it has to be".
 #[inline]

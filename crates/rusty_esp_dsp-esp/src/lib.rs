@@ -18,6 +18,19 @@
 //! and `riscv32imafc-unknown-none-elf` so the first twin lands in a crate
 //! that already builds for its chip.
 
+// `ee.*` reaches Rust only through inline asm, and Xtensa asm is still
+// experimental; the `esp` toolchain is nightly, so this is available. Gated
+// on the target so the host build of this crate (where the twins are the
+// scalar oracle) needs no nightly at all.
+#![cfg_attr(
+    all(feature = "pie-s3", target_arch = "xtensa"),
+    feature(asm_experimental_arch)
+)]
+
+/// The ESP32-S3 twins.
+#[cfg(all(feature = "pie-s3", target_arch = "xtensa"))]
+pub mod pie_s3;
+
 #[cfg(any(feature = "pie-s3", feature = "pie-p4"))]
 use rusty_esp_core::error::Result;
 #[cfg(any(feature = "pie-s3", feature = "pie-p4"))]

@@ -32,6 +32,9 @@ esp-backtrace = { version = "=0.20.0", features = ["esp32s3", "panic-handler", "
 # The kernels and the measurement discipline, no_std: the same code the host
 # share table measured, so the two are comparable per unit.
 rusty_esp_dsp = { path = "../../crates/rusty_esp_dsp", default-features = false }
+# The PIE twins, so a SIMD kernel can be measured beside the scalar one it
+# replaces in ONE binary.
+rusty_esp_dsp-esp = { path = "../../crates/rusty_esp_dsp-esp", default-features = false, features = ["pie-s3"] }
 # The audio element kernels (gain, channels, DC block, biquad, resampler).
 # Audited for ALLOCATION earlier and found clean; never for instruction count,
 # which is a different question. Measured here so they get a null arm too.
