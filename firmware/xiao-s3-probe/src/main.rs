@@ -132,8 +132,10 @@ mod pie {
         // `ee.st.qacc_*` forms read it back. How many lanes it holds and how
         // wide each is are exactly what this reports.
         {
-            let a = Q(RAMP);
-            let b = Q(RAMP2);
+            // a = i16 lanes 1..=8, b = all ones. Each accumulator then
+            // holds the lane it was fed, which names the mapping outright.
+            let a = Q([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0]);
+            let b = Q([1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]);
             let mut lo = Q([0u8; 16]);
             let mut hi = Q([0u8; 16]);
             // SAFETY: two 16-byte aligned inputs read, two written; only
@@ -442,6 +444,47 @@ fn main() -> ! {
         measure("peak_abs_pie", "sample", npx, || {
             core::hint::black_box(rusty_esp_dsp_esp::pie_s3::peak_abs_i16(iv));
             Work { samples: npx, ..Work::ZERO }
+        });
+
+        // --- sad_16x16: PIE vs scalar. Stride 16 makes the block
+        // contiguous, and every row start is then 16-byte aligned, which is
+        // what ee.vld.128 needs.
+        let mut sadbuf: alloc::vec::Vec<u128> = alloc::vec![0; 32];
+        // SAFETY: a `Vec<u128>` is 16-byte aligned and initialised; the two
+        // 256-byte halves are a 16x16 block each at stride 16.
+        let sb = unsafe {
+            core::slice::from_raw_parts_mut(sadbuf.as_mut_ptr().cast::<u8>(), 512)
+        };
+        for (k, v) in sb.iter_mut().enumerate() {
+            *v = (k.wrapping_mul(97) ^ (k >> 3)) as u8;
+        }
+        let (sa_blk, sb_blk) = sb.split_at(256);
+        let rref = rusty_esp_dsp::block::sad_16x16(sa_blk, 16, sb_blk, 16).unwrap_or(0);
+        let rpie = rusty_esp_dsp_esp::pie_s3::sad_16x16(sa_blk, 16, sb_blk, 16).unwrap_or(0);
+        println!(
+            "PIEKERNEL sad_16x16 identical={} scalar={rref} pie={rpie} align={}",
+            rref == rpie,
+            sa_blk.as_ptr() as usize % 16
+        );
+        measure("sad16_scalar", "block", 1, || {
+            core::hint::black_box(rusty_esp_dsp::block::sad_16x16(sa_blk, 16, sb_blk, 16).ok());
+            Work { blocks: 1, ..Work::ZERO }
+        });
+        measure("sad16_pie", "block", 1, || {
+            core::hint::black_box(rusty_esp_dsp_esp::pie_s3::sad_16x16(sa_blk, 16, sb_blk, 16).ok());
+            Work { blocks: 1, ..Work::ZERO }
+        });
+
+        let r8ref = rusty_esp_dsp::block::sad_8x8(sa_blk, 16, sb_blk, 16).unwrap_or(0);
+        let r8pie = rusty_esp_dsp_esp::pie_s3::sad_8x8(sa_blk, 16, sb_blk, 16).unwrap_or(0);
+        println!("PIEKERNEL sad_8x8 identical={} scalar={r8ref} pie={r8pie}", r8ref == r8pie);
+        measure("sad8_scalar", "block", 1, || {
+            core::hint::black_box(rusty_esp_dsp::block::sad_8x8(sa_blk, 16, sb_blk, 16).ok());
+            Work { blocks: 1, ..Work::ZERO }
+        });
+        measure("sad8_pie", "block", 1, || {
+            core::hint::black_box(rusty_esp_dsp_esp::pie_s3::sad_8x8(sa_blk, 16, sb_blk, 16).ok());
+            Work { blocks: 1, ..Work::ZERO }
         });
 
         report_memory("after_pie");

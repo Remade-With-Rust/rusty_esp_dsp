@@ -177,3 +177,167 @@ pub fn peak_abs_i16(a: &[i16]) -> u16 {
     }
     if saw_min { 32768 } else { best }
 }
+
+/// `sad_16x16` on the PIE unit.
+///
+/// The S3 has **no SAD instruction and no unsigned compare or subtract** — the
+/// assembler rejects `ee.vsad.u8`, `ee.vmax.u8` and `ee.vsubs.u8` alike — so
+/// the absolute difference of two bytes has to be built in signed 16-bit:
+///
+/// 1. `ee.vzip.8 qa, qzero` ZERO-EXTENDS sixteen bytes into two vectors of
+///    eight `u16` lanes (the probe showed `vzip` interleaves, so interleaving
+///    with zero is exactly a widen).
+/// 2. `ee.vsubs.s16` is then exact: both operands are `0..=255`, so the
+///    difference is `-255..=255` and nothing saturates.
+/// 3. `ee.vmax.s16(d, 0 - d)` is the magnitude, and negating `-255..=255`
+///    does not saturate either. This is what stands in for the missing
+///    `ee.vabs.s16`.
+///
+/// The accumulators stay in `s16` because they can: sixteen rows of at most
+/// 255 is 4 080 per lane, well inside the type. The sixteen lanes are summed
+/// in scalar once per call, where the total can reach 65 280.
+///
+/// Every row must start 16-byte aligned for `ee.vld.128`, which needs the
+/// base AND the stride aligned; anything else is the oracle's.
+#[allow(unsafe_code)]
+pub fn sad_16x16(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
+    // The oracle's own bounds, in its order.
+    expect_len(a, 15 * sa + 16)?;
+    expect_len(b, 15 * sb + 16)?;
+    if sa % 16 != 0
+        || sb % 16 != 0
+        || !aligned16(a.as_ptr())
+        || !aligned16(b.as_ptr())
+    {
+        return rusty_esp_dsp::block::sad_16x16(a, sa, b, sb);
+    }
+
+    #[repr(align(16))]
+    struct Q([i16; 8]);
+    let mut acc_lo = Q([0; 8]);
+    let mut acc_hi = Q([0; 8]);
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+    // SAFETY: `expect_len` above guarantees 15*stride+16 readable bytes from
+    // each base, and the loop reads exactly 16 bytes at `base + r*stride` for
+    // r in 0..16. Both bases and both strides are 16-byte aligned, which is
+    // what `ee.vld.128` requires. q0-q6 are the only vector registers used.
+    unsafe {
+        core::arch::asm!(
+            "ee.zero.q q4",              // accumulator, low eight lanes
+            "ee.zero.q q5",              // accumulator, high eight lanes
+            "ee.zero.q q6",              // a constant zero, for the negations
+            "2:",
+            "ee.vld.128.ip q0, {pa}, 0",
+            "ee.vld.128.ip q1, {pb}, 0",
+            "add {pa}, {pa}, {sa}",
+            "add {pb}, {pb}, {sb}",
+            // widen both rows: 16 bytes -> 2 x 8 u16 lanes
+            "ee.zero.q q2",
+            "ee.vzip.8 q0, q2",
+            "ee.zero.q q3",
+            "ee.vzip.8 q1, q3",
+            // exact differences, then magnitudes via max(d, -d)
+            "ee.vsubs.s16 q0, q0, q1",
+            "ee.vsubs.s16 q2, q2, q3",
+            "ee.vsubs.s16 q1, q6, q0",
+            "ee.vmax.s16 q0, q0, q1",
+            "ee.vsubs.s16 q3, q6, q2",
+            "ee.vmax.s16 q2, q2, q3",
+            "ee.vadds.s16 q4, q4, q0",
+            "ee.vadds.s16 q5, q5, q2",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 2b",
+            "ee.vst.128.ip q4, {lo}, 0",
+            "ee.vst.128.ip q5, {hi}, 0",
+            pa = inout(reg) pa => _,
+            pb = inout(reg) pb => _,
+            sa = in(reg) sa,
+            sb = in(reg) sb,
+            n = inout(reg) 16usize => _,
+            lo = in(reg) acc_lo.0.as_mut_ptr(),
+            hi = in(reg) acc_hi.0.as_mut_ptr(),
+            options(nostack),
+        );
+    }
+
+    // 16 lanes of at most 4 080; the total can reach 65 280, so sum in u32.
+    let mut total: u32 = 0;
+    for k in 0..8 {
+        total += u32::from(acc_lo.0[k] as u16);
+        total += u32::from(acc_hi.0[k] as u16);
+    }
+    Ok(total)
+}
+
+/// `sad_8x8` on the PIE unit, by the same construction as [`sad_16x16`].
+///
+/// A row here is eight bytes, half a vector. That costs nothing: `ee.vzip.8`
+/// puts the FIRST eight bytes of its operand into the first result register
+/// as `u16` lanes, so a 16-byte load whose upper half is ignored lands the
+/// eight wanted bytes exactly where they are needed. The upper half is
+/// discarded rather than computed.
+///
+/// The load reads sixteen bytes where the kernel's contract promises eight,
+/// so the SIMD arm is taken only when the slice genuinely has that slack;
+/// otherwise the oracle runs. Eight rows of at most 255 is 2 040 a lane.
+#[allow(unsafe_code)]
+pub fn sad_8x8(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
+    expect_len(a, 7 * sa + 8)?;
+    expect_len(b, 7 * sb + 8)?;
+    // The vector load takes 16 bytes from the last row's start, which the
+    // contract does not promise; require the slack explicitly.
+    if sa % 16 != 0
+        || sb % 16 != 0
+        || !aligned16(a.as_ptr())
+        || !aligned16(b.as_ptr())
+        || a.len() < 7 * sa + 16
+        || b.len() < 7 * sb + 16
+    {
+        return rusty_esp_dsp::block::sad_8x8(a, sa, b, sb);
+    }
+
+    #[repr(align(16))]
+    struct Q([i16; 8]);
+    let mut acc = Q([0; 8]);
+    let pa = a.as_ptr();
+    let pb = b.as_ptr();
+    // SAFETY: the guard above proves 7*stride+16 readable bytes from each
+    // base, and the loop reads exactly 16 at `base + r*stride` for r in 0..8.
+    // Both bases and strides are 16-byte aligned. q0-q4, q6 only.
+    unsafe {
+        core::arch::asm!(
+            "ee.zero.q q4",
+            "ee.zero.q q6",
+            "2:",
+            "ee.vld.128.ip q0, {pa}, 0",
+            "ee.vld.128.ip q1, {pb}, 0",
+            "add {pa}, {pa}, {sa}",
+            "add {pb}, {pb}, {sb}",
+            // only the low eight bytes matter; q2/q3 take the ignored halves
+            "ee.zero.q q2",
+            "ee.vzip.8 q0, q2",
+            "ee.zero.q q3",
+            "ee.vzip.8 q1, q3",
+            "ee.vsubs.s16 q0, q0, q1",
+            "ee.vsubs.s16 q1, q6, q0",
+            "ee.vmax.s16 q0, q0, q1",
+            "ee.vadds.s16 q4, q4, q0",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 2b",
+            "ee.vst.128.ip q4, {out}, 0",
+            pa = inout(reg) pa => _,
+            pb = inout(reg) pb => _,
+            sa = in(reg) sa,
+            sb = in(reg) sb,
+            n = inout(reg) 8usize => _,
+            out = in(reg) acc.0.as_mut_ptr(),
+            options(nostack),
+        );
+    }
+    let mut total: u32 = 0;
+    for k in 0..8 {
+        total += u32::from(acc.0[k] as u16);
+    }
+    Ok(total)
+}
