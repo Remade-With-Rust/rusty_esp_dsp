@@ -2285,3 +2285,141 @@ fn pie_rotate90(gd: &[u8], ys: &mut [u8], reference: &mut [u8]) {
         Work { pixels: rnu, ..Work::ZERO }
     });
 }
+
+/// The FUSED load-op forms, read off the silicon.
+///
+/// The assembler accepts a family nothing here has used: instructions that
+/// do a vector load AND an arithmetic op in one slot.
+///
+///     ee.vmulas.s16.accx.ld.ip  qu, as, imm, qx, qy
+///     ee.vadds.s16.ld.incp      qu, as, qa, qx, qy
+///     ee.vsubs.s16.ld.incp      qu, as, qa, qx, qy
+///
+/// If they mean "load `qu` from `as` (post-incrementing it) while the
+/// arithmetic runs on OTHER registers", they are a software-pipelined loop
+/// body -- load the next vector while multiplying the current one -- and
+/// they halve the instruction count of exactly the reduction loops that
+/// just measured LOAD-BOUND. Which register receives the load, whether the
+/// increment is an immediate or a fixed 16, and whether the arithmetic
+/// operands may alias the loaded register are all guesses until measured.
+#[inline(never)]
+fn pie_fused_probe() {
+    #[repr(align(16))]
+    struct Q([i16; 8]);
+    // A buffer whose two halves are distinguishable at a glance.
+    #[repr(align(16))]
+    struct Buf([i16; 16]);
+    let buf = Buf([
+        100, 101, 102, 103, 104, 105, 106, 107, 200, 201, 202, 203, 204, 205, 206, 207,
+    ]);
+    let xa = Q([1, 2, 3, 4, 5, 6, 7, 8]);
+    let yb = Q([10, 10, 10, 10, 10, 10, 10, 10]);
+
+    // 1. MAC + load. Expect ACCX = sum(xa*yb) = 10*(1+..+8) = 360, and the
+    //    loaded register to hold the FIRST half of `buf`.
+    {
+        let mut got = Q([0; 8]);
+        let (lo, hi): (u32, u32);
+        let mut ptr = buf.0.as_ptr().cast::<u8>();
+        // SAFETY: `buf` is 32 aligned bytes and only its first 16 are read;
+        // `xa`/`yb` are 16-byte aligned reads and `got` an aligned write.
+        unsafe {
+            core::arch::asm!(
+                "ee.zero.accx",
+                "ee.vld.128.ip q1, {px}, 0",
+                "ee.vld.128.ip q2, {py}, 0",
+                "ee.vmulas.s16.accx.ld.ip q0, {p}, 16, q1, q2",
+                "ee.vst.128.ip q0, {o}, 0",
+                "rur.accx_0 {l}",
+                "rur.accx_1 {h}",
+                px = inout(reg) xa.0.as_ptr() => _,
+                py = inout(reg) yb.0.as_ptr() => _,
+                p = inout(reg) ptr,
+                o = inout(reg) got.0.as_mut_ptr() => _,
+                l = out(reg) lo,
+                h = out(reg) hi,
+                options(nostack),
+            );
+        }
+        let acc = ((u64::from(hi & 0xff) << 32) | u64::from(lo)) as i64;
+        println!(
+            "P5 vmulas.accx.ld.ip  accx={acc} (want 360)  loaded={:?} (want 100..107)",
+            got.0
+        );
+        println!(
+            "P5                    ptr_advanced_by={}",
+            ptr as usize - buf.0.as_ptr() as usize
+        );
+    }
+
+    // 2. Saturating add + load. Expect qa = xa + yb = 11..18, and the loaded
+    //    register to hold the first half of `buf`.
+    {
+        let mut sum = Q([0; 8]);
+        let mut got = Q([0; 8]);
+        let mut ptr = buf.0.as_ptr().cast::<u8>();
+        // SAFETY: as above; two aligned 16-byte writes.
+        unsafe {
+            core::arch::asm!(
+                "ee.vld.128.ip q1, {px}, 0",
+                "ee.vld.128.ip q2, {py}, 0",
+                "ee.vadds.s16.ld.incp q0, {p}, q3, q1, q2",
+                "ee.vst.128.ip q3, {os}, 0",
+                "ee.vst.128.ip q0, {og}, 0",
+                px = inout(reg) xa.0.as_ptr() => _,
+                py = inout(reg) yb.0.as_ptr() => _,
+                p = inout(reg) ptr,
+                os = inout(reg) sum.0.as_mut_ptr() => _,
+                og = inout(reg) got.0.as_mut_ptr() => _,
+                options(nostack),
+            );
+        }
+        println!(
+            "P5 vadds.s16.ld.incp  sum={:?} (want 11..18)  loaded={:?}",
+            sum.0, got.0
+        );
+        println!(
+            "P5                    ptr_advanced_by={}",
+            ptr as usize - buf.0.as_ptr() as usize
+        );
+    }
+
+    // 3. Is `ee.src.q` with SAR_BYTE = 8 a register-level 64-bit half swap?
+    //    If it is, the 4x4 transpose that made `satd_4x4` lose can stay in
+    //    registers instead of going through memory, and that refutation
+    //    expires. SAR_BYTE is settable only as a side effect of a load from
+    //    an address congruent to 8 mod 16.
+    {
+        #[repr(align(16))]
+        struct B([u8; 32]);
+        let b = B({
+            let mut a = [0u8; 32];
+            let mut i = 0;
+            while i < 32 {
+                a[i] = i as u8;
+                i += 1;
+            }
+            a
+        });
+        let mut o = Q([0; 8]);
+        let src = unsafe { b.0.as_ptr().add(8) };
+        // SAFETY: the dummy load reads the aligned block containing `b+8`,
+        // which is inside `b`; `o` is an aligned 16-byte write.
+        unsafe {
+            core::arch::asm!(
+                "ee.vld.128.ip q0, {base}, 0",      // q0 = bytes 0..=15
+                "ee.ld.128.usar.ip q1, {p8}, 0",    // sets SAR_BYTE = 8
+                "ee.src.q q2, q0, q0",              // funnel q0 with itself
+                "ee.vst.128.ip q2, {o}, 0",
+                base = inout(reg) b.0.as_ptr() => _,
+                p8 = inout(reg) src => _,
+                o = inout(reg) o.0.as_mut_ptr().cast::<u8>() => _,
+                options(nostack),
+            );
+        }
+        // SAFETY: `o` is POD; viewing its bytes shows the lane order.
+        let bytes: &[u8; 16] = unsafe { &*o.0.as_ptr().cast() };
+        println!("P5 src.q sar8 self     {bytes:02x?} (want 08..0f,00..07)");
+    }
+    println!("P5 == end ==");
+}

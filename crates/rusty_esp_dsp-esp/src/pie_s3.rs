@@ -91,7 +91,7 @@ pub fn yuyv_to_gray8(src: &[u8], dst: &mut [u8]) -> Result<usize> {
         //
         // Sixteen pixels short of the end, because producing the last
         // window reads the aligned block containing its last byte.
-        let ub = (pixels - 16) / 16 * 16;
+        let ub = (pixels - 16) / 32 * 32;
         simd_even_bytes_unaligned_src(&src[..ub * 2], &mut dst[..ub]);
         ub
     } else {
@@ -296,10 +296,12 @@ pub fn sad_16x16(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
             "ee.zero.q q5",              // accumulator, high eight lanes
             "ee.zero.q q6",              // a constant zero, for the negations
             "2:",
-            "ee.vld.128.ip q0, {pa}, 0",
-            "ee.vld.128.ip q1, {pb}, 0",
-            "add {pa}, {pa}, {sa}",
-            "add {pb}, {pb}, {sb}",
+            // `ee.vld.128.xp` loads AND advances by a register-valued
+            // stride, which is exactly what a row walk wants -- it replaces
+            // the load plus the `add` that followed it, two instructions a
+            // row per stream.
+            "ee.vld.128.xp q0, {pa}, {sa}",
+            "ee.vld.128.xp q1, {pb}, {sb}",
             // widen both rows: 16 bytes -> 2 x 8 u16 lanes
             "ee.zero.q q2",
             "ee.vzip.8 q0, q2",
@@ -380,10 +382,9 @@ pub fn sad_8x8(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
             "ee.zero.q q4",
             "ee.zero.q q6",
             "2:",
-            "ee.vld.128.ip q0, {pa}, 0",
-            "ee.vld.128.ip q1, {pb}, 0",
-            "add {pa}, {pa}, {sa}",
-            "add {pb}, {pb}, {sb}",
+            // As in `sad_16x16`: load and stride in one instruction.
+            "ee.vld.128.xp q0, {pa}, {sa}",
+            "ee.vld.128.xp q1, {pb}, {sb}",
             // only the low eight bytes matter; q2/q3 take the ignored halves
             "ee.zero.q q2",
             "ee.vzip.8 q0, q2",
@@ -429,12 +430,10 @@ pub fn sad_8x8(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
 #[allow(unsafe_code)]
 #[must_use]
 pub fn sum_sq_i16(a: &[i16]) -> i64 {
-    // SIXTEEN samples a trip, not eight. At eight the body was one load,
-    // one multiply-accumulate and two instructions of loop -- fifty per cent
-    // overhead -- and the UNALIGNED arm, which does three MORE instructions
-    // per window but unrolls to sixteen, measured FASTER (14,279 against
-    // 14,960 ps/sample). A slower-per-byte path beating a faster one is the
-    // instrument pointing at loop shape, not at the loads.
+    // NOT the fused form, and that is MEASURED. `ee.vmulas.s16.accx.ld.ip`
+    // does the load and the eight-lane multiply-accumulate in one slot and
+    // it is SLOWER here -- see the ledger's P6 refutation. Instruction count
+    // went down and cycles went up in all three kernels tried.
     let body = a.len() / 16 * 16;
     if body == 0 {
         return rusty_esp_dsp::sample::sum_sq_i16(a);
@@ -506,8 +505,10 @@ pub fn sum_sq_i16(a: &[i16]) -> i64 {
 #[must_use]
 pub fn dot_i16(a: &[i16], b: &[i16]) -> i64 {
     let n = a.len().min(b.len());
-    // SIXTEEN a trip; the body was one multiply-accumulate against two
-    // instructions of loop.
+    // NOT the fused form, and that is MEASURED. `ee.vmulas.s16.accx.ld.ip`
+    // does the load and the eight-lane multiply-accumulate in one slot and
+    // it is SLOWER here -- see the ledger's P6 refutation. Instruction count
+    // went down and cycles went up in all three kernels tried.
     let body = n / 16 * 16;
     if body == 0 {
         return rusty_esp_dsp::sample::dot_i16(a, b);
@@ -593,7 +594,8 @@ pub fn sum_sq_i16_le(samples: &[u8]) -> (i64, usize) {
 #[allow(unsafe_code)]
 pub fn mix_i16(a: &[i16], b: &[i16], out: &mut [i16]) {
     let n = a.len().min(b.len()).min(out.len());
-    // SIXTEEN a trip; the body was one add against two instructions of loop.
+    // NOT the fused `ee.vadds.s16.ld.incp`, which measured +64.6% here --
+    // the worst of the three fused forms tried. See the P6 refutation.
     let body = n / 16 * 16;
     let vectorable = body > 0
         && aligned16(a.as_ptr().cast::<u8>())
@@ -966,16 +968,21 @@ fn sum_sq_i16_unaligned(a: &[i16]) -> i64 {
     if n < UNALIGNED_TAIL + 16 {
         return rusty_esp_dsp::sample::sum_sq_i16(a);
     }
-    let body = (n - UNALIGNED_TAIL) / 16 * 16;
+    // Widened, and with DISJOINT registers for the two halves. Reusing the
+    // same window register would make the second `ee.src.q` wait for the
+    // first half's read of it -- a false dependency, which is the shape that
+    // made `gain_i16` slower when it was widened.
+    let body = (n - UNALIGNED_TAIL) / 32 * 32;
     let mut total: i64 = 0;
     let mut p = a.as_ptr().cast::<u8>();
-    let mut left = body / 16;
+    let mut left = body / 32;
 
     while left > 0 {
-        let batch = left.min(8);
+        // FOUR trips = sixteen MACs = 128 products, peaking at 2^37.
+        let batch = left.min(4);
         left -= batch;
         let (lo, hi): (u32, u32);
-        // SAFETY: the loop consumes 32 bytes a trip and reads at most one
+        // SAFETY: the loop consumes 64 bytes a trip and reads at most one
         // 16-byte block beyond them; `body` stops `UNALIGNED_TAIL` samples
         // short of the slice end precisely so that block is still inside it.
         // q0-q2 and ACCX only, and SAR is restored.
@@ -989,8 +996,14 @@ fn sum_sq_i16_unaligned(a: &[i16]) -> i64 {
                 "ee.src.q q2, q0, q1",
                 "ee.vmulas.s16.accx q2, q2",
                 "ee.ld.128.usar.ip q0, {p}, 16",
-                "ee.src.q q2, q1, q0",
-                "ee.vmulas.s16.accx q2, q2",
+                "ee.src.q q3, q1, q0",
+                "ee.vmulas.s16.accx q3, q3",
+                "ee.ld.128.usar.ip q1, {p}, 16",
+                "ee.src.q q5, q0, q1",
+                "ee.vmulas.s16.accx q5, q5",
+                "ee.ld.128.usar.ip q0, {p}, 16",
+                "ee.src.q q6, q1, q0",
+                "ee.vmulas.s16.accx q6, q6",
                 "addi {n}, {n}, -1",
                 "bnez {n}, 7b",
                 "rur.accx_0 {l}",
@@ -1007,7 +1020,7 @@ fn sum_sq_i16_unaligned(a: &[i16]) -> i64 {
         // Non-negative, so the 40-bit composition needs no sign extension.
         total += (((u64::from(hi) & 0xff) << 32) | u64::from(lo)) as i64;
         // Each trip consumed 32 bytes but left the pointer one block ahead.
-        p = unsafe { a.as_ptr().cast::<u8>().add((body / 16 - left) * 32) };
+        p = unsafe { a.as_ptr().cast::<u8>().add((body / 32 - left) * 64) };
     }
 
     for &x in &a[body..] {
@@ -1028,11 +1041,15 @@ fn peak_abs_i16_unaligned(a: &[i16]) -> u16 {
     if n < UNALIGNED_TAIL + 16 {
         return rusty_esp_dsp::sample::peak_abs_i16(a);
     }
-    let body = (n - UNALIGNED_TAIL) / 16 * 16;
+    // Widened, and with DISJOINT registers for the two halves. Reusing the
+    // same window register would make the second `ee.src.q` wait for the
+    // first half's read of it -- a false dependency, which is the shape that
+    // made `gain_i16` slower when it was widened.
+    let body = (n - UNALIGNED_TAIL) / 32 * 32;
     let mut maxes = [0i16; 8];
     let mut mins = [0i16; 8];
     let mut p = a.as_ptr().cast::<u8>();
-    let mut left = body / 16;
+    let mut left = body / 32;
     // SAFETY: as for `sum_sq_i16_unaligned` -- 32 bytes consumed a trip and
     // at most one block read beyond, which `UNALIGNED_TAIL` reserves. The
     // two output buffers are 16 bytes each. q0-q4 only; SAR is restored.
@@ -1048,9 +1065,17 @@ fn peak_abs_i16_unaligned(a: &[i16]) -> u16 {
             "ee.vmax.s16 q3, q3, q2",
             "ee.vmin.s16 q4, q4, q2",
             "ee.ld.128.usar.ip q0, {p}, 16",
-            "ee.src.q q2, q1, q0",
-            "ee.vmax.s16 q3, q3, q2",
-            "ee.vmin.s16 q4, q4, q2",
+            "ee.src.q q5, q1, q0",
+            "ee.vmax.s16 q3, q3, q5",
+            "ee.vmin.s16 q4, q4, q5",
+            "ee.ld.128.usar.ip q1, {p}, 16",
+            "ee.src.q q6, q0, q1",
+            "ee.vmax.s16 q3, q3, q6",
+            "ee.vmin.s16 q4, q4, q6",
+            "ee.ld.128.usar.ip q0, {p}, 16",
+            "ee.src.q q7, q1, q0",
+            "ee.vmax.s16 q3, q3, q7",
+            "ee.vmin.s16 q4, q4, q7",
             "addi {n}, {n}, -1",
             "bnez {n}, 8b",
             "ee.vst.128.ip q3, {mx}, 0",
@@ -1331,7 +1356,11 @@ fn simd_even_bytes_unaligned_src(src: &[u8], dst: &mut [u8]) {
 
     let mut s = src.as_ptr();
     let mut d = dst.as_mut_ptr();
-    let mut left = dst.len() / 16;
+    // Widened, and with DISJOINT registers for the two halves. Reusing the
+    // same window register would make the second `ee.src.q` wait for the
+    // first half's read of it -- a false dependency, which is the shape that
+    // made `gain_i16` slower when it was widened.
+    let mut left = dst.len() / 32;
     if left == 0 {
         return;
     }
@@ -1351,6 +1380,12 @@ fn simd_even_bytes_unaligned_src(src: &[u8], dst: &mut [u8]) {
             "ee.src.q q3, q1, q0",        // and 16..=31
             "ee.vunzip.8 q2, q3",         // q2 = the sixteen even bytes: luma
             "ee.vst.128.ip q2, {d}, 16",
+            "ee.ld.128.usar.ip q1, {s}, 16",
+            "ee.src.q q4, q0, q1",
+            "ee.ld.128.usar.ip q0, {s}, 16",
+            "ee.src.q q5, q1, q0",
+            "ee.vunzip.8 q4, q5",
+            "ee.vst.128.ip q4, {d}, 16",
             "addi {n}, {n}, -1",
             "bnez {n}, 12b",
             "wsr.sar {sar}",
@@ -1438,10 +1473,14 @@ fn mono_to_stereo_i16_unaligned_src(src: &[i16], dst: &mut [i16]) -> usize {
     if n < UNALIGNED_TAIL + 8 || !aligned16(dst.as_ptr().cast::<u8>()) {
         return 0;
     }
-    let body = (n - UNALIGNED_TAIL) / 8 * 8;
+    // Widened, and with DISJOINT registers for the two halves. Reusing the
+    // same window register would make the second `ee.src.q` wait for the
+    // first half's read of it -- a false dependency, which is the shape that
+    // made `gain_i16` slower when it was widened.
+    let body = (n - UNALIGNED_TAIL) / 16 * 16;
     let mut ps = src.as_ptr().cast::<u8>();
     let mut pd = dst.as_mut_ptr().cast::<u8>();
-    let mut left = body / 8;
+    let mut left = body / 16;
     // SAFETY: each trip consumes 16 source bytes and writes 32, reading at
     // most one block beyond -- reserved by `UNALIGNED_TAIL`. `dst` holds
     // `2 * n` samples and is 16-byte aligned. q0-q3 only; SAR is restored.
@@ -1456,6 +1495,13 @@ fn mono_to_stereo_i16_unaligned_src(src: &[i16], dst: &mut [i16]) -> usize {
             "ee.vzip.16 q2, q3",             // every lane twice
             "ee.vst.128.ip q2, {pd}, 16",
             "ee.vst.128.ip q3, {pd}, 16",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "ee.ld.128.usar.ip q1, {ps}, 0",
+            "ee.src.q q4, q0, q1",
+            "ee.src.q q5, q0, q1",
+            "ee.vzip.16 q4, q5",
+            "ee.vst.128.ip q4, {pd}, 16",
+            "ee.vst.128.ip q5, {pd}, 16",
             "ee.ld.128.usar.ip q0, {ps}, 16",
             "addi {n}, {n}, -1",
             "bnez {n}, 14b",
@@ -1976,11 +2022,15 @@ fn convert_i16_to_i32_unaligned_src(src: &[i16], dst: &mut [i32]) -> usize {
     if n < UNALIGNED_TAIL + 8 || !aligned16(dst.as_ptr().cast::<u8>()) {
         return 0;
     }
-    let body = (n - UNALIGNED_TAIL) / 8 * 8;
+    // Widened, and with DISJOINT registers for the two halves. Reusing the
+    // same window register would make the second `ee.src.q` wait for the
+    // first half's read of it -- a false dependency, which is the shape that
+    // made `gain_i16` slower when it was widened.
+    let body = (n - UNALIGNED_TAIL) / 16 * 16;
     let mut ps = src.as_ptr().cast::<u8>();
     let mut pd = dst.as_mut_ptr().cast::<u8>();
-    let mut left = body / 8;
-    // SAFETY: eight samples a trip -- 16 source bytes consumed, 32 written --
+    let mut left = body / 16;
+    // SAFETY: sixteen samples a trip -- 32 source bytes consumed, 64 written --
     // reading at most one 16-byte block beyond, reserved by `UNALIGNED_TAIL`.
     // `dst` is 16-byte aligned. q0-q3 only; SAR is restored.
     unsafe {
@@ -1994,6 +2044,13 @@ fn convert_i16_to_i32_unaligned_src(src: &[i16], dst: &mut [i32]) -> usize {
             "ee.vzip.16 q3, q2",
             "ee.vst.128.ip q3, {pd}, 16",
             "ee.vst.128.ip q2, {pd}, 16",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "ee.ld.128.usar.ip q1, {ps}, 0",
+            "ee.src.q q4, q0, q1",
+            "ee.zero.q q5",
+            "ee.vzip.16 q5, q4",
+            "ee.vst.128.ip q5, {pd}, 16",
+            "ee.vst.128.ip q4, {pd}, 16",
             "ee.ld.128.usar.ip q0, {ps}, 16",
             "addi {n}, {n}, -1",
             "bnez {n}, 22b",
@@ -2016,11 +2073,15 @@ fn convert_i32_to_i16_unaligned_src(src: &[i32], dst: &mut [i16]) -> usize {
     if n < UNALIGNED_TAIL + 8 || !aligned16(dst.as_ptr().cast::<u8>()) {
         return 0;
     }
-    let body = (n - UNALIGNED_TAIL) / 8 * 8;
+    // Widened, and with DISJOINT registers for the two halves. Reusing the
+    // same window register would make the second `ee.src.q` wait for the
+    // first half's read of it -- a false dependency, which is the shape that
+    // made `gain_i16` slower when it was widened.
+    let body = (n - UNALIGNED_TAIL) / 16 * 16;
     let mut ps = src.as_ptr().cast::<u8>();
     let mut pd = dst.as_mut_ptr().cast::<u8>();
-    let mut left = body / 8;
-    // SAFETY: eight samples a trip -- 32 source bytes consumed, 16 written --
+    let mut left = body / 16;
+    // SAFETY: sixteen samples a trip -- 64 source bytes consumed, 32 written --
     // reading at most one block beyond, reserved by `UNALIGNED_TAIL`. `dst`
     // is 16-byte aligned. q0-q3 only; SAR is restored.
     unsafe {
@@ -2034,6 +2095,12 @@ fn convert_i32_to_i16_unaligned_src(src: &[i32], dst: &mut [i16]) -> usize {
             "ee.src.q q3, q1, q0",
             "ee.vunzip.16 q2, q3",       // q3 = the eight high halfwords
             "ee.vst.128.ip q3, {pd}, 16",
+            "ee.ld.128.usar.ip q1, {ps}, 16",
+            "ee.src.q q4, q0, q1",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "ee.src.q q5, q1, q0",
+            "ee.vunzip.16 q4, q5",
+            "ee.vst.128.ip q5, {pd}, 16",
             "addi {n}, {n}, -1",
             "bnez {n}, 23b",
             "wsr.sar {sar}",
@@ -2154,6 +2221,21 @@ pub fn rotate90_gray8(src: &[u8], width: u32, height: u32, dst: &mut [u8]) -> Re
         return Ok(());
     }
 
+    // The tile loop stays in RUST, and that is a MEASURED choice.
+    //
+    // Moving it into the asm -- which is what made `yuyv_to_gray8` 25.6%
+    // faster -- made this kernel 9.3% SLOWER (10,199 against 9,332 ps/px),
+    // and the reason is the opposite of a saving. Rust recomputes both
+    // cursors from `x0` and `y0` for every tile, so a tile's first load
+    // depends on nothing the previous tile did. An in-asm loop has to walk
+    // them incrementally, so the next tile's first load waits on the
+    // previous tile's last store.
+    //
+    // The general form: removing a host loop wins when the address is
+    // already a running cursor (`yuyv_to_gray8`, whose pointer only ever
+    // increments), and loses when the host was computing an INDEPENDENT
+    // address each trip. Redundant-looking arithmetic can be breaking a
+    // dependency chain.
     let mut x0 = 0usize;
     while x0 < w {
         let mut y0 = 0usize;
@@ -2186,7 +2268,7 @@ pub fn rotate90_gray8(src: &[u8], width: u32, height: u32, dst: &mut [u8]) -> Re
                     "ee.vld.l.64.ip q6, {ps}, 0",
                     "add {ps}, {ps}, {back}",
                     "ee.vld.l.64.ip q7, {ps}, 0",
-                    // the transpose
+                    // the transpose: three stages of perfect shuffle
                     "ee.vzip.8 q0, q1",
                     "ee.vzip.8 q2, q3",
                     "ee.vzip.8 q4, q5",

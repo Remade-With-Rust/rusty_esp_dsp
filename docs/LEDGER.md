@@ -1372,3 +1372,102 @@ renamable by hand — two loads and two adds are two independent chains.
 `gain_i16` works through the one accumulator, so its two halves are one
 chain, and instruction count stops predicting time. Count instructions to
 find the candidates; measure to keep them.
+
+## P6 — eight smaller wins, three refutations, and the well running dry
+
+| kernel | before | after | |
+|---|---:|---:|---:|
+| `yuyv_to_gray8` unaligned | 12,276 | 10,784 | **−12.2%** |
+| `convert_i32_to_i16` unaligned | 33,291 | 29,524 | **−11.3%** |
+| `mono_to_stereo` unaligned | 31,325 | 29,256 | **−6.6%** |
+| `convert_i16_to_i32` unaligned | 30,334 | 28,459 | **−6.2%** |
+| `sad_8x8` aligned | 4,916,568 | 4,616,638 | **−6.1%** |
+| `sum_sq_i16` unaligned | 14,310 | 13,901 | −2.9% |
+| `peak_abs_i16` unaligned | 13,796 | 13,436 | −2.6% |
+| `sad_16x16` aligned | 7,817,854 | 7,655,006 | −2.1% |
+
+`ee.vld.128.xp` loads AND advances by a register-valued stride, which is
+what a row walk wants — it replaces the load plus the `add` after it, on
+both streams, in both SADs.
+
+### ★★ The kernels have crossed from INSTRUCTION-bound to LOAD-bound
+
+Every widening in P5 landed within a point or two of what its
+instructions-per-element predicted. In P6 the same edit under-delivers by
+three to five times:
+
+| | predicted | measured |
+|---|---:|---:|
+| `sum_sq_i16` unaligned 16→32 | −12.5% | −2.9% |
+| `peak_abs_i16` unaligned 16→32 | −10% | −2.6% |
+| `sad_16x16` `.xp` | −11% | −2.1% |
+
+The three that fell shortest are the three that do the MOST loads per byte
+of arithmetic — the unaligned reductions run two loads and a funnel per
+sixteen bytes, and SAD reads two streams. **Instructions are no longer the
+binding constraint on these loops; the load ports are.** That is the whole
+reason this entry is smaller than the last one, and it predicts where the
+remaining headroom is: kernels with HIGH ARITHMETIC INTENSITY, not more
+unrolling.
+
+### ★★ REFUTED: the FUSED load-op forms are slower
+
+The assembler accepts a family nothing here had used, and the part confirmed
+their semantics exactly:
+
+    ee.vmulas.s16.accx.ld.ip q0, a, 16, q1, q2   ACCX += q1·q2 AND q0 <- [a], a += 16
+    ee.vadds.s16.ld.incp     q0, a, q3, q1, q2   q3 = q1+q2  AND q0 <- [a], a += 16
+
+One instruction doing a full 128-bit load and an eight-lane operation is
+strictly fewer instructions. All three kernels rewritten with them got
+**slower**:
+
+    dot_i16    11,745 -> 13,833   +17.8%
+    mix_i16    14,708 -> 24,212   +64.6%
+    sum_sq_i16 10,005 -> 11,027   +10%   (and doing LESS work -- see below)
+
+Reverted. This is the `gain_i16` law at ISA scale: **instruction count is
+not cycles.** These forms do not reduce the number of LOADS, which is what
+these loops are actually limited by, and they appear to cost more than the
+two instructions they replace.
+
+One process note, because it nearly became a wrong number. `sum_sq` and
+`dot` run their asm once per accumulator-flush batch with the pointer as
+`inout`, and the fused prologue loads one block AHEAD — so the asm left the
+pointer sixteen bytes past the last block processed, and every batch after
+the first silently SKIPPED a block. The gate caught it (`identical=false`,
+and the PIE sum was SMALLER, which is what skipping looks like). Had the
+kernel been one that happened to still agree, the timing would have been
+recorded for a loop doing less work than it claimed.
+
+### ★★ REFUTED AGAIN, by a second mechanism: `satd_4x4`
+
+P4 refuted this kernel at +25.4% and named its transpose's memory round trip
+as the cause, recording that the refutation **would expire** if a
+register-level 64-bit half-swap were found. One was:
+`ee.src.q q, x, x` at SAR_BYTE = 8 is `x.hi64 ++ x.lo64`, measured
+`[08..0f, 00..07]`, and SAR_BYTE is settable by any `ee.ld.128.usar.ip`
+from an address congruent to 8 (mod 16).
+
+Rebuilt with the whole transpose in eight register instructions and no
+memory traffic at all:
+
+    satd_4x4       4,640,155 -> 4,992,012   +7.6%   (was +25.4%)
+    satd_4x4_sum   2,558,459 -> 3,108,225  +21.5%   (was +53.2%)
+
+**The memory round trip was most of the cost and removing it was not
+enough.** The refutation now rests on two independently-tested mechanisms
+rather than one, which is what §11 asks of a refutation worth keeping.
+
+### REFUTED: removing a host loop is not always a win
+
+Moving `rotate90_gray8`'s tile loop into the asm — the edit that made
+`yuyv_to_gray8` 25.6% faster — made this kernel **9.3% slower** (10,199
+against 9,332). The reason is the opposite of a saving: Rust recomputed both
+cursors from `x0` and `y0` each tile, so a tile's first load depended on
+nothing the previous tile did. An in-asm loop must walk them incrementally,
+so the next tile's first load waits on the previous tile's last store.
+
+**Removing a host loop wins when the address is already a running cursor,
+and loses when the host was computing an INDEPENDENT address each trip.**
+Redundant-looking arithmetic can be breaking a dependency chain.
