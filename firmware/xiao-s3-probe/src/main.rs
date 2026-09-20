@@ -1345,6 +1345,164 @@ fn main() -> ! {
             }
         }
 
+        // --- downscale2x_gray8 with every source ROW at an odd address ---
+        //
+        // 128x14 out of `&gd[1..]`, so `(2*oy)*w` lands on an odd byte for
+        // every row -- the case the aligned twin's per-row test rejects, and
+        // which a frame whose width is not a multiple of 32 produces on every
+        // second row anyway.
+        {
+            const UW: u32 = 128;
+            const UH: u32 = 14;
+            let uo = (UW as usize / 2) * (UH as usize / 2);
+            let usrc = &gd[1..];
+            println!(
+                "PIEUNALIGNED downscale src={} dst={} out_px={uo}",
+                usrc.as_ptr() as usize % 16,
+                ys.as_ptr() as usize % 16
+            );
+            let _ = pixel::downscale2x_gray8(usrc, UW, UH, &mut reference[..uo]);
+            let _ = rusty_esp_dsp_esp::pie_s3::downscale2x_gray8(usrc, UW, UH, &mut ys[..uo]);
+            println!(
+                "PIEKERNEL downscale2x_gray8_unaligned identical={}",
+                reference[..uo] == ys[..uo]
+            );
+            let uou = uo as u64;
+            measure("dscale_un_scalar", "px_out", uou, || {
+                let _ = pixel::downscale2x_gray8(usrc, UW, UH, &mut reference[..uo]);
+                Work { pixels: uou, ..Work::ZERO }
+            });
+            measure("dscale_un_pie", "px_out", uou, || {
+                let _ = rusty_esp_dsp_esp::pie_s3::downscale2x_gray8(usrc, UW, UH, &mut ys[..uo]);
+                Work { pixels: uou, ..Work::ZERO }
+            });
+        }
+
+        // --- fourth tier: the three forms the next kernels hinge on -------
+        {
+            #[repr(align(16))]
+            struct Q([u8; 16]);
+            #[repr(align(16))]
+            struct S([i16; 8]);
+
+            // 1. QACC holds EIGHT lanes or four? `ee.srcmb.s16.qacc` takes a
+            //    select; sel=0 gave lanes 0..=3 in the low half. If sel=1
+            //    returns lanes 4..=7 then `Gain` can do eight samples a trip.
+            let a = S([3, 5, 7, 9, 11, 13, 15, 17]);
+            let b = S([2, 2, 2, 2, 2, 2, 2, 2]);
+            for sel in [0u32, 1] {
+                let mut o = Q([0u8; 16]);
+                // SAFETY: two aligned 16-byte reads, one aligned write.
+                unsafe {
+                    core::arch::asm!(
+                        "ee.zero.qacc",
+                        "ee.vld.128.ip q0, {pa}, 0",
+                        "ee.vld.128.ip q1, {pb}, 0",
+                        "ee.vmulas.s16.qacc q0, q1",
+                        "ee.srcmb.s16.qacc q2, {sh}, {sel}",
+                        "ee.vst.128.ip q2, {o}, 0",
+                        pa = inout(reg) a.0.as_ptr() => _,
+                        pb = inout(reg) b.0.as_ptr() => _,
+                        sh = in(reg) 0u32,
+                        sel = const 0,
+                        o = inout(reg) o.0.as_mut_ptr() => _,
+                        options(nostack),
+                    );
+                }
+                let _ = sel;
+                println!("P4 srcmb sel=0        q2={:02x?}", o.0);
+                break;
+            }
+            {
+                let mut o = Q([0u8; 16]);
+                // SAFETY: as above, with the select immediate set to one.
+                unsafe {
+                    core::arch::asm!(
+                        "ee.zero.qacc",
+                        "ee.vld.128.ip q0, {pa}, 0",
+                        "ee.vld.128.ip q1, {pb}, 0",
+                        "ee.vmulas.s16.qacc q0, q1",
+                        "ee.srcmb.s16.qacc q2, {sh}, 1",
+                        "ee.vst.128.ip q2, {o}, 0",
+                        pa = inout(reg) a.0.as_ptr() => _,
+                        pb = inout(reg) b.0.as_ptr() => _,
+                        sh = in(reg) 0u32,
+                        o = inout(reg) o.0.as_mut_ptr() => _,
+                        options(nostack),
+                    );
+                }
+                println!("P4 srcmb sel=1        q2={:02x?}", o.0);
+            }
+
+            // 2. Does `ee.srcmb` FLOOR or truncate toward zero on a negative
+            //    accumulator? Rust's `>>` floors, and `Gain` depends on it.
+            {
+                let n = S([-3, -5, -7, -9, 0, 0, 0, 0]);
+                let t = S([2, 2, 2, 2, 0, 0, 0, 0]);
+                let mut o = Q([0u8; 16]);
+                // SAFETY: two aligned reads, one aligned write.
+                unsafe {
+                    core::arch::asm!(
+                        "ee.zero.qacc",
+                        "ee.vld.128.ip q0, {pa}, 0",
+                        "ee.vld.128.ip q1, {pb}, 0",
+                        "ee.vmulas.s16.qacc q0, q1",
+                        "ee.srcmb.s16.qacc q2, {sh}, 0",
+                        "ee.vst.128.ip q2, {o}, 0",
+                        pa = inout(reg) n.0.as_ptr() => _,
+                        pb = inout(reg) t.0.as_ptr() => _,
+                        sh = in(reg) 2u32,
+                        o = inout(reg) o.0.as_mut_ptr() => _,
+                        options(nostack),
+                    );
+                }
+                // products -6 -10 -14 -18; >>2 FLOORS to -2 -3 -4 -5,
+                // truncates toward zero to -1 -2 -3 -4
+                println!("P4 srcmb neg sh=2     q2={:02x?}", o.0);
+            }
+
+            // 3. A broadcast load, which a gain or a threshold wants.
+            {
+                let v: u16 = 0x1234;
+                let mut o = Q([0u8; 16]);
+                // SAFETY: a 2-byte read of a live local and one aligned write.
+                unsafe {
+                    core::arch::asm!(
+                        "ee.zero.q q0",
+                        "ee.vldbc.16 q0, {p}",
+                        "ee.vst.128.ip q0, {o}, 0",
+                        p = inout(reg) core::ptr::addr_of!(v) => _,
+                        o = inout(reg) o.0.as_mut_ptr() => _,
+                        options(nostack),
+                    );
+                }
+                println!("P4 vldbc.16 0x1234    q0={:02x?}", o.0);
+            }
+
+            // 4. `ee.bitrev` -- if it reverses BYTES it gives rotate180 a
+            //    kernel; if it reverses bits within lanes it does not.
+            {
+                let src = Q([
+                    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                ]);
+                let mut o = Q([0u8; 16]);
+                // SAFETY: one aligned read, one aligned write.
+                unsafe {
+                    core::arch::asm!(
+                        "ee.vld.128.ip q0, {p}, 0",
+                        "ee.bitrev q0, {a}",
+                        "ee.vst.128.ip q0, {o}, 0",
+                        p = inout(reg) src.0.as_ptr() => _,
+                        a = inout(reg) 16u32 => _,
+                        o = inout(reg) o.0.as_mut_ptr() => _,
+                        options(nostack),
+                    );
+                }
+                println!("P4 bitrev ramp        q0={:02x?}", o.0);
+            }
+            println!("P4 == end ==");
+        }
+
         report_memory("after_pie");
     }
 

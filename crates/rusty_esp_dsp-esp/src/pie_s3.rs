@@ -787,14 +787,18 @@ pub fn downscale2x_gray8(src: &[u8], width: u32, height: u32, dst: &mut [u8]) ->
         // Per ROW, because a row's alignment depends on the stride and the
         // caller's base together. A row that does not qualify takes the
         // scalar arm; the image does not have to be all one or all the other.
-        let body =
-            if aligned16(r0.as_ptr()) && aligned16(r1.as_ptr()) && aligned16(drow.as_ptr()) {
-                ow / 16 * 16
-            } else {
-                0
-            };
+        let aligned =
+            aligned16(r0.as_ptr()) && aligned16(r1.as_ptr()) && aligned16(drow.as_ptr());
+        // A row that is not aligned is no longer the oracle's: the unaligned
+        // idiom reaches it, writes into `drow` itself, and reports how far it
+        // got so the scalar tail can finish from there.
+        let body = if aligned {
+            ow / 16 * 16
+        } else {
+            downscale2x_gray8_unaligned_row(r0, r1, drow)
+        };
 
-        if body > 0 {
+        if aligned && body > 0 {
             let mut p0 = r0.as_ptr();
             let mut p1 = r1.as_ptr();
             let mut pd = drow.as_mut_ptr();
@@ -1450,5 +1454,108 @@ fn stereo_to_mono_i16_unaligned_src(src: &[i16], dst: &mut [i16]) -> usize {
         );
     }
     let _ = (ps, pd);
+    body
+}
+
+/// `downscale2x_gray8` for source rows at ANY offset, destination aligned.
+///
+/// The row-alignment test in the aligned twin depends on the caller's base
+/// AND the stride together, so a frame whose width is not a multiple of 32
+/// fails it on every second row. The unaligned idiom removes the question.
+///
+/// The register budget is the reason this is a separate body rather than a
+/// flag: the aligned twin already uses all eight, and three more are needed
+/// for the two funnels. The allocation that fits is q4/q5 for the two halves
+/// of eight sums, q7 for the round term, and q0-q3 plus q6 recycled as load
+/// scratch, widening scratch and zero.
+#[allow(unsafe_code)]
+fn downscale2x_gray8_unaligned_row(r0: &[u8], r1: &[u8], drow: &mut [u8]) -> usize {
+    let ow = drow.len();
+    if ow < 32 || !aligned16(drow.as_ptr()) {
+        return 0;
+    }
+    // Sixteen output pixels a trip; leave one trip's worth of slack so the
+    // last window's trailing block stays inside the row slices.
+    let body = (ow - 16) / 16 * 16;
+    if body == 0 {
+        return 0;
+    }
+    let mut p0 = r0.as_ptr();
+    let mut p1 = r1.as_ptr();
+    let mut pd = drow.as_mut_ptr();
+    let mut left = body / 16;
+    // SAFETY: each trip consumes 32 bytes of each source row and writes 16,
+    // and reads at most one 16-byte block past what it consumes -- which the
+    // 16-pixel reservation above covers, since each row slice is `2 * ow`
+    // bytes. `drow` is 16-byte aligned. q0-q7 only; SAR is restored.
+    unsafe {
+        core::arch::asm!(
+            "rsr.sar {sar}",
+            "ee.zero.q q6",
+            "ee.vcmp.eq.s16 q7, q6, q6", // all ones
+            "ee.vsubs.s32 q7, q6, q7",   // one per 32-bit lane
+            "ssai 1",
+            "ee.vsl.32 q7, q7",          // two: the round term
+            "16:",
+            // ---- columns 0..=15 -> outputs 0..=7 ----
+            "ee.ld.128.usar.ip q0, {p0}, 16",
+            "ee.ld.128.usar.ip q1, {p0}, 0",
+            "ee.src.q q6, q0, q1",       // sixteen bytes of row 0
+            "ee.ld.128.usar.ip q0, {p1}, 16",
+            "ee.ld.128.usar.ip q1, {p1}, 0",
+            "ee.src.q q2, q0, q1",       // and of row 1
+            "ee.zero.q q3",
+            "ee.vzip.8 q6, q3",          // row0 widened: low eight, high eight
+            "ee.zero.q q0",
+            "ee.vzip.8 q2, q0",          // row1 widened
+            "ee.vadds.s16 q6, q6, q2",   // vertical sum, columns 0..=7
+            "ee.vadds.s16 q3, q3, q0",   // columns 8..=15
+            "ee.vunzip.16 q6, q3",       // even columns / odd columns
+            "ee.vadds.s16 q4, q6, q3",   // eight horizontal pairs, <= 1020
+            // ---- columns 16..=31 -> outputs 8..=15 ----
+            "ee.ld.128.usar.ip q0, {p0}, 16",
+            "ee.ld.128.usar.ip q1, {p0}, 0",
+            "ee.src.q q6, q0, q1",
+            "ee.ld.128.usar.ip q0, {p1}, 16",
+            "ee.ld.128.usar.ip q1, {p1}, 0",
+            "ee.src.q q2, q0, q1",
+            "ee.zero.q q3",
+            "ee.vzip.8 q6, q3",
+            "ee.zero.q q0",
+            "ee.vzip.8 q2, q0",
+            "ee.vadds.s16 q6, q6, q2",
+            "ee.vadds.s16 q3, q3, q0",
+            "ee.vunzip.16 q6, q3",
+            "ee.vadds.s16 q5, q6, q3",
+            // ---- (sum + 2) >> 2 in 32-bit lanes; sums are non-negative ----
+            "ee.zero.q q0",
+            "ee.vzip.16 q4, q0",
+            "ee.zero.q q1",
+            "ee.vzip.16 q5, q1",
+            "ee.vadds.s32 q4, q4, q7",
+            "ee.vadds.s32 q0, q0, q7",
+            "ee.vadds.s32 q5, q5, q7",
+            "ee.vadds.s32 q1, q1, q7",
+            "ssai 2",
+            "ee.vsr.32 q4, q4",
+            "ee.vsr.32 q0, q0",
+            "ee.vsr.32 q5, q5",
+            "ee.vsr.32 q1, q1",
+            "ee.vunzip.16 q4, q0",
+            "ee.vunzip.16 q5, q1",
+            "ee.vunzip.8 q4, q5",        // low byte of each: the sixteen pixels
+            "ee.vst.128.ip q4, {pd}, 16",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 16b",
+            "wsr.sar {sar}",
+            p0 = inout(reg) p0,
+            p1 = inout(reg) p1,
+            pd = inout(reg) pd,
+            n = inout(reg) left => _,
+            sar = out(reg) _,
+            options(nostack),
+        );
+    }
+    let _ = (p0, p1, pd);
     body
 }
