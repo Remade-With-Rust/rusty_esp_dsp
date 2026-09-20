@@ -24,7 +24,7 @@
 //! |---|---|
 //! | `ssai N` + `ee.vsr.32 qd, qs` | ARITHMETIC right shift, four 32-bit lanes, amount from SAR |
 //! | `ssai N` + `ee.vsl.32 qd, qs` | left shift, four 32-bit lanes, wrapping |
-//! | `ee.vmul.s16 qd, qa, qb` | eight lanes, low half, **WRAPS** -- 32767 x 3 reads 32765 |
+//! | `ee.vmul.s16 qd, qa, qb` | **UNSETTLED -- do not use.** Two probes disagree: `(2,3)` and `(32767,3)` read 6 and 32765, which is the low half; `(24,2048)` and `(8,2048)` read 3 and 1, which is `(a*b) >> 14`. No single rule fits both, so the instruction is not characterised. `downscale2x_rgb565` was written with it, produced a wrong red field, and now shifts through 32-bit lanes instead. |
 //! | `ee.vadds.s32` / `ee.vsubs.s32` | four 32-bit lanes, saturating |
 //! | `ee.vcmp.lt.s16` / `.gt` / `.eq` | eight lanes, all-ones where true, all-zeros where false |
 //! | `ee.vzip.32` / `ee.vunzip.32` | interleave / deinterleave 32-bit lanes across the pair |
@@ -2393,4 +2393,264 @@ pub fn sad_4x4(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
         total += u32::from(acc.0[k] as u16);
     }
     Ok(total)
+}
+
+/// `downscale2x_rgb565` — backlog B1, the largest scalar cost left in the
+/// family at 1,196,886 ps per output pixel.
+///
+/// # The algebra, which removes most of the work before any SIMD
+///
+/// The oracle expands each 5/6/5 channel to eight bits, averages four of
+/// them, and packs back to 5/6/5. Two identities collapse that.
+///
+/// **The expansions are multiply-shifts.** `r5to8(v) = (v << 3) | (v >> 2)`
+/// is exactly `(33 * v) >> 2`, and `g6to8(v) = (v << 2) | (v >> 4)` is
+/// exactly `(65 * v) >> 4` — checked at both ends of each range (v=31 gives
+/// 255 either way, v=1 gives 8 and 4). A multiply-shift is what QACC does in
+/// three instructions for eight lanes; a shift-or pair is not.
+///
+/// **The pack throws away exactly the bits the average just computed.**
+/// `pack_rgb565` keeps `r & 0xF8`, i.e. `r >> 3` placed at bit 11. Since
+/// `r = (sum + 2) / 4`, the packed field is `((sum + 2) >> 2) >> 3`, and
+/// shifts compose:
+///
+/// ```text
+///   r5 = (sum_r + 2) >> 5      g6 = (sum_g + 2) >> 4      b5 = (sum_b + 2) >> 5
+/// ```
+///
+/// So the 8-bit intermediate never has to exist. Every value stays inside
+/// an i16 lane: the expansions reach 255, four of them 1020, and `+2`
+/// leaves 1022.
+///
+/// The per-term floor is kept — `Σ (33·v)>>2` is NOT `(33·Σv)>>2` — because
+/// the gate is byte-identity, not closeness.
+///
+/// # The shape
+///
+/// One channel at a time across BOTH rows, which is what makes it fit in
+/// eight vector registers: `q0`/`q1` hold the two source rows for the whole
+/// trip, `q2`/`q3` work, `q4`/`q5`/`q6` accumulate the three finished
+/// channels, and `q7` is reloaded with each constant as it is needed.
+///
+/// Extraction goes through 32-bit lanes, where `ssai` + `ee.vsr.32` is a
+/// plain shift, rather than through QACC — there is no 16-bit shift on this
+/// unit. Blue needs no shift at all, just a mask on the source.
+///
+/// Four output pixels a trip, stored with `ee.vst.l.64`.
+#[allow(unsafe_code)]
+pub fn downscale2x_rgb565(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    dst: &mut [u8],
+) -> Result<(), ()> {
+    let (w, h) = (width as usize, height as usize);
+    let (ow, oh) = (w / 2, h / 2);
+    if src.len() < w * h * 2 || dst.len() < ow * oh * 2 {
+        return Err(());
+    }
+
+    // The constants, in the order the loop reloads them.
+    #[repr(align(16))]
+    struct C([i16; 8]);
+    let c = C([0x1f, 0x3f, 33, 65, 2, 1, 2048, 32]);
+
+    for oy in 0..oh {
+        let r0 = &src[(2 * oy) * w * 2..(2 * oy) * w * 2 + ow * 4];
+        let r1 = &src[(2 * oy + 1) * w * 2..(2 * oy + 1) * w * 2 + ow * 4];
+        let drow = &mut dst[oy * ow * 2..oy * ow * 2 + ow * 2];
+
+        let body = if aligned16(r0.as_ptr()) && aligned16(r1.as_ptr()) && aligned16(drow.as_ptr())
+        {
+            ow / 4 * 4
+        } else {
+            0
+        };
+
+        if body > 0 {
+            let mut p0 = r0.as_ptr();
+            let mut p1 = r1.as_ptr();
+            let mut pd = drow.as_mut_ptr();
+            let pc = c.0.as_ptr().cast::<u8>();
+            let mut left = body / 4;
+            // SAFETY: each trip reads 16 bytes (8 pixels) from each source
+            // row and writes 8 (4 pixels), `body / 4` times; `body <= ow` and
+            // each row is sliced to exactly `ow * 4` bytes, so every access
+            // is inside the three slices. All three are 16-byte aligned, and
+            // `c` is a local 16-byte aligned array read two bytes at a time.
+            // q0-q7 only; SAR is restored.
+            unsafe {
+                core::arch::asm!(
+                    "rsr.sar {sar}",
+                    "29:",
+                    "ee.vld.128.ip q0, {p0}, 16",
+                    "ee.vld.128.ip q1, {p1}, 16",
+                    // RED
+                    "ee.orq q2, q0, q0",
+                    "ee.zero.q q3",
+                    "ee.vzip.16 q2, q3",
+                    "ssai 11",
+                    "ee.vsr.32 q2, q2",
+                    "ee.vsr.32 q3, q3",
+                    "ee.vunzip.16 q2, q3",
+                    "addi {t}, {pc}, 4",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q2, q7",
+                    "ee.srcmb.s16.qacc q2, {sh2}, 0",
+                    "ee.orq q3, q1, q1",
+                    "ee.zero.q q4",
+                    "ee.vzip.16 q3, q4",
+                    "ssai 11",
+                    "ee.vsr.32 q3, q3",
+                    "ee.vsr.32 q4, q4",
+                    "ee.vunzip.16 q3, q4",
+                    "addi {t}, {pc}, 4",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q3, q7",
+                    "ee.srcmb.s16.qacc q3, {sh2}, 0",
+                    "ee.vadds.s16 q2, q2, q3",
+                    "ee.vunzip.16 q2, q3",
+                    "ee.vadds.s16 q2, q2, q3",
+                    "addi {t}, {pc}, 8",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.vadds.s16 q2, q2, q7",
+                    "addi {t}, {pc}, 10",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q2, q7",
+                    "ee.srcmb.s16.qacc q4, {sh5}, 0",
+                    // GREEN
+                    "ee.orq q2, q0, q0",
+                    "ee.zero.q q3",
+                    "ee.vzip.16 q2, q3",
+                    "ssai 5",
+                    "ee.vsr.32 q2, q2",
+                    "ee.vsr.32 q3, q3",
+                    "ee.vunzip.16 q2, q3",
+                    "addi {t}, {pc}, 2",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.andq q2, q2, q7",
+                    "addi {t}, {pc}, 6",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q2, q7",
+                    "ee.srcmb.s16.qacc q2, {sh4}, 0",
+                    "ee.orq q3, q1, q1",
+                    "ee.zero.q q5",
+                    "ee.vzip.16 q3, q5",
+                    "ssai 5",
+                    "ee.vsr.32 q3, q3",
+                    "ee.vsr.32 q5, q5",
+                    "ee.vunzip.16 q3, q5",
+                    "addi {t}, {pc}, 2",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.andq q3, q3, q7",
+                    "addi {t}, {pc}, 6",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q3, q7",
+                    "ee.srcmb.s16.qacc q3, {sh4}, 0",
+                    "ee.vadds.s16 q2, q2, q3",
+                    "ee.vunzip.16 q2, q3",
+                    "ee.vadds.s16 q2, q2, q3",
+                    "addi {t}, {pc}, 8",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.vadds.s16 q2, q2, q7",
+                    "addi {t}, {pc}, 10",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q2, q7",
+                    "ee.srcmb.s16.qacc q5, {sh4}, 0",
+                    // BLUE
+                    "addi {t}, {pc}, 0",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.andq q2, q0, q7",
+                    "ee.andq q3, q1, q7",
+                    "addi {t}, {pc}, 4",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q2, q7",
+                    "ee.srcmb.s16.qacc q2, {sh2}, 0",
+                    "addi {t}, {pc}, 4",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q3, q7",
+                    "ee.srcmb.s16.qacc q3, {sh2}, 0",
+                    "ee.vadds.s16 q2, q2, q3",
+                    "ee.vunzip.16 q2, q3",
+                    "ee.vadds.s16 q2, q2, q3",
+                    "addi {t}, {pc}, 8",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.vadds.s16 q2, q2, q7",
+                    "addi {t}, {pc}, 10",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q2, q7",
+                    "ee.srcmb.s16.qacc q6, {sh5}, 0",
+                    // PACK. The left shifts go through 32-bit lanes, NOT
+                    // through `ee.vmul.s16`: that instruction does not keep
+                    // the low half of the product here, it returns
+                    // `(a * b) >> 14` -- measured, 24 * 2048 came back 3.
+                    // Widen, shift, narrow; the results fit 16 bits
+                    // (31 << 11 = 63488) so the low halves are exact.
+                    "ee.zero.q q7",
+                    "ee.vzip.16 q4, q7",
+                    "ssai 11",
+                    "ee.vsl.32 q4, q4",
+                    "ee.vsl.32 q7, q7",
+                    "ee.vunzip.16 q4, q7",        // r5 << 11
+                    "ee.zero.q q7",
+                    "ee.vzip.16 q5, q7",
+                    "ssai 5",
+                    "ee.vsl.32 q5, q5",
+                    "ee.vsl.32 q7, q7",
+                    "ee.vunzip.16 q5, q7",        // g6 << 5
+                    "ee.orq q4, q4, q5",
+                    "ee.orq q4, q4, q6",
+                    "ee.vst.l.64.ip q4, {pd}, 8",
+                    "addi {n}, {n}, -1",
+                    "bnez {n}, 29b",
+                    "wsr.sar {sar}",
+                    p0 = inout(reg) p0,
+                    p1 = inout(reg) p1,
+                    pd = inout(reg) pd,
+                    n = inout(reg) left => _,
+                    pc = in(reg) pc,
+                    t = out(reg) _,
+                    sh2 = in(reg) 2u32,
+                    sh4 = in(reg) 4u32,
+                    sh5 = in(reg) 5u32,
+                    sar = out(reg) _,
+                    options(nostack),
+                );
+            }
+            let _ = (p0, p1, pd);
+        }
+
+        // The tail, and the whole row when it is not aligned: the oracle's
+        // own arithmetic.
+        for ox in body..ow {
+            let q = |s: &[u8], i: usize| u16::from_le_bytes([s[i * 2], s[i * 2 + 1]]);
+            let (a, b) = (q(r0, 2 * ox), q(r0, 2 * ox + 1));
+            let (cc, d) = (q(r1, 2 * ox), q(r1, 2 * ox + 1));
+            let ex5 = |p: u16, sh: u32| -> u32 {
+                let v = u32::from((p >> sh) & 0x1f);
+                (v << 3) | (v >> 2)
+            };
+            let ex6 = |p: u16| -> u32 {
+                let v = u32::from((p >> 5) & 0x3f);
+                (v << 2) | (v >> 4)
+            };
+            let r = ((ex5(a, 11) + ex5(b, 11) + ex5(cc, 11) + ex5(d, 11) + 2) / 4) as u8;
+            let g = ((ex6(a) + ex6(b) + ex6(cc) + ex6(d) + 2) / 4) as u8;
+            let bl = ((ex5(a, 0) + ex5(b, 0) + ex5(cc, 0) + ex5(d, 0) + 2) / 4) as u8;
+            let packed = ((u16::from(r) & 0xf8) << 8)
+                | ((u16::from(g) & 0xfc) << 3)
+                | (u16::from(bl) >> 3);
+            drow[ox * 2..ox * 2 + 2].copy_from_slice(&packed.to_le_bytes());
+        }
+    }
+    Ok(())
 }

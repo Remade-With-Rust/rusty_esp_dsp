@@ -56,7 +56,7 @@ destination its chip arm declines by precondition.
 
 | # | kernel | crate | why it is a candidate |
 |---|---|---|---|
-| B1 | `downscale2x_rgb565` | `rusty_esp_dsp` | the highest arithmetic intensity left (~40 ops per output pixel on 4 loads) — and P6 showed the remaining headroom is in compute-bound kernels, not more unrolling |
+| ~~B1~~ | ~~`downscale2x_rgb565`~~ | `rusty_esp_dsp` | **DONE, −65.5%** (1,330,835 → 458,773 ps/px_out). 28.5 instructions per output pixel against the scalar's ~287 cycles. |
 | B2 | `yuyv_to_rgb565` | `rusty_esp_dsp` | colour conversion, 2 bytes out; QACC handles the coefficients |
 | B3 | `find_start_code` / `nal_spans` / `access_units` | `rusty_esp_video-core` | scanning for `00 00 01` is a byte compare — `ee.vcmp.eq.s8` |
 | ~~B4~~ | ~~`jpeg::find_eoi`~~ | `rusty_esp_image-core` | **DROPPED on inspection.** It scans BACKWARDS from the end and a well-formed JPEG has `FF D9` as its last two bytes, so it exits on the first iteration. Its recorded 175,274 ps/byte is a pathological-input number, not the production cost. Vectorising an O(1)-in-practice loop buys nothing. |

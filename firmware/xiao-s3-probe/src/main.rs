@@ -1834,6 +1834,8 @@ fn main() -> ! {
         pie_audio_reach(ibytes, iv);
         pie_convert_reach(ibytes);
         pie_tier_b();
+        b1_extract_probe();
+        pie_b1(ys, gd, &mut reference);
         pie_fused_family_probe();
 
         report_memory("after_pie");
@@ -2839,5 +2841,176 @@ fn pie_tier_b() {
             core::hint::black_box(acc);
             Work { samples: nsu, ..Work::ZERO }
         });
+    }
+}
+
+/// B1: `downscale2x_rgb565`, the largest scalar cost left in the family.
+///
+/// Gated against the oracle on the same bytes. The twin's destination is
+/// `gd` (a `Vec<u128>` view, so 16-byte aligned, which its per-row check
+/// requires); the oracle writes to `reference`, a plain `Vec<u8>`, so even
+/// if that happened to be aligned the oracle has no chip arm to take.
+#[inline(never)]
+fn pie_b1(ys: &[u8], gd: &mut [u8], reference: &mut [u8]) {
+    const BW: u32 = 64;
+    const BH: u32 = 16;
+    let src_len = (BW as usize) * (BH as usize) * 2;
+    let out_len = (BW as usize / 2) * (BH as usize / 2) * 2;
+    let src = &ys[..src_len];
+    println!(
+        "PIEPRECOND b1 src_align={} dst_align={} out_bytes={out_len}",
+        src.as_ptr() as usize % 16,
+        gd.as_ptr() as usize % 16
+    );
+    let _ = pixel::downscale2x_rgb565(src, BW, BH, &mut reference[..out_len]);
+    let _ = rusty_esp_dsp_esp::pie_s3::downscale2x_rgb565(src, BW, BH, &mut gd[..out_len]);
+    println!(
+        "PIEKERNEL downscale2x_rgb565 identical={}",
+        reference[..out_len] == gd[..out_len]
+    );
+    // Localise the disagreement: the first four output pixels from each,
+    // split into the three fields, so a wrong channel names itself.
+    for k in 0..4 {
+        let o = u16::from_le_bytes([reference[k * 2], reference[k * 2 + 1]]);
+        let p = u16::from_le_bytes([gd[k * 2], gd[k * 2 + 1]]);
+        println!(
+            "B1DIAG k={k} oracle={:04x} (r{} g{} b{})  pie={:04x} (r{} g{} b{})",
+            o, o >> 11, (o >> 5) & 0x3f, o & 0x1f,
+            p, p >> 11, (p >> 5) & 0x3f, p & 0x1f
+        );
+    }
+    let n = (out_len / 2) as u64;
+    measure("dscale565_scalar", "px_out", n, || {
+        let _ = pixel::downscale2x_rgb565(src, BW, BH, &mut reference[..out_len]);
+        Work { pixels: n, ..Work::ZERO }
+    });
+    measure("dscale565_pie", "px_out", n, || {
+        let _ = rusty_esp_dsp_esp::pie_s3::downscale2x_rgb565(src, BW, BH, &mut gd[..out_len]);
+        Work { pixels: n, ..Work::ZERO }
+    });
+}
+
+/// Why is B1's red field zero? Run the extraction on KNOWN pixels and print
+/// every step, rather than re-reading the listing a third time.
+#[inline(never)]
+fn b1_extract_probe() {
+    #[repr(align(16))]
+    struct Q([u16; 8]);
+    // v_r for these is 31, 16, 1, 0, 31, 8, 4, 2
+    let src = Q([0xf800, 0x8000, 0x0800, 0x0000, 0xffff, 0x4321, 0x2000, 0x1234]);
+    let (mut w0, mut w1, mut ex) = (Q([0; 8]), Q([0; 8]), Q([0; 8]));
+    // SAFETY: four 16-byte aligned buffers, one read and three written;
+    // q0-q3 only, and SAR is restored.
+    unsafe {
+        core::arch::asm!(
+            "rsr.sar {sar}",
+            "ee.vld.128.ip q0, {p}, 0",
+            "ee.orq q2, q0, q0",
+            "ee.zero.q q3",
+            "ee.vzip.16 q2, q3",          // widen to u32
+            "ee.vst.128.ip q2, {o0}, 0",  // what the widen produced
+            "ssai 11",
+            "ee.vsr.32 q2, q2",
+            "ee.vsr.32 q3, q3",
+            "ee.vst.128.ip q2, {o1}, 0",  // what the shift produced
+            "ee.vunzip.16 q2, q3",
+            "ee.vst.128.ip q2, {o2}, 0",  // the eight v_r
+            "wsr.sar {sar}",
+            p = inout(reg) src.0.as_ptr() => _,
+            o0 = inout(reg) w0.0.as_mut_ptr() => _,
+            o1 = inout(reg) w1.0.as_mut_ptr() => _,
+            o2 = inout(reg) ex.0.as_mut_ptr() => _,
+            sar = out(reg) _,
+            options(nostack),
+        );
+    }
+    println!("B1EX src   ={:04x?}", src.0);
+    println!("B1EX widen ={:04x?} (want f800,0000,8000,0000,0800,0000,0000,0000)", w0.0);
+    println!("B1EX shift ={:04x?}", w1.0);
+    println!("B1EX v_r   ={:?} (want 31,16,1,0,31,8,4,2)", ex.0);
+
+    // ---- the rest of the red pipeline, step by step -------------------
+    #[repr(align(16))]
+    struct C([i16; 8]);
+    let c = C([0x1f, 0x3f, 33, 65, 2, 1, 2048, 32]);
+    let pc = c.0.as_ptr().cast::<u8>();
+    let (mut e, mut sums, mut r5, mut packed) = (Q([0; 8]), Q([0; 8]), Q([0; 8]), Q([0; 8]));
+    // SAFETY: `ex` holds the eight v_r just measured; five aligned 16-byte
+    // buffers; q2/q3/q4/q7 only.
+    unsafe {
+        core::arch::asm!(
+            "ee.vld.128.ip q2, {v}, 0",        // q2 = the eight v_r
+            "addi {t}, {pc}, 4",
+            "ee.vldbc.16 q7, {t}",             // 33
+            "ee.zero.qacc",
+            "ee.vmulas.s16.qacc q2, q7",
+            "ee.srcmb.s16.qacc q2, {sh2}, 0",  // e = (33v) >> 2
+            "ee.vst.128.ip q2, {oe}, 0",
+            "ee.orq q3, q2, q2",               // pretend row1 == row0
+            "ee.vadds.s16 q2, q2, q3",
+            "ee.vunzip.16 q2, q3",
+            "ee.vadds.s16 q2, q2, q3",
+            "addi {t}, {pc}, 8",
+            "ee.vldbc.16 q7, {t}",             // 2
+            "ee.vadds.s16 q2, q2, q7",
+            "ee.vst.128.ip q2, {os}, 0",       // the four sums + 2
+            "addi {t}, {pc}, 10",
+            "ee.vldbc.16 q7, {t}",             // 1
+            "ee.zero.qacc",
+            "ee.vmulas.s16.qacc q2, q7",
+            "ee.srcmb.s16.qacc q4, {sh5}, 0",  // r5
+            "ee.vst.128.ip q4, {or}, 0",
+            "addi {t}, {pc}, 12",
+            "ee.vldbc.16 q7, {t}",             // 2048
+            "ee.vmul.s16 q4, q4, q7",
+            "ee.vst.128.ip q4, {op}, 0",       // r5 << 11
+            v = inout(reg) ex.0.as_ptr() => _,
+            pc = in(reg) pc,
+            t = out(reg) _,
+            sh2 = in(reg) 2u32,
+            sh5 = in(reg) 5u32,
+            oe = inout(reg) e.0.as_mut_ptr() => _,
+            os = inout(reg) sums.0.as_mut_ptr() => _,
+            or = inout(reg) r5.0.as_mut_ptr() => _,
+            op = inout(reg) packed.0.as_mut_ptr() => _,
+            options(nostack),
+        );
+    }
+    println!("B1EX e     ={:?} (want 255,132,8,0,255,66,33,16)", e.0);
+    println!("B1EX sum+2 ={:?} (want 776,18,644,100 in lanes 0..3)", sums.0);
+    println!("B1EX r5    ={:?} (want 24,0,20,3 in lanes 0..3)", r5.0);
+    println!("B1EX r5<<11={:04x?}", packed.0);
+
+    // What IS `ee.vmul.s16`? The earlier table says "low half, wraps", from
+    // a probe whose operands were all small. Re-ask with a product that
+    // exceeds 16 bits, and dump the multiplier too so a bad broadcast
+    // cannot be mistaken for a bad multiply.
+    {
+        let a = Q([24, 20, 12, 3, 1, 2, 4, 8]);
+        let (mut mul, mut prod) = (Q([0; 8]), Q([0; 8]));
+        // SAFETY: three aligned 16-byte buffers; q2/q3/q7 only.
+        unsafe {
+            core::arch::asm!(
+                "addi {t}, {pc}, 12",
+                "ee.vldbc.16 q7, {t}",
+                "ee.vst.128.ip q7, {om}, 0",
+                "ee.vld.128.ip q2, {pa}, 0",
+                "ee.vmul.s16 q3, q2, q7",
+                "ee.vst.128.ip q3, {op}, 0",
+                pc = in(reg) pc,
+                t = out(reg) _,
+                pa = inout(reg) a.0.as_ptr() => _,
+                om = inout(reg) mul.0.as_mut_ptr() => _,
+                op = inout(reg) prod.0.as_mut_ptr() => _,
+                options(nostack),
+            );
+        }
+        println!("B1EX vmul multiplier={:?} (want 2048 in every lane)", mul.0);
+        println!(
+            "B1EX vmul a={:?} -> {:?}",
+            a.0, prod.0
+        );
+        println!("B1EX   low-half would be 49152,40960,24576,6144,2048,4096,8192,16384");
+        println!("B1EX   (a*b)>>14 would be     3,    2,    1,   0,   0,   0,   0,    1");
     }
 }
