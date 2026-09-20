@@ -653,6 +653,104 @@ fn main() -> ! {
             Work { samples: npx, ..Work::ZERO }
         });
 
+        // --- rms_dbfs_i16: the function the SHIPPING per-block loop calls --
+        let rref = rusty_esp_dsp::sample::rms_dbfs_i16(ibytes);
+        let rpie = rusty_esp_dsp_esp::pie_s3::rms_dbfs_i16(ibytes);
+        println!(
+            "PIEKERNEL rms_dbfs_i16 identical={} scalar={rref} pie={rpie}",
+            rref == rpie
+        );
+        measure("rms_scalar", "sample", npx, || {
+            core::hint::black_box(rusty_esp_dsp::sample::rms_dbfs_i16(ibytes));
+            Work { samples: npx, ..Work::ZERO }
+        });
+        measure("rms_pie", "sample", npx, || {
+            core::hint::black_box(rusty_esp_dsp_esp::pie_s3::rms_dbfs_i16(ibytes));
+            Work { samples: npx, ..Work::ZERO }
+        });
+
+        // --- mix_i16: gated against the audio element, not a rewrite of it --
+        // 512 samples, not NPX: by this point the heap is down to a few KiB
+        // and these are two more buffers. The per-sample figure is what the
+        // A/B reports, so a smaller working set says the same thing.
+        const NMIX: usize = 512;
+        let nmix = NMIX as u64;
+        let mut msrc: alloc::vec::Vec<u128> = alloc::vec![0; NMIX / 8];
+        let mut psrc: alloc::vec::Vec<u128> = alloc::vec![0; NMIX / 8];
+        // SAFETY: `Vec<u128>` is 16-byte aligned and initialised; `i16` is POD.
+        let (mref, mpie) = unsafe {
+            (
+                core::slice::from_raw_parts_mut(msrc.as_mut_ptr().cast::<u8>(), NMIX * 2),
+                core::slice::from_raw_parts_mut(psrc.as_mut_ptr().cast::<u8>(), NMIX * 2),
+            )
+        };
+        // SAFETY: as above -- the same bytes, viewed as the samples they are.
+        let jbytes = unsafe {
+            core::slice::from_raw_parts(jv.as_ptr().cast::<u8>(), NMIX * 2)
+        };
+        let mbytes = &ibytes[..NMIX * 2];
+        rusty_esp_audio_core::elements::mix_i16(mbytes, jbytes, mref)
+            .expect("mix scalar");
+        rusty_esp_dsp_esp::pie_s3::mix_i16(&iv[..NMIX], &jv[..NMIX], unsafe {
+            // SAFETY: `mpie` is the byte view of an aligned `Vec<u128>`.
+            core::slice::from_raw_parts_mut(mpie.as_mut_ptr().cast::<i16>(), NMIX)
+        });
+        println!("PIEKERNEL mix_i16 identical={}", mref[..] == mpie[..]);
+        measure("mix_scalar", "sample", nmix, || {
+            let _ = rusty_esp_audio_core::elements::mix_i16(mbytes, jbytes, mref);
+            Work { samples: nmix, ..Work::ZERO }
+        });
+        measure("mix_pie", "sample", nmix, || {
+            // SAFETY: as above.
+            let o = unsafe {
+                core::slice::from_raw_parts_mut(mpie.as_mut_ptr().cast::<i16>(), NMIX)
+            };
+            rusty_esp_dsp_esp::pie_s3::mix_i16(&iv[..NMIX], &jv[..NMIX], o);
+            Work { samples: nmix, ..Work::ZERO }
+        });
+
+        // --- mono_to_stereo: gated against the MonoToStereo element ---
+        {
+            use rusty_esp_audio_core::elements::MonoToStereo;
+            use rusty_esp_audio_core::pipeline::Element;
+            use rusty_esp_dsp::esp_core::pcm::{PcmBlock, PcmFormat, SampleFormat};
+            use rusty_esp_dsp::esp_core::time::Micros;
+            let f_mono = PcmFormat::new(16_000, 1, SampleFormat::I16).expect("fmt");
+            let half = NMIX / 2; // so the doubled output fits the buffers above
+            let halfu = half as u64;
+            let mut e = MonoToStereo;
+            // SAFETY: byte views of the two aligned scratch buffers.
+            let (sref, spie) = unsafe {
+                (
+                    core::slice::from_raw_parts_mut(msrc.as_mut_ptr().cast::<u8>(), NMIX * 2),
+                    core::slice::from_raw_parts_mut(psrc.as_mut_ptr().cast::<u8>(), NMIX * 2),
+                )
+            };
+            let blk = PcmBlock::new(f_mono, Micros(0), &ibytes[..half * 2]).expect("blk");
+            let _ = e.process(blk, sref).expect("upmix scalar");
+            rusty_esp_dsp_esp::pie_s3::mono_to_stereo_i16(&iv[..half], unsafe {
+                // SAFETY: `spie` is the byte view of an aligned `Vec<u128>`.
+                core::slice::from_raw_parts_mut(spie.as_mut_ptr().cast::<i16>(), NMIX)
+            });
+            println!(
+                "PIEKERNEL mono_to_stereo identical={}",
+                sref[..half * 4] == spie[..half * 4]
+            );
+            measure("upmix_scalar", "sample", halfu, || {
+                let blk = PcmBlock::new(f_mono, Micros(0), &ibytes[..half * 2]).expect("blk");
+                let _ = e.process(blk, sref);
+                Work { samples: halfu, ..Work::ZERO }
+            });
+            measure("upmix_pie", "sample", halfu, || {
+                // SAFETY: as above.
+                let o = unsafe {
+                    core::slice::from_raw_parts_mut(spie.as_mut_ptr().cast::<i16>(), NMIX)
+                };
+                rusty_esp_dsp_esp::pie_s3::mono_to_stereo_i16(&iv[..half], o);
+                Work { samples: halfu, ..Work::ZERO }
+            });
+        }
+
         report_memory("after_pie");
     }
 

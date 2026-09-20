@@ -1027,3 +1027,77 @@ parked. Every twin checks it once and hands anything else to the oracle — the
 same two-arm shape I13 put through the audio elements. And the probe's own
 buffers come from a `Vec<u128>`, because a `Vec<u8>` does not promise it and
 the twin would otherwise take its fallback silently and read FLAT.
+
+## P2 — the PIE campaign closes at 10/10
+
+Five more twins on top of P1's five, every one `identical=true` against its
+scalar oracle in a same-build A/B on the S3.
+
+| kernel | scalar ps/sample | PIE | |
+|---|---:|---:|---:|
+| `dot_i16` | 271,354 | 16,580 | **−93.9%** (16.4×) |
+| `sum_sq_i16_le` | 187,340 | 16,019 | **−91.5%** (11.7×) |
+| `mix_i16` | 108,364 | 19,105 | **−82.4%** (5.7×) |
+| `rms_dbfs_i16` | 215,092 | 43,799 | **−79.6%** (4.9×) |
+| `mono_to_stereo` | 55,259 | 26,626 | **−51.8%** (2.1×) |
+
+Two of these are the SHIPPING path rather than a pre-positioned kernel:
+`rms_dbfs_i16` is what the per-block loop of `xiao-s3-sense-idf-pdm-udp`
+calls after `Pipeline::process`, and it is a wrapper — a `sum_sq_i16_le` and
+an f64 tail — so the twin reuses the tail character for character and is
+bit-identical by construction.
+
+### ★★ ACCX is FORTY bits, and `sum_sq_i16` was right by accident
+
+P1 composed `rur.accx_1` and `rur.accx_0` into a `u64` and gated
+`identical=true`, which reads like proof that the accumulator is 64 bits
+wide. It is not. `dot_i16` — the first kernel here whose result can be
+negative — failed its gate with the LOW word exactly correct (1174948039,
+which is `-3120019257 mod 2^32`) and the high word reading 2559.
+
+A direct probe on accumulators of known value settled it in one flash:
+
+```
+accumulator  -1  ->  accx_0=0xffffffff  accx_1=0x000000ff
+accumulator  +1  ->  accx_0=0x00000001  accx_1=0x00000000
+```
+
+ACCX is 40 bits and `rur.accx_1` delivers bits 32..=39 **zero**-extended.
+Composing the halves as a `u64` is exact only while the accumulator is
+non-negative, which is why a sum of squares got away with it and a dot
+product did not. The general lesson is the sharper half: **a gate that
+passes tells you the kernel is right on the DOMAIN YOU FED IT, and a
+non-negative corpus cannot ask a signed question.** The A/B for `dot_i16`
+therefore builds its second operand to OPPOSE the first, so the running
+total crosses zero and the answer is negative — `negative=true` is printed
+beside `identical=` precisely so a future corpus change cannot quietly
+retire the test.
+
+40 bits is also what bounds the flush batch: 16 instructions × 8 lanes = 128
+products of at most 2^30 peaks at 2^37, leaving 4× headroom.
+
+### The two cheap instructions
+
+**`ee.vadds.s16` IS `mix_i16`.** Eight lanes of saturating add, clamped to
+the i16 range, one instruction, against the scalar arm's widen-add-compare-
+compare-narrow per sample.
+
+**`ee.vzip.16` against a second load of the SAME address is mono→stereo.**
+Zip interleaves two registers; zipping a register with itself duplicates
+every lane. Eight samples become sixteen in five instructions. It is the
+smallest win of the ten (−51.8%) because the scalar arm was already only a
+load and two stores — there was less to remove.
+
+### Two process notes worth more than either kernel
+
+**`str.replace(old, new, 1)` patched the wrong function.** The sign-extension
+fix was written against a line that `sum_sq_i16` and `dot_i16` shared
+verbatim, and the first occurrence is `sum_sq_i16`. The tell was §10's: the
+re-flashed board returned a bit-for-bit identical wrong answer, which is the
+question "is my binary even rebuilding?" It also produced a free reading —
+`sum_sq_i16` gated `identical=true` WITH the sign-extending composition
+applied, which prices the change at zero where it does not matter.
+
+**A dependency appended to the end of a `Cargo.toml` lands under `[lints]`.**
+`libm` for the dBFS tail went in with a blind `>>` and became a lint key. It
+did not fail the build; it would have failed to be a dependency.

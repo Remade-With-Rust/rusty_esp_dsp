@@ -1479,6 +1479,7 @@ dependencies = [
 name = "rusty_esp_dsp-esp"
 version = "0.1.0"
 dependencies = [
+ "libm",
  "rusty_esp_core",
  "rusty_esp_dsp",
 ]

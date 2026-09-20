@@ -491,3 +491,118 @@ pub fn sum_sq_i16_le(samples: &[u8]) -> (i64, usize) {
         _ => rusty_esp_dsp::sample::sum_sq_i16_le(samples),
     }
 }
+
+/// Saturating sum of two i16 streams -- the arithmetic `mix_i16` does.
+///
+/// `ee.vadds.s16` IS this operation: eight lanes, clamped to the i16 range,
+/// one instruction. The scalar arm spends a widen, an add, two compares and
+/// a narrow per sample to reach the same eight values.
+#[allow(unsafe_code)]
+pub fn mix_i16(a: &[i16], b: &[i16], out: &mut [i16]) {
+    let n = a.len().min(b.len()).min(out.len());
+    let body = n / 8 * 8;
+    let vectorable = body > 0
+        && aligned16(a.as_ptr().cast::<u8>())
+        && aligned16(b.as_ptr().cast::<u8>())
+        && aligned16(out.as_ptr().cast::<u8>());
+
+    if vectorable {
+        let mut pa = a.as_ptr().cast::<u8>();
+        let mut pb = b.as_ptr().cast::<u8>();
+        let mut po = out.as_mut_ptr().cast::<u8>();
+        let mut left = body / 8;
+        // SAFETY: each pointer advances by 16 exactly `body / 8` times and
+        // `body` is a multiple of 8 samples no longer than the shortest
+        // slice, so every access stays in bounds. All three are 16-byte
+        // aligned. q0/q1/q2 only.
+        unsafe {
+            core::arch::asm!(
+                "3:",
+                "ee.vld.128.ip q0, {pa}, 16",
+                "ee.vld.128.ip q1, {pb}, 16",
+                "ee.vadds.s16 q2, q0, q1",
+                "ee.vst.128.ip q2, {po}, 16",
+                "addi {n}, {n}, -1",
+                "bnez {n}, 3b",
+                pa = inout(reg) pa,
+                pb = inout(reg) pb,
+                po = inout(reg) po,
+                n = inout(reg) left => _,
+                options(nostack),
+            );
+        }
+        let _ = (pa, pb, po);
+    }
+
+    let start = if vectorable { body } else { 0 };
+    for k in start..n {
+        let s = i32::from(a[k]) + i32::from(b[k]);
+        out[k] = s.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+    }
+}
+
+/// Mono to stereo: every sample twice, in place of one load and two stores.
+///
+/// `ee.vzip.16` interleaves two registers into the pair -- so zipping a
+/// register with a SECOND LOAD OF THE SAME ADDRESS interleaves it with
+/// itself, which is duplication. Eight input samples become sixteen output
+/// samples in five instructions, against the scalar arm's eight loads and
+/// sixteen stores.
+#[allow(unsafe_code)]
+pub fn mono_to_stereo_i16(src: &[i16], dst: &mut [i16]) {
+    let n = src.len().min(dst.len() / 2);
+    let body = n / 8 * 8;
+    let vectorable = body > 0
+        && aligned16(src.as_ptr().cast::<u8>())
+        && aligned16(dst.as_ptr().cast::<u8>());
+
+    if vectorable {
+        let mut ps = src.as_ptr().cast::<u8>();
+        let mut pd = dst.as_mut_ptr().cast::<u8>();
+        let mut left = body / 8;
+        // SAFETY: the source advances 16 bytes and the destination 32 per
+        // trip, `body / 8` times; `body <= n` and `dst` holds `2 * n`
+        // samples, so both stay in bounds. Both are 16-byte aligned.
+        unsafe {
+            core::arch::asm!(
+                "4:",
+                "ee.vld.128.ip q0, {ps}, 0",  // the SAME sixteen bytes into
+                "ee.vld.128.ip q1, {ps}, 16", // both halves of the zip pair
+                "ee.vzip.16 q0, q1",
+                "ee.vst.128.ip q0, {pd}, 16",
+                "ee.vst.128.ip q1, {pd}, 16",
+                "addi {n}, {n}, -1",
+                "bnez {n}, 4b",
+                ps = inout(reg) ps,
+                pd = inout(reg) pd,
+                n = inout(reg) left => _,
+                options(nostack),
+            );
+        }
+        let _ = (ps, pd);
+    }
+
+    let start = if vectorable { body } else { 0 };
+    for k in start..n {
+        dst[k * 2] = src[k];
+        dst[k * 2 + 1] = src[k];
+    }
+}
+
+/// `rms_dbfs_i16` with the reduction on the PIE unit.
+///
+/// The f64 tail is character-for-character the scalar's, operating on the
+/// same `i64` and the same count, so this is bit-identical by construction
+/// and the whole win is [`sum_sq_i16_le`]'s. It is worth its own entry
+/// because this -- not the reduction -- is the function the shipping
+/// firmware's per-block loop calls.
+#[must_use]
+pub fn rms_dbfs_i16(samples: &[u8]) -> f32 {
+    let (acc, n) = sum_sq_i16_le(samples);
+    if n == 0 || acc == 0 {
+        return -120.0;
+    }
+    let mean = acc as f64 / n as f64;
+    let rms = libm::sqrt(mean) / 32768.0;
+    (20.0 * libm::log10(rms)) as f32
+}

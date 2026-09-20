@@ -29,6 +29,8 @@ pie-p4 = []
 [dependencies]
 rusty_esp_dsp = { path = "../rusty_esp_dsp", version = "0.1.0", default-features = false }
 rusty_esp_core = { workspace = true }
+# for `rms_dbfs_i16`'s tail, which must be the scalar's exactly
+libm = { version = "0.2", default-features = false }
 
 [lints]
 workspace = true
