@@ -1492,6 +1492,7 @@ dependencies = [
  "embedded-hal 1.0.0",
  "rusty_esp_core",
  "rusty_esp_dsp",
+ "rusty_esp_dsp-esp",
 ]
 
 [[package]]

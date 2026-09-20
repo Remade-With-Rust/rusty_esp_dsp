@@ -883,14 +883,28 @@ fn main() -> ! {
             core::slice::from_raw_parts(jv.as_ptr().cast::<u8>(), NMIX * 2)
         };
         let mbytes = &ibytes[..NMIX * 2];
-        rusty_esp_audio_core::elements::mix_i16(mbytes, jbytes, mref)
-            .expect("mix scalar");
+        // ORACLE BY ODD OFFSET. Wiring the element to the twin (backlog
+        // A2-A5) turned this gate into a tautology: both sides became the
+        // same code. An output slice at an ODD byte offset makes `as_i16_mut`
+        // refuse it, so the element takes its BYTE arm -- the documented
+        // oracle, which the chip arm never replaces -- and the comparison is
+        // a real one again.
+        let mref_odd = &mut mref[1..1 + (NMIX - 1) * 2];
+        rusty_esp_audio_core::elements::mix_i16(
+            &mbytes[..(NMIX - 1) * 2],
+            &jbytes[..(NMIX - 1) * 2],
+            mref_odd,
+        )
+        .expect("mix oracle");
         rusty_esp_dsp_esp::pie_s3::mix_i16(&iv[..NMIX], &jv[..NMIX], unsafe {
             // SAFETY: `mpie` is the byte view of an aligned `Vec<u128>`.
             core::slice::from_raw_parts_mut(mpie.as_mut_ptr().cast::<i16>(), NMIX)
         });
-        println!("PIEKERNEL mix_i16 identical={}", mref[..] == mpie[..]);
-        measure("mix_scalar", "sample", nmix, || {
+        println!(
+            "PIEKERNEL mix_i16 identical={}",
+            mref[1..1 + (NMIX - 1) * 2] == mpie[..(NMIX - 1) * 2]
+        );
+        measure("mix_element", "sample", nmix, || {
             let _ = rusty_esp_audio_core::elements::mix_i16(mbytes, jbytes, mref);
             Work { samples: nmix, ..Work::ZERO }
         });
@@ -910,7 +924,9 @@ fn main() -> ! {
             use rusty_esp_dsp::esp_core::pcm::{PcmBlock, PcmFormat, SampleFormat};
             use rusty_esp_dsp::esp_core::time::Micros;
             let f_mono = PcmFormat::new(16_000, 1, SampleFormat::I16).expect("fmt");
-            let half = NMIX / 2; // so the doubled output fits the buffers above
+            // One frame fewer than the buffer holds: the oracle arm writes at
+            // an ODD offset (see below), so it needs one spare byte.
+            let half = NMIX / 2 - 1;
             let halfu = half as u64;
             let mut e = MonoToStereo;
             // SAFETY: byte views of the two aligned scratch buffers.
@@ -921,16 +937,20 @@ fn main() -> ! {
                 )
             };
             let blk = PcmBlock::new(f_mono, Micros(0), &ibytes[..half * 2]).expect("blk");
-            let _ = e.process(blk, sref).expect("upmix scalar");
+            // ORACLE BY ODD OFFSET: an output at an odd byte makes
+            // `as_i16_mut` refuse it, so the element takes its BYTE arm --
+            // the oracle the chip arm never replaces. Without this the gate
+            // compares the twin against itself (backlog A2-A5).
+            let _ = e.process(blk, &mut sref[1..]).expect("upmix oracle");
             rusty_esp_dsp_esp::pie_s3::mono_to_stereo_i16(&iv[..half], unsafe {
                 // SAFETY: `spie` is the byte view of an aligned `Vec<u128>`.
                 core::slice::from_raw_parts_mut(spie.as_mut_ptr().cast::<i16>(), NMIX)
             });
             println!(
                 "PIEKERNEL mono_to_stereo identical={}",
-                sref[..half * 4] == spie[..half * 4]
+                sref[1..1 + half * 4] == spie[..half * 4]
             );
-            measure("upmix_scalar", "sample", halfu, || {
+            measure("upmix_element", "sample", halfu, || {
                 let blk = PcmBlock::new(f_mono, Micros(0), &ibytes[..half * 2]).expect("blk");
                 let _ = e.process(blk, sref);
                 Work { samples: halfu, ..Work::ZERO }
@@ -993,16 +1013,20 @@ fn main() -> ! {
                 )
             };
             let blk = PcmBlock::new(f_stereo, Micros(0), &ibytes[..fr * 4]).expect("blk");
-            let _ = e.process(blk, dref).expect("downmix scalar");
+            // ORACLE BY ODD OFFSET: an output at an odd byte makes
+            // `as_i16_mut` refuse it, so the element takes its BYTE arm --
+            // the oracle the chip arm never replaces. Without this the gate
+            // compares the twin against itself (backlog A2-A5).
+            let _ = e.process(blk, &mut dref[1..]).expect("downmix oracle");
             rusty_esp_dsp_esp::pie_s3::stereo_to_mono_i16(&iv[..fr * 2], unsafe {
                 // SAFETY: `dpie` is the byte view of an aligned `Vec<u128>`.
                 core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
             });
             println!(
                 "PIEKERNEL stereo_to_mono identical={}",
-                dref[..fr * 2] == dpie[..fr * 2]
+                dref[1..1 + fr * 2] == dpie[..fr * 2]
             );
-            measure("downmix_scalar", "sample", fru, || {
+            measure("downmix_element", "sample", fru, || {
                 let blk = PcmBlock::new(f_stereo, Micros(0), &ibytes[..fr * 4]).expect("blk");
                 let _ = e.process(blk, dref);
                 Work { samples: fru, ..Work::ZERO }
@@ -1263,7 +1287,7 @@ fn main() -> ! {
                 "PIEKERNEL mix_i16_unaligned identical={}",
                 dref[..mn * 2] == dpie[..mn * 2]
             );
-            measure("mix_un_scalar", "sample", mnu, || {
+            measure("mix_un_element", "sample", mnu, || {
                 let _ = rusty_esp_audio_core::elements::mix_i16(
                     &uabytes[..mn * 2],
                     &ubbytes[..mn * 2],
@@ -1302,7 +1326,7 @@ fn main() -> ! {
                     "PIEKERNEL mono_to_stereo_unaligned identical={}",
                     dref[..hn * 4] == dpie[..hn * 4]
                 );
-                measure("upmix_un_scalar", "sample", hnu, || {
+                measure("upmix_un_element", "sample", hnu, || {
                     let blk =
                         PcmBlock::new(f_mono, Micros(0), &uabytes[..hn * 2]).expect("blk");
                     let _ = up.process(blk, dref);
@@ -1328,7 +1352,7 @@ fn main() -> ! {
                     "PIEKERNEL stereo_to_mono_unaligned identical={}",
                     dref[..hn * 2] == dpie[..hn * 2]
                 );
-                measure("downmix_un_scalar", "sample", hnu, || {
+                measure("downmix_un_element", "sample", hnu, || {
                     let blk =
                         PcmBlock::new(f_stereo, Micros(0), &uabytes[..hn * 4]).expect("blk");
                     let _ = dn.process(blk, dref);
@@ -1530,17 +1554,21 @@ fn main() -> ! {
 
             // aligned
             let blk = PcmBlock::new(f_mono, Micros(0), &ibytes[..gn * 2]).expect("blk");
-            let _ = g.process(blk, dref).expect("gain scalar");
+            // ORACLE BY ODD OFFSET: an output at an odd byte makes
+            // `as_i16_mut` refuse it, so the element takes its BYTE arm --
+            // the oracle the chip arm never replaces. Without this the gate
+            // compares the twin against itself (backlog A2-A5).
+            let _ = g.process(blk, &mut dref[1..]).expect("gain oracle");
             rusty_esp_dsp_esp::pie_s3::gain_i16(&iv[..gn], GQ, unsafe {
                 // SAFETY: `dpie` is the byte view of an aligned `Vec<u128>`.
                 core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
             });
             println!(
                 "PIEKERNEL gain_i16 identical={} align={}",
-                dref[..gn * 2] == dpie[..gn * 2],
+                dref[1..1 + gn * 2] == dpie[..gn * 2],
                 iv.as_ptr() as usize % 16
             );
-            measure("gain_scalar", "sample", gnu, || {
+            measure("gain_element", "sample", gnu, || {
                 let blk = PcmBlock::new(f_mono, Micros(0), &ibytes[..gn * 2]).expect("blk");
                 let _ = g.process(blk, dref);
                 Work { samples: gnu, ..Work::ZERO }
@@ -1568,7 +1596,7 @@ fn main() -> ! {
                 dref[..gn * 2] == dpie[..gn * 2],
                 ua.as_ptr() as usize % 16
             );
-            measure("gain_un_scalar", "sample", gnu, || {
+            measure("gain_un_element", "sample", gnu, || {
                 let blk = PcmBlock::new(f_mono, Micros(0), &uab[..gn * 2]).expect("blk");
                 let _ = g.process(blk, dref);
                 Work { samples: gnu, ..Work::ZERO }
@@ -2262,7 +2290,9 @@ fn main() -> ! {
 #[inline(never)]
 fn pie_rotate90(gd: &[u8], ys: &mut [u8], reference: &mut [u8]) {
     const RW: u32 = 64;
-    const RH: u32 = 32;
+    // 24 not 32: the oracle arm writes at an odd offset and `reference`
+    // is exactly NPX bytes, so the full 64x32 would not fit.
+    const RH: u32 = 24;
     let rn = (RW as usize) * (RH as usize);
     println!(
         "PIEPRECOND rotate90 w%8={} h%8={} src_align={} dst_align={}",
@@ -2271,11 +2301,14 @@ fn pie_rotate90(gd: &[u8], ys: &mut [u8], reference: &mut [u8]) {
         gd.as_ptr() as usize % 16,
         ys.as_ptr() as usize % 16
     );
-    let _ = rusty_esp_image_core::ops::rotate90_gray8(&gd[..rn], RW, RH, &mut reference[..rn]);
+    // ORACLE BY UNALIGNED DESTINATION: the chip arm needs a 16-byte aligned
+    // `dst` and declines otherwise, so `reference[1..]` takes the tiled
+    // scalar loop -- the oracle -- while the twin runs on aligned buffers.
+    let _ = rusty_esp_image_core::ops::rotate90_gray8(&gd[..rn], RW, RH, &mut reference[1..]);
     let _ = rusty_esp_dsp_esp::pie_s3::rotate90_gray8(&gd[..rn], RW, RH, &mut ys[..rn]);
     println!(
         "PIEKERNEL rotate90_gray8 identical={}",
-        reference[..rn] == ys[..rn]
+        reference[1..1 + rn] == ys[..rn]
     );
     let rnu = rn as u64;
     measure("rot90_scalar", "px", rnu, || {

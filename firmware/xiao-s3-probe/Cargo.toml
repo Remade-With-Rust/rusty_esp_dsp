@@ -43,7 +43,7 @@ rusty_esp_audio-core = { path = "../../../rusty_esp_audio/crates/rusty_esp_audio
 # `push` folds a 50-frame window, so both are real per-frame work.
 rusty_esp_signal-core = { path = "../../../rusty_esp_signal/crates/rusty_esp_signal-core", default-features = false, features = ["alloc"] }
 # The three pixel kernels the DSP crate did NOT take: crop, rotate90, rotate180.
-rusty_esp_image-core = { path = "../../../rusty_esp_image/crates/rusty_esp_image-core", default-features = false, features = ["alloc"] }
+rusty_esp_image-core = { path = "../../../rusty_esp_image/crates/rusty_esp_image-core", default-features = false, features = ["alloc", "pie-s3"] }
 
 [features]
 # The allocator arm. Exactly one, and the default is esp-hal's standard so
