@@ -1696,3 +1696,154 @@ fn gain_i16_unaligned_src(src: &[i16], c: &[i16; 4], dst: &mut [i16]) -> usize {
     let _ = (ps, pd);
     body
 }
+
+/// `convert` I16 -> I32 (and I16 -> I24In32, which is the same rule).
+///
+/// The scalar writes `(i32::from(x)) << 16`. On a little-endian machine that
+/// value's four bytes are `[0, 0, lo(x), hi(x)]` -- which is exactly `x`
+/// interleaved with a ZERO halfword in the low position. So the shift, the
+/// sign-extension and the widening are all one `ee.vzip.16` against a zeroed
+/// register, and no shift instruction is involved at all.
+///
+/// `ee.vzip.16` writes BOTH registers of the pair, so one zip produces all
+/// eight results: the zeroed register comes back holding the first four and
+/// the source register the second four. Five instructions for eight samples,
+/// against a scalar arm that marshals two bytes in and four bytes out each.
+#[allow(unsafe_code)]
+pub fn convert_i16_to_i32(src: &[i16], dst: &mut [i32]) {
+    let n = src.len().min(dst.len());
+    let body = n / 8 * 8;
+    let vectorable = body > 0
+        && aligned16(src.as_ptr().cast::<u8>())
+        && aligned16(dst.as_ptr().cast::<u8>());
+
+    if vectorable {
+        let mut ps = src.as_ptr().cast::<u8>();
+        let mut pd = dst.as_mut_ptr().cast::<u8>();
+        let mut left = body / 8;
+        // SAFETY: eight samples a trip -- 16 bytes read, 32 written --
+        // `body / 8` times, and `body` is within both slices. Both are
+        // 16-byte aligned. q0 and q1 only.
+        unsafe {
+            core::arch::asm!(
+                "19:",
+                "ee.vld.128.ip q0, {ps}, 16",
+                "ee.zero.q q1",
+                "ee.vzip.16 q1, q0",         // [0,x0,0,x1,..] = x<<16 per i32
+                "ee.vst.128.ip q1, {pd}, 16",
+                "ee.vst.128.ip q0, {pd}, 16",
+                "addi {n}, {n}, -1",
+                "bnez {n}, 19b",
+                ps = inout(reg) ps,
+                pd = inout(reg) pd,
+                n = inout(reg) left => _,
+                options(nostack),
+            );
+        }
+        let _ = (ps, pd);
+    }
+
+    let start = if vectorable { body } else { 0 };
+    for k in start..n {
+        dst[k] = i32::from(src[k]) << 16;
+    }
+}
+
+/// `convert` I32 -> I16 (and I24In32 -> I16).
+///
+/// The scalar writes `(x >> 16) as i16`, an ARITHMETIC shift followed by a
+/// truncation -- which together are simply the HIGH halfword of each i32.
+/// `ee.vunzip.16` splits a register pair into even and odd 16-bit lanes, and
+/// on a little-endian machine the odd lanes ARE the high halves. One
+/// instruction, no shift, and the sign comes along because it was never
+/// separated from the value.
+#[allow(unsafe_code)]
+pub fn convert_i32_to_i16(src: &[i32], dst: &mut [i16]) {
+    let n = src.len().min(dst.len());
+    let body = n / 8 * 8;
+    let vectorable = body > 0
+        && aligned16(src.as_ptr().cast::<u8>())
+        && aligned16(dst.as_ptr().cast::<u8>());
+
+    if vectorable {
+        let mut ps = src.as_ptr().cast::<u8>();
+        let mut pd = dst.as_mut_ptr().cast::<u8>();
+        let mut left = body / 8;
+        // SAFETY: eight samples a trip -- 32 bytes read, 16 written --
+        // `body / 8` times, within both slices, both 16-byte aligned.
+        // q0 and q1 only.
+        unsafe {
+            core::arch::asm!(
+                "20:",
+                "ee.vld.128.ip q0, {ps}, 16",
+                "ee.vld.128.ip q1, {ps}, 16",
+                "ee.vunzip.16 q0, q1",       // q1 = the eight high halfwords
+                "ee.vst.128.ip q1, {pd}, 16",
+                "addi {n}, {n}, -1",
+                "bnez {n}, 20b",
+                ps = inout(reg) ps,
+                pd = inout(reg) pd,
+                n = inout(reg) left => _,
+                options(nostack),
+            );
+        }
+        let _ = (ps, pd);
+    }
+
+    let start = if vectorable { body } else { 0 };
+    for k in start..n {
+        dst[k] = (src[k] >> 16) as i16;
+    }
+}
+
+/// `convert` I32 -> I24In32: keep the top three bytes, zero the low one.
+///
+/// The scalar writes `[0, i[1], i[2], i[3]]`, which is a mask. The mask
+/// itself is BUILT rather than loaded: all-ones shifted left by eight in
+/// 32-bit lanes is `0xffff_ff00`, and both halves of that are instructions
+/// this module has measured.
+#[allow(unsafe_code)]
+pub fn convert_i32_to_i24in32(src: &[i32], dst: &mut [i32]) {
+    let n = src.len().min(dst.len());
+    let body = n / 4 * 4;
+    let vectorable = body > 0
+        && aligned16(src.as_ptr().cast::<u8>())
+        && aligned16(dst.as_ptr().cast::<u8>());
+
+    if vectorable {
+        let mut ps = src.as_ptr().cast::<u8>();
+        let mut pd = dst.as_mut_ptr().cast::<u8>();
+        let mut left = body / 4;
+        // SAFETY: four samples a trip -- 16 bytes read and written --
+        // `body / 4` times, within both slices, both 16-byte aligned.
+        // q0, q6 and q7 only; SAR is restored.
+        unsafe {
+            core::arch::asm!(
+                "rsr.sar {sar}",
+                "ee.zero.q q6",
+                "ee.vcmp.eq.s16 q7, q6, q6", // all ones
+                "ssai 8",
+                "ee.vsl.32 q7, q7",          // 0xffff_ff00 per 32-bit lane
+                "21:",
+                "ee.vld.128.ip q0, {ps}, 16",
+                "ee.andq q0, q0, q7",
+                "ee.vst.128.ip q0, {pd}, 16",
+                "addi {n}, {n}, -1",
+                "bnez {n}, 21b",
+                "wsr.sar {sar}",
+                ps = inout(reg) ps,
+                pd = inout(reg) pd,
+                n = inout(reg) left => _,
+                sar = out(reg) _,
+                options(nostack),
+            );
+        }
+        let _ = (ps, pd);
+    }
+
+    let start = if vectorable { body } else { 0 };
+    for k in start..n {
+        let b = src[k].to_le_bytes();
+        dst[k] = i32::from_le_bytes([0, b[1], b[2], b[3]]);
+    }
+}
