@@ -22,19 +22,35 @@ ledger P4).
 is a seam. The dsp seam itself was in this state for the entire campaign
 (fifty-seven twins, no caller) until it was wired.
 
-| # | call site | crate | twin | measured | status |
-|---|---|---|---|---:|---|
-| A1 | `rms_dbfs_i16` | `rusty_esp_audio-core` | `pie_s3::rms_dbfs_i16` | −79.6% | **shipping firmware calls this per block** |
-| A2 | `Gain::process` | `rusty_esp_audio-core` | `pie_s3::gain_i16` | −82.0% | |
-| A3 | `StereoToMono::process` | `rusty_esp_audio-core` | `pie_s3::stereo_to_mono_i16` | −60.5% | |
-| A4 | `MonoToStereo::process` | `rusty_esp_audio-core` | `pie_s3::mono_to_stereo_i16` | −51.8% | |
-| A5 | `mix_i16` | `rusty_esp_audio-core` | `pie_s3::mix_i16` | −82.4% | |
-| A6 | `peak_abs_i16` | `rusty_esp_audio-core` | `pie_s3::peak_abs_i16` | −85.7% | re-export of the scalar |
-| A7 | `sample::pcm::convert` integer arms | `rusty_esp_dsp` | `pie_s3::convert_*` | −85% to −92% | its own fast arms bypass the twins |
-| A8 | `rotate90_gray8` | `rusty_esp_image-core` | `pie_s3::rotate90_gray8` | −95.4% | |
+**ALL EIGHT DONE.** Each row is the CALL SITE measured before and after, on
+an ESP32-S3, not the kernel in isolation — so these are delivered numbers.
 
-Neither `rusty_esp_audio` nor `rusty_esp_image` depends on
-`rusty_esp_dsp-esp` at all today.
+| # | call site | crate | before | after | |
+|---|---|---|---:|---:|---:|
+| A1 | `rms_dbfs_i16` | `rusty_esp_audio-core` | 215,142 | 38,312 | **−82.2%** |
+| A2 | `Gain::process` | `rusty_esp_audio-core` | 134,920 | 27,896 | **−79.3%** |
+| A3 | `StereoToMono::process` | `rusty_esp_audio-core` | 96,008 | 42,897 | **−55.3%** |
+| A4 | `MonoToStereo::process` | `rusty_esp_audio-core` | 55,259 | 27,165 | **−50.8%** |
+| A5 | `mix_i16` | `rusty_esp_audio-core` | 108,364 | 16,783 | **−84.5%** |
+| A6 | `peak_abs_i16` | `rusty_esp_audio-core` | 78,259 | 10,272 | **−86.9%** |
+| A7 | `Convert::process` int pairs | `rusty_esp_audio-core` | 193,418 | 29,240 | **−84.9%** |
+| A8 | `rotate90_gray8` | `rusty_esp_image-core` | 201,137 | 12,329 | **−93.9%** |
+
+A1 is the one that matters most: the shipping PDM firmware calls it once per
+captured block.
+
+Each is behind an off-by-default `pie-s3` feature, dispatched by a helper
+whose BOTH arms exist — off-chip or feature-off it returns `false`/`None`
+from a const-foldable body, so the scalar stays visible as the oracle and is
+never dead code. A7 needed `as_i32`/`as_i32_mut` added to `rusty_esp_core`.
+
+**Wiring these broke five of the probe's gates and it took a deliberate look
+to notice.** Once an element routes to the twin, a gate comparing the
+element against the twin is comparing the twin with itself — and it keeps
+printing `identical=true`. Each is now forced onto an arm the chip path
+cannot take: an output at an ODD byte offset (so `as_i16_mut` refuses it and
+the element runs its byte arm) or, for `rotate90_gray8`, an unaligned
+destination its chip arm declines by precondition.
 
 ## Tier B — no twin, and worth building
 

@@ -1832,6 +1832,7 @@ fn main() -> ! {
         pie_rotate90(gd, ys, &mut reference);
         pie_seam_reach(iv, gd, ys);
         pie_audio_reach(ibytes, iv);
+        pie_convert_reach(ibytes);
         pie_fused_family_probe();
 
         report_memory("after_pie");
@@ -2720,5 +2721,53 @@ fn pie_audio_reach(ibytes: &[u8], iv: &[i16]) {
     measure("audio_peak", "sample", n, || {
         core::hint::black_box(rusty_esp_audio_core::peak_abs_i16(iv));
         Work { samples: n, ..Work::ZERO }
+    });
+}
+
+/// Does the `Convert` ELEMENT reach the integer twins? (backlog A7)
+///
+/// The element's own fast arms are i16<->f32, which PIE cannot touch; the
+/// INTEGER pairs went through the generic per-sample table. The oracle arm
+/// here is forced the same way the audio gates are: an output at an odd byte
+/// offset makes `as_i32_mut` refuse it, so the element falls through to that
+/// table -- which the chip arm never replaces.
+#[inline(never)]
+fn pie_convert_reach(ibytes: &[u8]) {
+    use rusty_esp_audio_core::elements::Convert;
+    use rusty_esp_audio_core::pipeline::Element;
+    use rusty_esp_dsp::esp_core::pcm::{PcmBlock, PcmFormat, SampleFormat};
+    use rusty_esp_dsp::esp_core::time::Micros;
+
+    const CN: usize = 240;
+    let f16 = PcmFormat::new(16_000, 1, SampleFormat::I16).expect("fmt");
+    let mut c = Convert::to(SampleFormat::I32);
+    let mut wired: alloc::vec::Vec<u128> = alloc::vec![0; CN / 4 + 2];
+    // SAFETY: a `Vec<u128>` is 16-byte aligned and initialised; the byte view
+    // is a reinterpretation of POD and is long enough for `CN` i32 plus the
+    // one spare byte the odd-offset oracle needs.
+    let wb = unsafe {
+        core::slice::from_raw_parts_mut(wired.as_mut_ptr().cast::<u8>(), CN * 4 + 8)
+    };
+    let mut oracle = alloc::vec![0u8; CN * 4 + 8];
+
+    let blk = PcmBlock::new(f16, Micros(0), &ibytes[..CN * 2]).expect("blk");
+    let nw = c.process(blk, wb).expect("convert wired");
+    let blk = PcmBlock::new(f16, Micros(0), &ibytes[..CN * 2]).expect("blk");
+    let no = c.process(blk, &mut oracle[1..]).expect("convert oracle");
+    println!(
+        "PIECONVERT i16->i32 agree={} n_wired={nw} n_oracle={no}",
+        wb[..nw] == oracle[1..1 + no]
+    );
+
+    let cnu = CN as u64;
+    measure("cvt_element", "sample", cnu, || {
+        let blk = PcmBlock::new(f16, Micros(0), &ibytes[..CN * 2]).expect("blk");
+        let _ = c.process(blk, wb);
+        Work { samples: cnu, ..Work::ZERO }
+    });
+    measure("cvt_element_oracle", "sample", cnu, || {
+        let blk = PcmBlock::new(f16, Micros(0), &ibytes[..CN * 2]).expect("blk");
+        let _ = c.process(blk, &mut oracle[1..]);
+        Work { samples: cnu, ..Work::ZERO }
     });
 }
