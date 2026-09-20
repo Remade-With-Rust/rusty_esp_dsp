@@ -150,6 +150,25 @@ cargo test --workspace
 cargo check -p rusty_esp_dsp --no-default-features --target riscv32imac-unknown-none-elf
 ```
 
+## Changed in 0.1.1: `rms_dbfs_i16` is single precision
+
+Worth stating rather than burying, because it changes output.
+
+The float tail was `f64`. The ESP32-S3's FPU is **single precision**, so its
+divide, `sqrt` and `log10` were all software routines — about 48% of the one
+audio block that ships, for digits nothing reads. It is `f32` now, via
+`20·log10(√m / 32768) = 10·log10(m) − 20·log10(32768)`, which drops the
+square root outright.
+
+**Results move by at most 1.526e-5 dB**, and that bound is not a sample: the
+tail takes one number, so its domain is enumerable, and the test walks
+**every one of the 520,093,697 inputs it can ever receive**. A VAD threshold
+is whole dB and a log line prints one decimal, so the change is orders below
+anything that consumes it.
+
+The new `sample::dbfs_from_mean_square` is that tail as a public function —
+one definition, so the scalar and the PIE twin cannot drift apart.
+
 ## Part of Janus
 
 **Janus** rebuilds the Espressif ESP32 and Arduino application portfolio as
