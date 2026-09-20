@@ -1802,6 +1802,7 @@ fn main() -> ! {
         }
 
         pie_rotate90(gd, ys, &mut reference);
+        pie_fused_family_probe();
 
         report_memory("after_pie");
     }
@@ -2422,4 +2423,188 @@ fn pie_fused_probe() {
         println!("P5 src.q sar8 self     {bytes:02x?} (want 08..0f,00..07)");
     }
     println!("P5 == end ==");
+}
+
+/// The FUSED-OP FAMILIES, read off the silicon.
+///
+/// The ISA table in `lib/xtensa_esp32s3.so` lists 217 `ee.*` mnemonics, 108
+/// of them carrying a fused load or store. They are only about a dozen
+/// FAMILIES -- the rest are type variants -- and the earlier refutation
+/// (ledger P6) tested exactly one of them: ALU-plus-LOAD, in loops that were
+/// load-bound. These are the families that could still pay, because each
+/// removes something OTHER than an issue slot on a load port.
+#[inline(never)]
+fn pie_fused_family_probe() {
+    #[repr(align(16))]
+    struct B([u8; 64]);
+    #[repr(align(16))]
+    struct Q([u8; 16]);
+    let ramp = B({
+        let mut a = [0u8; 64];
+        let mut i = 0;
+        while i < 64 {
+            a[i] = i as u8;
+            i += 1;
+        }
+        a
+    });
+
+    // 1. `ee.src.q.ld.ip qu, as, imm, qx, qy` -- the unaligned funnel fused
+    //    with the next block load. Every unaligned arm in this module spends
+    //    `ee.ld.128.usar.ip` + `ee.src.q` per window; if this does both, that
+    //    halves the per-window cost of TWELVE kernels. Which register
+    //    receives the funnel is not guessable, so print all three.
+    {
+        let (mut o0, mut o1, mut o2) = (Q([0; 16]), Q([0; 16]), Q([0; 16]));
+        let mut ptr = unsafe { ramp.0.as_ptr().add(32) };
+        let at3 = unsafe { ramp.0.as_ptr().add(3) };
+        // SAFETY: all reads are inside `ramp`'s 64 bytes; three aligned
+        // 16-byte writes. q0-q2 only.
+        unsafe {
+            core::arch::asm!(
+                "ee.ld.128.usar.ip q3, {a3}, 0",   // sets SAR_BYTE = 3
+                "ee.vld.128.ip q1, {base}, 16",    // q1 = bytes 00..0f
+                "ee.vld.128.ip q2, {base}, 0",     // q2 = bytes 10..1f
+                "ee.src.q.ld.ip q0, {p}, 16, q1, q2",
+                "ee.vst.128.ip q0, {p0}, 0",
+                "ee.vst.128.ip q1, {p1}, 0",
+                "ee.vst.128.ip q2, {p2}, 0",
+                a3 = inout(reg) at3 => _,
+                base = inout(reg) ramp.0.as_ptr() => _,
+                p = inout(reg) ptr,
+                p0 = inout(reg) o0.0.as_mut_ptr() => _,
+                p1 = inout(reg) o1.0.as_mut_ptr() => _,
+                p2 = inout(reg) o2.0.as_mut_ptr() => _,
+                options(nostack),
+            );
+        }
+        println!("P7 src.q.ld.ip q0={:02x?}", o0.0);
+        println!("P7               q1={:02x?}", o1.0);
+        println!("P7               q2={:02x?}", o2.0);
+        println!(
+            "P7               ptr+{} (funnel of q1,q2 at SAR_BYTE=3 would be 03..12)",
+            ptr as usize - unsafe { ramp.0.as_ptr().add(32) } as usize
+        );
+    }
+
+    // 2. `ee.vadds.s16.st.incp qu, as, qd, qx, qy` -- ALU plus STORE. The
+    //    refuted family removed a load; this removes a STORE, which is a
+    //    different port. Element-wise writers are where it would pay.
+    {
+        #[repr(align(16))]
+        struct S([i16; 8]);
+        let xa = S([1, 2, 3, 4, 5, 6, 7, 8]);
+        let yb = S([10, 10, 10, 10, 10, 10, 10, 10]);
+        let mut mem = S([0; 8]);
+        let (mut od, mut ou) = (Q([0; 16]), Q([0; 16]));
+        let mut ptr = mem.0.as_mut_ptr().cast::<u8>();
+        // SAFETY: two aligned 16-byte reads, one aligned 16-byte store
+        // through the instruction, two aligned 16-byte writes.
+        unsafe {
+            core::arch::asm!(
+                "ee.vld.128.ip q1, {px}, 0",
+                "ee.vld.128.ip q2, {py}, 0",
+                "ee.zero.q q0",
+                "ee.zero.q q3",
+                "ee.vadds.s16.st.incp q0, {p}, q3, q1, q2",
+                "ee.vst.128.ip q3, {od}, 0",
+                "ee.vst.128.ip q0, {ou}, 0",
+                px = inout(reg) xa.0.as_ptr() => _,
+                py = inout(reg) yb.0.as_ptr() => _,
+                p = inout(reg) ptr,
+                od = inout(reg) od.0.as_mut_ptr() => _,
+                ou = inout(reg) ou.0.as_mut_ptr() => _,
+                options(nostack),
+            );
+        }
+        println!(
+            "P7 vadds.st.incp mem={:?} qd={:02x?}",
+            mem.0, od.0
+        );
+        println!(
+            "P7               qu={:02x?} ptr+{}",
+            ou.0,
+            ptr as usize - mem.0.as_ptr() as usize
+        );
+    }
+
+    // 3. `ee.ldqa.u8.128.ip as, imm` -- no q operand at all, so it loads
+    //    straight into QACC, widening as it goes. SAD and the gray downscale
+    //    both widen bytes with `ee.vzip.8` against zero; this would delete
+    //    that step. Read QACC back with `ee.srcmb` at shift 0.
+    {
+        let mut got = Q([0; 16]);
+        let mut ptr = ramp.0.as_ptr();
+        // SAFETY: one 16-byte read inside `ramp`, one aligned write.
+        unsafe {
+            core::arch::asm!(
+                "ee.zero.qacc",
+                "ee.ldqa.u8.128.ip {p}, 16",
+                "ee.srcmb.s16.qacc q0, {sh}, 0",
+                "ee.vst.128.ip q0, {o}, 0",
+                p = inout(reg) ptr,
+                sh = in(reg) 0u32,
+                o = inout(reg) got.0.as_mut_ptr() => _,
+                options(nostack),
+            );
+        }
+        println!(
+            "P7 ldqa.u8.128   qacc_lo8={:02x?} ptr+{}",
+            got.0,
+            ptr as usize - ramp.0.as_ptr() as usize
+        );
+    }
+
+    // 4. `ee.srs.accx at, as, sel` -- shift ACCX into a GENERAL register.
+    //    Every reduction here reads ACCX with two `rur`s and then rebuilds a
+    //    40-bit value by hand; if this returns the shifted accumulator
+    //    directly it replaces all of that.
+    {
+        #[repr(align(16))]
+        struct S([i16; 8]);
+        let xa = S([1, 2, 3, 4, 5, 6, 7, 8]);
+        let yb = S([10, 10, 10, 10, 10, 10, 10, 10]);
+        let (r0, r2): (u32, u32);
+        // SAFETY: two aligned 16-byte reads; no writes.
+        unsafe {
+            core::arch::asm!(
+                "ee.zero.accx",
+                "ee.vld.128.ip q1, {px}, 0",
+                "ee.vld.128.ip q2, {py}, 0",
+                "ee.vmulas.s16.accx q1, q2",   // ACCX = 360
+                "ee.srs.accx {a}, {s0}, 0",
+                "ee.srs.accx {b}, {s2}, 0",
+                px = inout(reg) xa.0.as_ptr() => _,
+                py = inout(reg) yb.0.as_ptr() => _,
+                a = out(reg) r0,
+                b = out(reg) r2,
+                s0 = in(reg) 0u32,
+                s2 = in(reg) 2u32,
+                options(nostack),
+            );
+        }
+        println!("P7 srs.accx sh0={r0} sh2={r2} (ACCX=360, so want 360 and 90)");
+    }
+
+    // 5. `ee.mov.u8.qacc q0` -- a widening MOVE into QACC, the register-side
+    //    twin of `ldqa`.
+    {
+        let mut got = Q([0; 16]);
+        // SAFETY: one aligned 16-byte read and one aligned write.
+        unsafe {
+            core::arch::asm!(
+                "ee.zero.qacc",
+                "ee.vld.128.ip q1, {p}, 0",
+                "ee.mov.u8.qacc q1",
+                "ee.srcmb.s16.qacc q0, {sh}, 0",
+                "ee.vst.128.ip q0, {o}, 0",
+                p = inout(reg) ramp.0.as_ptr() => _,
+                sh = in(reg) 0u32,
+                o = inout(reg) got.0.as_mut_ptr() => _,
+                options(nostack),
+            );
+        }
+        println!("P7 mov.u8.qacc   qacc_lo8={:02x?}", got.0);
+    }
+    println!("P7 == end ==");
 }

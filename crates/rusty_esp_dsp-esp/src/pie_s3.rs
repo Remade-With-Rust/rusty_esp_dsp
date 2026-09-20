@@ -91,7 +91,7 @@ pub fn yuyv_to_gray8(src: &[u8], dst: &mut [u8]) -> Result<usize> {
         //
         // Sixteen pixels short of the end, because producing the last
         // window reads the aligned block containing its last byte.
-        let ub = (pixels - 16) / 32 * 32;
+        let ub = if pixels < 64 { 0 } else { (pixels - 16) / 48 * 48 };
         simd_even_bytes_unaligned_src(&src[..ub * 2], &mut dst[..ub]);
         ub
     } else {
@@ -594,8 +594,9 @@ pub fn sum_sq_i16_le(samples: &[u8]) -> (i64, usize) {
 #[allow(unsafe_code)]
 pub fn mix_i16(a: &[i16], b: &[i16], out: &mut [i16]) {
     let n = a.len().min(b.len()).min(out.len());
-    // NOT the fused `ee.vadds.s16.ld.incp`, which measured +64.6% here --
-    // the worst of the three fused forms tried. See the P6 refutation.
+    // NOT any of the ALU-fused forms. `ee.vadds.s16.ld.incp` measured
+    // +64.6% here and `ee.vadds.s16.st.incp` +57% -- the family is slow
+    // whether it absorbs the load or the store. See the P7 refutation.
     let body = n / 16 * 16;
     let vectorable = body > 0
         && aligned16(a.as_ptr().cast::<u8>())
@@ -968,18 +969,24 @@ fn sum_sq_i16_unaligned(a: &[i16]) -> i64 {
     if n < UNALIGNED_TAIL + 16 {
         return rusty_esp_dsp::sample::sum_sq_i16(a);
     }
-    // Widened, and with DISJOINT registers for the two halves. Reusing the
-    // same window register would make the second `ee.src.q` wait for the
-    // first half's read of it -- a false dependency, which is the shape that
-    // made `gain_i16` slower when it was widened.
-    let body = (n - UNALIGNED_TAIL) / 32 * 32;
+    // FUSED FUNNEL: `ee.src.q.ld.ip qu, as, imm, qx, qy` does the
+    // unaligned funnel AND the next block's load in one instruction --
+    // measured on the part, `qx` receives `funnel(qx, qy)` and `qu` receives
+    // `[as]`. That is one instruction per window where the idiom used two.
+    //
+    // It needs a THREE-register rotation to close: starting from
+    // `(q0, q1) = (block k, block k+1)`, three of these leave
+    // `(q0, q1) = (block k+3, block k+4)` -- the same shape -- with the
+    // three windows landing in q0, q1 and q2 in turn. So a trip is three
+    // windows, 24 samples.
+    let body = if n < 40 { 0 } else { (n - 16) / 24 * 24 };
     let mut total: i64 = 0;
     let mut p = a.as_ptr().cast::<u8>();
-    let mut left = body / 32;
+    let mut left = body / 24;
 
     while left > 0 {
-        // FOUR trips = sixteen MACs = 128 products, peaking at 2^37.
-        let batch = left.min(4);
+        // FIVE trips = fifteen MACs = 120 products, peaking under 2^37.
+        let batch = left.min(5);
         left -= batch;
         let (lo, hi): (u32, u32);
         // SAFETY: the loop consumes 64 bytes a trip and reads at most one
@@ -990,20 +997,15 @@ fn sum_sq_i16_unaligned(a: &[i16]) -> i64 {
             core::arch::asm!(
                 "rsr.sar {sar}",
                 "ee.zero.accx",
-                "ee.ld.128.usar.ip q0, {p}, 16",
+                "ee.ld.128.usar.ip q0, {p}, 16",   // sets SAR_BYTE, q0 = block k
+                "ee.vld.128.ip q1, {p}, 16",       // q1 = block k+1
                 "7:",
-                "ee.ld.128.usar.ip q1, {p}, 16",
-                "ee.src.q q2, q0, q1",
+                "ee.src.q.ld.ip q2, {p}, 16, q0, q1", // q0 = window, q2 = next
+                "ee.vmulas.s16.accx q0, q0",
+                "ee.src.q.ld.ip q0, {p}, 16, q1, q2",
+                "ee.vmulas.s16.accx q1, q1",
+                "ee.src.q.ld.ip q1, {p}, 16, q2, q0",
                 "ee.vmulas.s16.accx q2, q2",
-                "ee.ld.128.usar.ip q0, {p}, 16",
-                "ee.src.q q3, q1, q0",
-                "ee.vmulas.s16.accx q3, q3",
-                "ee.ld.128.usar.ip q1, {p}, 16",
-                "ee.src.q q5, q0, q1",
-                "ee.vmulas.s16.accx q5, q5",
-                "ee.ld.128.usar.ip q0, {p}, 16",
-                "ee.src.q q6, q1, q0",
-                "ee.vmulas.s16.accx q6, q6",
                 "addi {n}, {n}, -1",
                 "bnez {n}, 7b",
                 "rur.accx_0 {l}",
@@ -1020,7 +1022,7 @@ fn sum_sq_i16_unaligned(a: &[i16]) -> i64 {
         // Non-negative, so the 40-bit composition needs no sign extension.
         total += (((u64::from(hi) & 0xff) << 32) | u64::from(lo)) as i64;
         // Each trip consumed 32 bytes but left the pointer one block ahead.
-        p = unsafe { a.as_ptr().cast::<u8>().add((body / 32 - left) * 64) };
+        p = unsafe { a.as_ptr().cast::<u8>().add((body / 24 - left) * 48) };
     }
 
     for &x in &a[body..] {
@@ -1041,15 +1043,18 @@ fn peak_abs_i16_unaligned(a: &[i16]) -> u16 {
     if n < UNALIGNED_TAIL + 16 {
         return rusty_esp_dsp::sample::peak_abs_i16(a);
     }
-    // Widened, and with DISJOINT registers for the two halves. Reusing the
-    // same window register would make the second `ee.src.q` wait for the
-    // first half's read of it -- a false dependency, which is the shape that
-    // made `gain_i16` slower when it was widened.
-    let body = (n - UNALIGNED_TAIL) / 32 * 32;
+    // FUSED FUNNEL: `ee.src.q.ld.ip qu, as, imm, qx, qy` does the unaligned
+    // funnel AND the next block's load in one instruction -- `qx` receives
+    // `funnel(qx, qy)` and `qu` receives `[as]`. It also replaces the slower
+    // `ee.ld.128.usar.ip` with a plain load, since SAR_BYTE only has to be
+    // set once for a stream. Three of these close a register rotation:
+    // from `(q0, q1) = (block k, block k+1)` they leave `(block k+3,
+    // block k+4)`, with the windows landing in q0, q1, q2 in turn.
+    let body = if n < 40 { 0 } else { (n - 16) / 24 * 24 };
     let mut maxes = [0i16; 8];
     let mut mins = [0i16; 8];
     let mut p = a.as_ptr().cast::<u8>();
-    let mut left = body / 32;
+    let mut left = body / 24;
     // SAFETY: as for `sum_sq_i16_unaligned` -- 32 bytes consumed a trip and
     // at most one block read beyond, which `UNALIGNED_TAIL` reserves. The
     // two output buffers are 16 bytes each. q0-q4 only; SAR is restored.
@@ -1059,23 +1064,18 @@ fn peak_abs_i16_unaligned(a: &[i16]) -> u16 {
             "ee.zero.q q3",                 // running lane-wise maximum
             "ee.zero.q q4",                 // running lane-wise minimum
             "ee.ld.128.usar.ip q0, {p}, 16",
+            "ee.ld.128.usar.ip q0, {p}, 16",   // sets SAR_BYTE, q0 = block k
+            "ee.vld.128.ip q1, {p}, 16",       // q1 = block k+1
             "8:",
-            "ee.ld.128.usar.ip q1, {p}, 16",
-            "ee.src.q q2, q0, q1",
+            "ee.src.q.ld.ip q2, {p}, 16, q0, q1",
+            "ee.vmax.s16 q3, q3, q0",
+            "ee.vmin.s16 q4, q4, q0",
+            "ee.src.q.ld.ip q0, {p}, 16, q1, q2",
+            "ee.vmax.s16 q3, q3, q1",
+            "ee.vmin.s16 q4, q4, q1",
+            "ee.src.q.ld.ip q1, {p}, 16, q2, q0",
             "ee.vmax.s16 q3, q3, q2",
             "ee.vmin.s16 q4, q4, q2",
-            "ee.ld.128.usar.ip q0, {p}, 16",
-            "ee.src.q q5, q1, q0",
-            "ee.vmax.s16 q3, q3, q5",
-            "ee.vmin.s16 q4, q4, q5",
-            "ee.ld.128.usar.ip q1, {p}, 16",
-            "ee.src.q q6, q0, q1",
-            "ee.vmax.s16 q3, q3, q6",
-            "ee.vmin.s16 q4, q4, q6",
-            "ee.ld.128.usar.ip q0, {p}, 16",
-            "ee.src.q q7, q1, q0",
-            "ee.vmax.s16 q3, q3, q7",
-            "ee.vmin.s16 q4, q4, q7",
             "addi {n}, {n}, -1",
             "bnez {n}, 8b",
             "ee.vst.128.ip q3, {mx}, 0",
@@ -1356,11 +1356,17 @@ fn simd_even_bytes_unaligned_src(src: &[u8], dst: &mut [u8]) {
 
     let mut s = src.as_ptr();
     let mut d = dst.as_mut_ptr();
-    // Widened, and with DISJOINT registers for the two halves. Reusing the
-    // same window register would make the second `ee.src.q` wait for the
-    // first half's read of it -- a false dependency, which is the shape that
-    // made `gain_i16` slower when it was widened.
-    let mut left = dst.len() / 32;
+    // FUSED FUNNEL, applied on the measured gate. `ee.src.q.ld.ip` pays when
+    // the per-window body is small: counting non-fused instructions `x` and
+    // stores `s`, everything with `x + s <= 3` won (-13.6% to -22.1%) and
+    // everything at 6 lost (+5.1% to +52.8%), with nothing in between. This
+    // body is a copy, a deinterleave and a store across TWO windows, so
+    // `x + s` is about 2 -- an out-of-sample prediction of a win.
+    //
+    // Two windows have to be live at once, and the rotation overwrites the
+    // first one on its next step, so `ee.orq qd, qs, qs` copies it out. That
+    // costs one instruction and is still one fewer than the pair it replaces.
+    let mut left = dst.len() / 48;
     if left == 0 {
         return;
     }
@@ -1373,19 +1379,23 @@ fn simd_even_bytes_unaligned_src(src: &[u8], dst: &mut [u8]) {
         core::arch::asm!(
             "rsr.sar {sar}",
             "ee.ld.128.usar.ip q0, {s}, 16",
+            "ee.vld.128.ip q1, {s}, 16",
             "12:",
-            "ee.ld.128.usar.ip q1, {s}, 16",
-            "ee.src.q q2, q0, q1",        // source bytes 0..=15 of the trip
-            "ee.ld.128.usar.ip q0, {s}, 16",
-            "ee.src.q q3, q1, q0",        // and 16..=31
-            "ee.vunzip.8 q2, q3",         // q2 = the sixteen even bytes: luma
-            "ee.vst.128.ip q2, {d}, 16",
-            "ee.ld.128.usar.ip q1, {s}, 16",
-            "ee.src.q q4, q0, q1",
-            "ee.ld.128.usar.ip q0, {s}, 16",
-            "ee.src.q q5, q1, q0",
-            "ee.vunzip.8 q4, q5",
-            "ee.vst.128.ip q4, {d}, 16",
+            "ee.src.q.ld.ip q2, {s}, 16, q0, q1",
+            "ee.orq q3, q0, q0",                 // window 0, before it rotates
+            "ee.src.q.ld.ip q0, {s}, 16, q1, q2",
+            "ee.vunzip.8 q3, q1",                // q3 = the sixteen luma bytes
+            "ee.vst.128.ip q3, {d}, 16",
+            "ee.src.q.ld.ip q1, {s}, 16, q2, q0",
+            "ee.orq q3, q2, q2",
+            "ee.src.q.ld.ip q2, {s}, 16, q0, q1",
+            "ee.vunzip.8 q3, q0",
+            "ee.vst.128.ip q3, {d}, 16",
+            "ee.src.q.ld.ip q0, {s}, 16, q1, q2",
+            "ee.orq q3, q1, q1",
+            "ee.src.q.ld.ip q1, {s}, 16, q2, q0",
+            "ee.vunzip.8 q3, q2",
+            "ee.vst.128.ip q3, {d}, 16",
             "addi {n}, {n}, -1",
             "bnez {n}, 12b",
             "wsr.sar {sar}",
@@ -1473,10 +1483,10 @@ fn mono_to_stereo_i16_unaligned_src(src: &[i16], dst: &mut [i16]) -> usize {
     if n < UNALIGNED_TAIL + 8 || !aligned16(dst.as_ptr().cast::<u8>()) {
         return 0;
     }
-    // Widened, and with DISJOINT registers for the two halves. Reusing the
-    // same window register would make the second `ee.src.q` wait for the
-    // first half's read of it -- a false dependency, which is the shape that
-    // made `gain_i16` slower when it was widened.
+    // NOT the fused funnel, and that is MEASURED. `ee.src.q.ld.ip` pays
+    // where the per-window body is SHORT -- -13.6% to -22.1% on three
+    // kernels whose window work is one or two instructions -- and costs
+    // where it is long. This body read +52.8% with it. See the P7 entry.
     let body = (n - UNALIGNED_TAIL) / 16 * 16;
     let mut ps = src.as_ptr().cast::<u8>();
     let mut pd = dst.as_mut_ptr().cast::<u8>();
@@ -1776,6 +1786,8 @@ fn gain_i16_unaligned_src(src: &[i16], c: &[i16; 4], dst: &mut [i16]) -> usize {
     if n < UNALIGNED_TAIL + 8 || !aligned16(dst.as_ptr().cast::<u8>()) {
         return 0;
     }
+    // NOT the fused funnel: this body chains through QACC and read +5.1%
+    // with it. See the P7 boundary.
     let body = (n - UNALIGNED_TAIL) / 8 * 8;
     let mut ps = src.as_ptr().cast::<u8>();
     let mut pd = dst.as_mut_ptr().cast::<u8>();
@@ -2022,10 +2034,10 @@ fn convert_i16_to_i32_unaligned_src(src: &[i16], dst: &mut [i32]) -> usize {
     if n < UNALIGNED_TAIL + 8 || !aligned16(dst.as_ptr().cast::<u8>()) {
         return 0;
     }
-    // Widened, and with DISJOINT registers for the two halves. Reusing the
-    // same window register would make the second `ee.src.q` wait for the
-    // first half's read of it -- a false dependency, which is the shape that
-    // made `gain_i16` slower when it was widened.
+    // NOT the fused funnel, and that is MEASURED. `ee.src.q.ld.ip` pays
+    // where the per-window body is SHORT (-13.6% to -22.1% on three kernels
+    // whose window work is one or two instructions) and costs where it is
+    // long -- this body's zip-and-two-stores read +37.5%. See the P7 entry.
     let body = (n - UNALIGNED_TAIL) / 16 * 16;
     let mut ps = src.as_ptr().cast::<u8>();
     let mut pd = dst.as_mut_ptr().cast::<u8>();
@@ -2073,10 +2085,15 @@ fn convert_i32_to_i16_unaligned_src(src: &[i32], dst: &mut [i16]) -> usize {
     if n < UNALIGNED_TAIL + 8 || !aligned16(dst.as_ptr().cast::<u8>()) {
         return 0;
     }
-    // Widened, and with DISJOINT registers for the two halves. Reusing the
-    // same window register would make the second `ee.src.q` wait for the
-    // first half's read of it -- a false dependency, which is the shape that
-    // made `gain_i16` slower when it was widened.
+    // The fused funnel is NOT applied here, and this is an OPEN question
+    // rather than a refutation. It was tried and read +31.4% -- but the trip
+    // went from 16 samples to 24, which on this kernel's 239-sample test
+    // buffer moved the scalar TAIL from 15 samples to 23. At the scalar
+    // arm's ~165,000 ps/sample those eight samples add ~5,500 ps/sample by
+    // themselves, more than the whole apparent regression. The measurement
+    // did not hold work constant (`codec-measurement` §4), so it says
+    // nothing about the instruction. Re-test with a buffer whose length is
+    // a multiple of both trip widths before drawing any conclusion.
     let body = (n - UNALIGNED_TAIL) / 16 * 16;
     let mut ps = src.as_ptr().cast::<u8>();
     let mut pd = dst.as_mut_ptr().cast::<u8>();
@@ -2122,12 +2139,18 @@ fn convert_i32_to_i24in32_unaligned_src(src: &[i32], dst: &mut [i32]) -> usize {
     if n < UNALIGNED_TAIL + 16 || !aligned16(dst.as_ptr().cast::<u8>()) {
         return 0;
     }
-    // SIXTEEN a trip: this body was five instructions against two of loop.
-    let body = (n - UNALIGNED_TAIL) / 16 * 16;
+    // FUSED FUNNEL: `ee.src.q.ld.ip qu, as, imm, qx, qy` does the unaligned
+    // funnel AND the next block's load in one instruction -- `qx` receives
+    // `funnel(qx, qy)` and `qu` receives `[as]`. It also replaces the slower
+    // `ee.ld.128.usar.ip` with a plain load, since SAR_BYTE only has to be
+    // set once for a stream. Three of these close a register rotation:
+    // from `(q0, q1) = (block k, block k+1)` they leave `(block k+3,
+    // block k+4)`, with the windows landing in q0, q1, q2 in turn.
+    let body = if n < 28 { 0 } else { (n - 8) / 12 * 12 };
     let mut ps = src.as_ptr().cast::<u8>();
     let mut pd = dst.as_mut_ptr().cast::<u8>();
-    let mut left = body / 16;
-    // SAFETY: sixteen samples a trip -- 64 bytes consumed and written --
+    let mut left = body / 12;
+    // SAFETY: twelve samples a trip -- 48 bytes consumed and written --
     // reading at most one block beyond, reserved by `UNALIGNED_TAIL`. `dst`
     // is 16-byte aligned. q0-q2 and q6/q7 only; SAR is restored.
     unsafe {
@@ -2138,27 +2161,17 @@ fn convert_i32_to_i24in32_unaligned_src(src: &[i32], dst: &mut [i32]) -> usize {
             "ssai 8",
             "ee.vsl.32 q7, q7",          // 0xffff_ff00 per 32-bit lane
             "ee.ld.128.usar.ip q0, {ps}, 16",
+            "ee.vld.128.ip q1, {ps}, 16",      // q1 = block k+1
             "24:",
-            "ee.ld.128.usar.ip q1, {ps}, 0",
-            "ee.src.q q2, q0, q1",
+            "ee.src.q.ld.ip q2, {ps}, 16, q0, q1",
+            "ee.andq q0, q0, q7",
+            "ee.vst.128.ip q0, {pd}, 16",
+            "ee.src.q.ld.ip q0, {ps}, 16, q1, q2",
+            "ee.andq q1, q1, q7",
+            "ee.vst.128.ip q1, {pd}, 16",
+            "ee.src.q.ld.ip q1, {ps}, 16, q2, q0",
             "ee.andq q2, q2, q7",
             "ee.vst.128.ip q2, {pd}, 16",
-            "ee.ld.128.usar.ip q0, {ps}, 16",
-            "ee.ld.128.usar.ip q1, {ps}, 0",
-            "ee.src.q q2, q0, q1",
-            "ee.andq q2, q2, q7",
-            "ee.vst.128.ip q2, {pd}, 16",
-            "ee.ld.128.usar.ip q0, {ps}, 16",
-            "ee.ld.128.usar.ip q1, {ps}, 0",
-            "ee.src.q q2, q0, q1",
-            "ee.andq q2, q2, q7",
-            "ee.vst.128.ip q2, {pd}, 16",
-            "ee.ld.128.usar.ip q0, {ps}, 16",
-            "ee.ld.128.usar.ip q1, {ps}, 0",
-            "ee.src.q q2, q0, q1",
-            "ee.andq q2, q2, q7",
-            "ee.vst.128.ip q2, {pd}, 16",
-            "ee.ld.128.usar.ip q0, {ps}, 16",
             "addi {n}, {n}, -1",
             "bnez {n}, 24b",
             "wsr.sar {sar}",

@@ -1471,3 +1471,92 @@ so the next tile's first load waits on the previous tile's last store.
 **Removing a host loop wins when the address is already a running cursor,
 and loses when the host was computing an INDEPENDENT address each trip.**
 Redundant-looking arithmetic can be breaking a dependency chain.
+
+## P7 — the FULL fused-op census, and which families actually pay
+
+P6 refuted "fused load-op instructions" on three kernels. That was one
+FAMILY, not the feature. The complete list settles it.
+
+### Reading the ISA table instead of guessing mnemonics
+
+`xtensa-esp32s3-elf-as` is a 900 KB wrapper; the instruction set lives in
+`<toolchain>/lib/xtensa_esp32s3.so`, loaded through `xtensa-dynconfig`.
+Extracting printable strings from THAT gives the authoritative table:
+
+    217 ee.* mnemonics, 108 of them carrying a fused load or store.
+
+(`strings` is not installed here, and it exits 0 printing nothing — the
+first two sweeps read "0 matches" and meant "no such command". A count of
+zero deserves the same suspicion as an impossible one.)
+
+The 108 are about a dozen FAMILIES; the rest are s8/u8/s16/u16/s32 variants.
+
+| family | verdict |
+|---|---|
+| `v{adds,subs,max,min,mul}.*.ld.incp` (ALU+load) | **REFUTED**, P6: +10% to +64.6% |
+| `v{adds,subs,max,min,mul}.*.st.incp` (ALU+store) | **REFUTED**: `mix_i16` +57% |
+| `vmulas.*.{accx,qacc}.ld.{ip,xp}` (MAC+load) | **REFUTED**, P6 |
+| **`src.q.ld.{ip,xp}` (funnel+load)** | **PAYS — four wins below** |
+| `ldqa.*` / `mov.*.qacc` (load/move to QACC) | ruled out: not widening loads |
+| `srs.accx` (ACCX → general register) | works, but 32-bit; our accumulators reach 2^37 |
+| `ldf/stf.{64,128}` (float load/store) | no float-SIMD arithmetic exists to pair with |
+| `cmul.s16.*`, `fft.*` | no kernel of that shape here yet |
+
+### `ee.src.q.ld.ip` is the one that pays
+
+| kernel | before | after | |
+|---|---:|---:|---:|
+| `yuyv_to_gray8` unaligned | 10,784 | 8,291 | **−23.1%** |
+| `convert_i32_to_i24in32` unaligned | 43,286 | 34,548 | **−20.2%** |
+| `peak_abs_i16` unaligned | 13,436 | 11,047 | **−17.8%** |
+| `sum_sq_i16` unaligned | 13,901 | 11,993 | **−13.7%** |
+
+Measured semantics: `ee.src.q.ld.ip qu, as, imm, qx, qy` puts
+`funnel(qx, qy)` in **qx** and `[as]` in **qu**, `as += imm`. It is not an
+ALU fusion at all — it is the funnel unit plus a PLAIN load replacing the
+slower `ee.ld.128.usar.ip`, since SAR_BYTE only has to be set once per
+stream. Different hardware path, opposite verdict from the ALU family.
+
+Three of them close a register rotation: from `(q0,q1) = (block k, k+1)`
+they leave `(block k+3, k+4)`, with the windows landing in q0, q1, q2 in
+turn — so a trip is three windows, and the window register is free to be
+clobbered because the next rotation step overwrites it anyway.
+
+**It cannot serve two streams at different offsets.** SAR_BYTE is global and
+the fused load does not update it, so `dot_i16`, `mix_i16` and both SADs are
+structurally excluded from this form.
+
+### ★★ A two-variable gate separates where it pays
+
+Counting the per-window body — `x` non-fused instructions, `s` of them
+stores:
+
+| kernel | x | s | x+s | result |
+|---|---:|---:|---:|---:|
+| `sum_sq` | 1 | 0 | 1 | −13.7% |
+| `peak_abs` | 2 | 0 | 2 | −17.8% |
+| `convert_i32_to_i24in32` | 2 | 1 | 3 | −20.2% |
+| `gain` | 5 | 1 | 6 | +5.1% |
+| `convert_i16_to_i32` | 4 | 2 | 6 | +37.5% |
+| `mono_to_stereo` | 4 | 2 | 6 | +52.8% |
+
+**`x + s ≤ 3` pays; `x + s = 6` costs**, with nothing observed between.
+Stores carry double weight, which is why a 2-instruction body with a store
+wins and a 5-instruction body with a store does not. The gate made one
+out-of-sample prediction, `yuyv_to_gray8` at x+s ≈ 2, and it came in at
+−23.1%.
+
+### The second prediction's test was INVALID, and is recorded as open
+
+`convert_i32_to_i16` unaligned, also x+s ≈ 2, read **+31.4%** — and that
+number is not admissible. Moving the trip from 16 samples to 24 changed the
+scalar TAIL on its 239-sample test buffer from 15 samples to 23. At the
+scalar arm's ~165,000 ps/sample those eight extra samples add ~5,500
+ps/sample by themselves, which is more than the whole apparent regression.
+The two arms did not do the same work (§4).
+
+`yuyv_to_gray8` escaped the same trap only by luck: its body length made the
+reservation land on 2016 pixels at BOTH trip widths, so its tail was
+identical and its number is clean. **When a change alters the vector/scalar
+split, the per-element average is measuring the split, not the change.**
+Re-test with a buffer length that is a multiple of both trip widths.
