@@ -558,6 +558,124 @@ fn main() -> ! {
             Work { samples: npx, ..Work::ZERO }
         });
 
+        // --- third tier: the forms that remove the ALIGNMENT constraint --
+        //
+        // The assembler also accepts an unaligned-load idiom, 64-bit half
+        // loads and stores, a lane insert from a general register, and the
+        // accumulator's shift-round-clamp. Each of those would let a kernel
+        // reach data the twelve twins so far hand to the scalar arm, so each
+        // is read off the part before anything depends on it.
+        {
+            #[repr(align(16))]
+            struct B([u8; 48]);
+            let src = B({
+                let mut a = [0u8; 48];
+                let mut i = 0;
+                while i < 48 {
+                    a[i] = i as u8;
+                    i += 1;
+                }
+                a
+            });
+            #[repr(align(16))]
+            struct Q([u8; 16]);
+
+            // 1. The unaligned load: `ee.ld.128.usar.ip` is documented to set
+            //    SAR_BYTE from the address, and `ee.src.q` to funnel the pair.
+            //    Reading from offset 3 must produce bytes 3..=18.
+            for off in [0usize, 3, 7] {
+                let mut o = Q([0u8; 16]);
+                let base = unsafe { src.0.as_ptr().add(off) };
+                // SAFETY: `off + 32 <= 48`, so both loads stay inside `src`;
+                // the output is a 16-byte aligned buffer. q0-q2 only.
+                unsafe {
+                    core::arch::asm!(
+                        "ee.ld.128.usar.ip q0, {p}, 16",
+                        "ee.ld.128.usar.ip q1, {p}, 0",
+                        "ee.src.q q2, q0, q1",
+                        "ee.vst.128.ip q2, {o}, 0",
+                        p = inout(reg) base => _,
+                        o = inout(reg) o.0.as_mut_ptr() => _,
+                        options(nostack),
+                    );
+                }
+                println!("P3 unaligned off={off} q2={:02x?}", o.0);
+            }
+
+            // 2. The 64-bit half load: what happens to the OTHER half?
+            {
+                let mut lo = Q([0u8; 16]);
+                let mut hi = Q([0u8; 16]);
+                // SAFETY: two 8-byte reads inside `src`, two aligned writes.
+                unsafe {
+                    core::arch::asm!(
+                        "ee.vcmp.eq.s16 q0, q0, q0",   // fill with all-ones first
+                        "ee.vld.l.64.ip q0, {p}, 0",
+                        "ee.vst.128.ip q0, {a}, 0",
+                        "ee.vcmp.eq.s16 q1, q1, q1",
+                        "ee.vld.h.64.ip q1, {p}, 0",
+                        "ee.vst.128.ip q1, {b}, 0",
+                        p = inout(reg) src.0.as_ptr() => _,
+                        a = inout(reg) lo.0.as_mut_ptr() => _,
+                        b = inout(reg) hi.0.as_mut_ptr() => _,
+                        options(nostack),
+                    );
+                }
+                println!("P3 vld.l.64        q0={:02x?}", lo.0);
+                println!("P3 vld.h.64        q1={:02x?}", hi.0);
+            }
+
+            // 3. A lane insert from a general register -- the way a 4-byte
+            //    block row could be gathered without any alignment at all.
+            {
+                let mut o = Q([0u8; 16]);
+                // SAFETY: one aligned 16-byte write; q0 only.
+                unsafe {
+                    core::arch::asm!(
+                        "ee.zero.q q0",
+                        "ee.movi.32.q q0, {v}, 2",
+                        "ee.vst.128.ip q0, {o}, 0",
+                        v = in(reg) 0xdead_beefu32,
+                        o = inout(reg) o.0.as_mut_ptr() => _,
+                        options(nostack),
+                    );
+                }
+                println!("P3 movi.32.q l2    q0={:02x?}", o.0);
+            }
+
+            // 4. QACC's shift-round-clamp. Does it ROUND or TRUNCATE? The
+            //    products below are 6, 10, 14, 18; shifted right by two they
+            //    are 1.5, 2.5, 3.5, 4.5, so truncation and round-half-up and
+            //    round-half-even all print different answers.
+            {
+                #[repr(align(16))]
+                struct S([i16; 8]);
+                let a = S([3, 5, 7, 9, 0, 0, 0, 0]);
+                let b = S([2, 2, 2, 2, 0, 0, 0, 0]);
+                for sh in [0u32, 2] {
+                    let mut o = Q([0u8; 16]);
+                    // SAFETY: two aligned 16-byte reads, one aligned write.
+                    unsafe {
+                        core::arch::asm!(
+                            "ee.zero.qacc",
+                            "ee.vld.128.ip q0, {pa}, 0",
+                            "ee.vld.128.ip q1, {pb}, 0",
+                            "ee.vmulas.s16.qacc q0, q1",
+                            "ee.srcmb.s16.qacc q2, {sh}, 0",
+                            "ee.vst.128.ip q2, {o}, 0",
+                            pa = inout(reg) a.0.as_ptr() => _,
+                            pb = inout(reg) b.0.as_ptr() => _,
+                            sh = in(reg) sh,
+                            o = inout(reg) o.0.as_mut_ptr() => _,
+                            options(nostack),
+                        );
+                    }
+                    println!("P3 srcmb sh={sh}       q2={:02x?}", o.0);
+                }
+            }
+            println!("P3 == end ==");
+        }
+
         // --- semantics of the SECOND instruction tier, off the silicon ----
         //
         // The assembler accepts 31 more `ee.*` forms than the five patterns
@@ -896,6 +1014,73 @@ fn main() -> ! {
                 };
                 rusty_esp_dsp_esp::pie_s3::stereo_to_mono_i16(&iv[..fr * 2], o);
                 Work { samples: fru, ..Work::ZERO }
+            });
+        }
+
+        // --- the UNALIGNED arms: buffers that used to run fully scalar ---
+        //
+        // Every twin so far checks 16-byte alignment and hands anything else
+        // to the oracle, so a slice starting one sample in got no SIMD at
+        // all. `&iv[1..]` starts at 2 mod 16, which is exactly that case.
+        // The alignment is printed beside each gate, because a buffer that
+        // turned out to be aligned after all would make these arms measure
+        // the aligned path and read as a win that is not there.
+        {
+            let ua = &iv[1..];
+            let ub = &jv[1..];
+            println!(
+                "PIEUNALIGNED offset_a={} offset_b={}",
+                ua.as_ptr() as usize % 16,
+                ub.as_ptr() as usize % 16
+            );
+            let nu = (ua.len()) as u64;
+
+            let sref = rusty_esp_dsp::sample::sum_sq_i16(ua);
+            let spie = rusty_esp_dsp_esp::pie_s3::sum_sq_i16(ua);
+            println!(
+                "PIEKERNEL sum_sq_i16_unaligned identical={} scalar={sref} pie={spie}",
+                sref == spie
+            );
+            measure("sumsq_un_scalar", "sample", nu, || {
+                core::hint::black_box(rusty_esp_dsp::sample::sum_sq_i16(ua));
+                Work { samples: nu, ..Work::ZERO }
+            });
+            measure("sumsq_un_pie", "sample", nu, || {
+                core::hint::black_box(rusty_esp_dsp_esp::pie_s3::sum_sq_i16(ua));
+                Work { samples: nu, ..Work::ZERO }
+            });
+
+            let pref = rusty_esp_dsp::sample::peak_abs_i16(ua);
+            let ppie = rusty_esp_dsp_esp::pie_s3::peak_abs_i16(ua);
+            println!(
+                "PIEKERNEL peak_abs_i16_unaligned identical={} scalar={pref} pie={ppie}",
+                pref == ppie
+            );
+            measure("peak_un_scalar", "sample", nu, || {
+                core::hint::black_box(rusty_esp_dsp::sample::peak_abs_i16(ua));
+                Work { samples: nu, ..Work::ZERO }
+            });
+            measure("peak_un_pie", "sample", nu, || {
+                core::hint::black_box(rusty_esp_dsp_esp::pie_s3::peak_abs_i16(ua));
+                Work { samples: nu, ..Work::ZERO }
+            });
+
+            // Opposing operands again, so the answer is negative and the
+            // 40-bit sign reconstruction is under test on this path too.
+            let dref = rusty_esp_dsp::sample::dot_i16(ua, ub);
+            let dpie = rusty_esp_dsp_esp::pie_s3::dot_i16(ua, ub);
+            println!(
+                "PIEKERNEL dot_i16_unaligned identical={} negative={} scalar={dref} pie={dpie}",
+                dref == dpie,
+                dref < 0
+            );
+            measure("dot_un_scalar", "sample", nu, || {
+                core::hint::black_box(rusty_esp_dsp::sample::dot_i16(ua, ub));
+                Work { samples: nu, ..Work::ZERO }
+            });
+            measure("dot_un_pie", "sample", nu, || {
+                core::hint::black_box(rusty_esp_dsp_esp::pie_s3::dot_i16(ua, ub));
+                Work { samples: nu, ..Work::ZERO }
             });
         }
 

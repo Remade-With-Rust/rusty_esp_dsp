@@ -145,8 +145,12 @@ fn simd_even_bytes(src: &[u8], dst: &mut [u8]) {
 #[must_use]
 pub fn peak_abs_i16(a: &[i16]) -> u16 {
     let body = a.len() / 8 * 8;
-    if body == 0 || !aligned16(a.as_ptr().cast::<u8>()) {
+    if body == 0 {
         return rusty_esp_dsp::sample::peak_abs_i16(a);
+    }
+    if !aligned16(a.as_ptr().cast::<u8>()) {
+        // Not the oracle any more: the unaligned idiom reaches this buffer.
+        return peak_abs_i16_unaligned(a);
     }
 
     // Eight i16 lanes a trip: one load, one max, one min.
@@ -389,8 +393,12 @@ pub fn sad_8x8(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
 #[must_use]
 pub fn sum_sq_i16(a: &[i16]) -> i64 {
     let body = a.len() / 8 * 8;
-    if body == 0 || !aligned16(a.as_ptr().cast::<u8>()) {
+    if body == 0 {
         return rusty_esp_dsp::sample::sum_sq_i16(a);
+    }
+    if !aligned16(a.as_ptr().cast::<u8>()) {
+        // Not the oracle any more: the unaligned idiom reaches this buffer.
+        return sum_sq_i16_unaligned(a);
     }
 
     let mut total: i64 = 0;
@@ -452,11 +460,11 @@ pub fn sum_sq_i16(a: &[i16]) -> i64 {
 pub fn dot_i16(a: &[i16], b: &[i16]) -> i64 {
     let n = a.len().min(b.len());
     let body = n / 8 * 8;
-    if body == 0
-        || !aligned16(a.as_ptr().cast::<u8>())
-        || !aligned16(b.as_ptr().cast::<u8>())
-    {
+    if body == 0 {
         return rusty_esp_dsp::sample::dot_i16(a, b);
+    }
+    if !aligned16(a.as_ptr().cast::<u8>()) || !aligned16(b.as_ptr().cast::<u8>()) {
+        return dot_i16_unaligned(a, b);
     }
 
     let mut total: i64 = 0;
@@ -836,4 +844,211 @@ pub fn downscale2x_gray8(src: &[u8], width: u32, height: u32, dst: &mut [u8]) ->
         }
     }
     Ok(())
+}
+
+/// The number of trailing samples an unaligned arm must leave to the scalar
+/// tail.
+///
+/// `ee.ld.128.usar.ip` loads the 16-byte-aligned block CONTAINING its
+/// address, so producing the last unaligned window reads up to one whole
+/// block past the last sample the kernel consumes. Reading past the end of
+/// a slice is undefined behaviour whatever the hardware does with it, so
+/// every unaligned body stops eight samples (sixteen bytes) short and the
+/// scalar loop finishes the job.
+const UNALIGNED_TAIL: usize = 8;
+
+/// `sum_sq_i16` for a buffer that is NOT 16-byte aligned.
+///
+/// Until now any such buffer took the scalar path in full. The unaligned
+/// idiom is two loads and a funnel: `ee.ld.128.usar.ip` loads the aligned
+/// block containing the address AND sets SAR_BYTE from the low four bits,
+/// and `ee.src.q` shifts the pair by that amount. Measured on the part,
+/// offset 3 yields bytes 3..=18 and offset 7 yields 7..=22.
+///
+/// The loop is unrolled by two so the block loaded for one window is the
+/// low half of the next, which is what avoids needing a register move: the
+/// roles of the two block registers simply swap each half-trip.
+///
+/// Sixteen samples a trip, eight trips to a flush -- 128 products of at most
+/// 2^30 peak at 2^37 inside the 40-bit accumulator.
+#[allow(unsafe_code)]
+fn sum_sq_i16_unaligned(a: &[i16]) -> i64 {
+    let n = a.len();
+    if n < UNALIGNED_TAIL + 16 {
+        return rusty_esp_dsp::sample::sum_sq_i16(a);
+    }
+    let body = (n - UNALIGNED_TAIL) / 16 * 16;
+    let mut total: i64 = 0;
+    let mut p = a.as_ptr().cast::<u8>();
+    let mut left = body / 16;
+
+    while left > 0 {
+        let batch = left.min(8);
+        left -= batch;
+        let (lo, hi): (u32, u32);
+        // SAFETY: the loop consumes 32 bytes a trip and reads at most one
+        // 16-byte block beyond them; `body` stops `UNALIGNED_TAIL` samples
+        // short of the slice end precisely so that block is still inside it.
+        // q0-q2 and ACCX only, and SAR is restored.
+        unsafe {
+            core::arch::asm!(
+                "rsr.sar {sar}",
+                "ee.zero.accx",
+                "ee.ld.128.usar.ip q0, {p}, 16",
+                "7:",
+                "ee.ld.128.usar.ip q1, {p}, 16",
+                "ee.src.q q2, q0, q1",
+                "ee.vmulas.s16.accx q2, q2",
+                "ee.ld.128.usar.ip q0, {p}, 16",
+                "ee.src.q q2, q1, q0",
+                "ee.vmulas.s16.accx q2, q2",
+                "addi {n}, {n}, -1",
+                "bnez {n}, 7b",
+                "rur.accx_0 {l}",
+                "rur.accx_1 {h}",
+                "wsr.sar {sar}",
+                p = inout(reg) p,
+                n = inout(reg) batch => _,
+                l = out(reg) lo,
+                h = out(reg) hi,
+                sar = out(reg) _,
+                options(nostack),
+            );
+        }
+        // Non-negative, so the 40-bit composition needs no sign extension.
+        total += (((u64::from(hi) & 0xff) << 32) | u64::from(lo)) as i64;
+        // Each trip consumed 32 bytes but left the pointer one block ahead.
+        p = unsafe { a.as_ptr().cast::<u8>().add((body / 16 - left) * 32) };
+    }
+
+    for &x in &a[body..] {
+        total += i64::from(i32::from(x) * i32::from(x));
+    }
+    total
+}
+
+/// `peak_abs_i16` for a buffer that is NOT 16-byte aligned.
+///
+/// The same unaligned idiom in front of the same lane-wise MAX and MIN that
+/// the aligned twin uses -- the minimum is carried because negating through
+/// `ee.vsubs.s16` saturates at `-32768` and would report 32767 where the
+/// oracle reports 32768.
+#[allow(unsafe_code)]
+fn peak_abs_i16_unaligned(a: &[i16]) -> u16 {
+    let n = a.len();
+    if n < UNALIGNED_TAIL + 16 {
+        return rusty_esp_dsp::sample::peak_abs_i16(a);
+    }
+    let body = (n - UNALIGNED_TAIL) / 16 * 16;
+    let mut maxes = [0i16; 8];
+    let mut mins = [0i16; 8];
+    let mut p = a.as_ptr().cast::<u8>();
+    let mut left = body / 16;
+    // SAFETY: as for `sum_sq_i16_unaligned` -- 32 bytes consumed a trip and
+    // at most one block read beyond, which `UNALIGNED_TAIL` reserves. The
+    // two output buffers are 16 bytes each. q0-q4 only; SAR is restored.
+    unsafe {
+        core::arch::asm!(
+            "rsr.sar {sar}",
+            "ee.zero.q q3",                 // running lane-wise maximum
+            "ee.zero.q q4",                 // running lane-wise minimum
+            "ee.ld.128.usar.ip q0, {p}, 16",
+            "8:",
+            "ee.ld.128.usar.ip q1, {p}, 16",
+            "ee.src.q q2, q0, q1",
+            "ee.vmax.s16 q3, q3, q2",
+            "ee.vmin.s16 q4, q4, q2",
+            "ee.ld.128.usar.ip q0, {p}, 16",
+            "ee.src.q q2, q1, q0",
+            "ee.vmax.s16 q3, q3, q2",
+            "ee.vmin.s16 q4, q4, q2",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 8b",
+            "ee.vst.128.ip q3, {mx}, 0",
+            "ee.vst.128.ip q4, {mn}, 0",
+            "wsr.sar {sar}",
+            p = inout(reg) p,
+            n = inout(reg) left => _,
+            mx = inout(reg) maxes.as_mut_ptr() => _,
+            mn = inout(reg) mins.as_mut_ptr() => _,
+            sar = out(reg) _,
+            options(nostack),
+        );
+    }
+
+    let mut best: u16 = 0;
+    for k in 0..8 {
+        best = best.max(maxes[k].unsigned_abs());
+        best = best.max(mins[k].unsigned_abs());
+    }
+    for &x in &a[body..] {
+        best = best.max(x.unsigned_abs());
+    }
+    best
+}
+
+/// `dot_i16` for operands that are NOT both 16-byte aligned.
+///
+/// Two independent unaligned streams need two different SAR_BYTE values, and
+/// they get them for free: `ee.ld.128.usar.ip` sets SAR_BYTE as a side
+/// effect of every load, so as long as each `ee.src.q` immediately follows
+/// its own stream's load, each funnel shifts by its own offset.
+#[allow(unsafe_code)]
+fn dot_i16_unaligned(a: &[i16], b: &[i16]) -> i64 {
+    let n = a.len().min(b.len());
+    if n < UNALIGNED_TAIL + 8 {
+        return rusty_esp_dsp::sample::dot_i16(a, b);
+    }
+    let body = (n - UNALIGNED_TAIL) / 8 * 8;
+    let mut total: i64 = 0;
+    let mut done = 0usize;
+
+    while done < body {
+        let batch = (body - done) / 8;
+        let batch = batch.min(16);
+        let (lo, hi): (u32, u32);
+        let mut pa = unsafe { a.as_ptr().cast::<u8>().add(done * 2) };
+        let mut pb = unsafe { b.as_ptr().cast::<u8>().add(done * 2) };
+        // SAFETY: each trip consumes 16 bytes of each operand and reads at
+        // most one 16-byte block beyond, which `UNALIGNED_TAIL` reserves in
+        // both slices. q0-q4 and ACCX only; SAR is restored.
+        unsafe {
+            core::arch::asm!(
+                "rsr.sar {sar}",
+                "ee.zero.accx",
+                "ee.ld.128.usar.ip q0, {pa}, 16",
+                "ee.ld.128.usar.ip q2, {pb}, 16",
+                "9:",
+                "ee.ld.128.usar.ip q1, {pa}, 0",
+                "ee.src.q q4, q0, q1",       // SAR_BYTE is a's, set just above
+                "ee.ld.128.usar.ip q3, {pb}, 0",
+                "ee.src.q q0, q2, q3",       // and now b's
+                "ee.vmulas.s16.accx q4, q0",
+                "ee.ld.128.usar.ip q0, {pa}, 16",
+                "ee.ld.128.usar.ip q2, {pb}, 16",
+                "addi {n}, {n}, -1",
+                "bnez {n}, 9b",
+                "rur.accx_0 {l}",
+                "rur.accx_1 {h}",
+                "wsr.sar {sar}",
+                pa = inout(reg) pa,
+                pb = inout(reg) pb,
+                n = inout(reg) batch => _,
+                l = out(reg) lo,
+                h = out(reg) hi,
+                sar = out(reg) _,
+                options(nostack),
+            );
+        }
+        let _ = (pa, pb);
+        // Forty bits, and a dot product can be negative: mask and sign-extend.
+        let raw = (u64::from(hi & 0xff) << 32) | u64::from(lo);
+        total += ((raw << 24) as i64) >> 24;
+        done += batch * 8;
+    }
+
+    for k in done..n {
+        total += i64::from(i32::from(a[k]) * i32::from(b[k]));
+    }
+    total
 }
