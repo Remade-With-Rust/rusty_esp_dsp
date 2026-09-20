@@ -2654,3 +2654,174 @@ pub fn downscale2x_rgb565(
     }
     Ok(())
 }
+
+/// `yuyv_to_rgb565` — backlog B2. The camera's native format straight to the
+/// one the RTP payloader and every display want, at 431,650 ps/px scalar.
+///
+/// The colour maths is three multiply-shifts and `ee.vmulas.s16.qacc`
+/// accumulates, so GREEN's two terms — `(88·cb + 183·cr) >> 8` — go into one
+/// QACC pass and come out with a single `ee.srcmb`. Nothing saturates: with
+/// `|cb|,|cr| <= 128` the offsets stay inside ±227 and the sums inside
+/// −227..=481.
+///
+/// The clamp to `0..=255` must happen BEFORE the shift to 5/6/5, because a
+/// negative shifted right is −1, not 0.
+///
+/// Each U and V serves two pixels, which is `ee.vzip.8` of the register with
+/// a copy of itself — the same duplication `mono_to_stereo_i16` uses, at
+/// byte granularity.
+///
+/// The pack shifts through 32-bit lanes. `ee.vmul.s16` would be the obvious
+/// instruction and it is NOT characterised on this part (see the module
+/// table); using it in `downscale2x_rgb565` produced a silently wrong red
+/// field.
+///
+/// Eight pixels a trip.
+#[allow(unsafe_code)]
+pub fn yuyv_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize> {
+    if src.len() % 4 != 0 {
+        return Err(Error::InvalidGeometry);
+    }
+    let pixels = src.len() / 2;
+    expect_len(dst, pixels * 2)?;
+
+    #[repr(align(16))]
+    struct C([i16; 16]);
+    let c = C([128, 359, 88, 183, 454, 255, 1, 2048, 32, 0, 0, 0, 0, 0, 0, 0]);
+
+    let body = pixels / 8 * 8;
+    let vectorable = body > 0 && aligned16(src.as_ptr()) && aligned16(dst.as_ptr());
+
+    if vectorable {
+        let mut ps = src.as_ptr();
+        let mut pd = dst.as_mut_ptr();
+        let pc = c.0.as_ptr().cast::<u8>();
+        let mut left = body / 8;
+        // SAFETY: each trip reads 16 bytes and writes 16, `body / 8` times;
+        // `body <= pixels` and `dst` holds `pixels * 2` bytes, so both stay
+        // in bounds. Both are 16-byte aligned. `c` is a local 16-byte
+        // aligned array read two bytes at a time. q0-q7 only; SAR restored.
+        unsafe {
+            core::arch::asm!(
+                "rsr.sar {sar}",
+                    "30:",
+                    "ee.vld.128.ip q0, {ps}, 16",
+                    // deinterleave: evens are Y, odds are the chroma pairs
+                    "ee.zero.q q1",
+                    "ee.vunzip.8 q0, q1",
+                    "ee.zero.q q2",
+                    "ee.vunzip.8 q1, q2",
+                    // each U and V serves TWO pixels: zip the register with a copy
+                    "ee.orq q3, q1, q1",
+                    "ee.vzip.8 q1, q3",
+                    "ee.orq q3, q2, q2",
+                    "ee.vzip.8 q2, q3",
+                    // widen the eight that matter to i16
+                    "ee.zero.q q3",
+                    "ee.vzip.8 q0, q3",
+                    "ee.zero.q q3",
+                    "ee.vzip.8 q1, q3",
+                    "ee.zero.q q3",
+                    "ee.vzip.8 q2, q3",
+                    "addi {t}, {pc}, 0",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.vsubs.s16 q1, q1, q7",
+                    "ee.vsubs.s16 q2, q2, q7",
+                    // the three offsets; green accumulates BOTH terms in one QACC pass
+                    "addi {t}, {pc}, 2",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q2, q7",
+                    "ee.srcmb.s16.qacc q3, {sh8}, 0",
+                    "addi {t}, {pc}, 4",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q1, q7",
+                    "addi {t}, {pc}, 6",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.vmulas.s16.qacc q2, q7",
+                    "ee.srcmb.s16.qacc q4, {sh8}, 0",
+                    "addi {t}, {pc}, 8",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q1, q7",
+                    "ee.srcmb.s16.qacc q5, {sh8}, 0",
+                    // combine with luma; nothing here can saturate an i16 lane
+                    "ee.vadds.s16 q3, q0, q3",
+                    "ee.vsubs.s16 q4, q0, q4",
+                    "ee.vadds.s16 q5, q0, q5",
+                    // clamp to 0..=255 -- BEFORE the shift, because a negative would
+                    // shift to -1 rather than 0
+                    "ee.zero.q q6",
+                    "ee.vmax.s16 q3, q3, q6",
+                    "ee.vmax.s16 q4, q4, q6",
+                    "ee.vmax.s16 q5, q5, q6",
+                    "addi {t}, {pc}, 10",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.vmin.s16 q3, q3, q7",
+                    "ee.vmin.s16 q4, q4, q7",
+                    "ee.vmin.s16 q5, q5, q7",
+                    // to 5/6/5
+                    "addi {t}, {pc}, 12",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q3, q7",
+                    "ee.srcmb.s16.qacc q3, {sh3}, 0",
+                    "addi {t}, {pc}, 12",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q4, q7",
+                    "ee.srcmb.s16.qacc q4, {sh2}, 0",
+                    "addi {t}, {pc}, 12",
+                    "ee.vldbc.16 q7, {t}",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q5, q7",
+                    "ee.srcmb.s16.qacc q5, {sh3}, 0",
+                    // pack
+                    "ee.zero.q q0",
+                    "ee.vzip.16 q3, q0",
+                    "ssai 11",
+                    "ee.vsl.32 q3, q3",
+                    "ee.vsl.32 q0, q0",
+                    "ee.vunzip.16 q3, q0",
+                    "ee.zero.q q0",
+                    "ee.vzip.16 q4, q0",
+                    "ssai 5",
+                    "ee.vsl.32 q4, q4",
+                    "ee.vsl.32 q0, q0",
+                    "ee.vunzip.16 q4, q0",
+                    "ee.orq q3, q3, q4",
+                    "ee.orq q3, q3, q5",
+                    "ee.vst.128.ip q3, {pd}, 16",
+                    "addi {n}, {n}, -1",
+                    "bnez {n}, 30b",
+                "wsr.sar {sar}",
+                ps = inout(reg) ps,
+                pd = inout(reg) pd,
+                n = inout(reg) left => _,
+                pc = in(reg) pc,
+                t = out(reg) _,
+                sh8 = in(reg) 8u32,
+                sh3 = in(reg) 3u32,
+                sh2 = in(reg) 2u32,
+                sar = out(reg) _,
+                options(nostack),
+            );
+        }
+        let _ = (ps, pd);
+    }
+
+    // The tail, and the whole buffer when it is not aligned: the oracle's
+    // own arithmetic, byte for byte.
+    let start = if vectorable { body } else { 0 };
+    for k in start..pixels {
+        let m = k / 2 * 4;
+        let y = src[m + if k % 2 == 0 { 0 } else { 2 }];
+        let [r, g, b] = rusty_esp_dsp::pixel::yuv_to_rgb(y, src[m + 1], src[m + 3]);
+        let packed = ((u16::from(r) & 0xf8) << 8)
+            | ((u16::from(g) & 0xfc) << 3)
+            | (u16::from(b) >> 3);
+        dst[k * 2..k * 2 + 2].copy_from_slice(&packed.to_le_bytes());
+    }
+    Ok(pixels)
+}

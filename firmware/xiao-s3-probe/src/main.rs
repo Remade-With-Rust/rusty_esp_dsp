@@ -1836,6 +1836,7 @@ fn main() -> ! {
         pie_tier_b();
         b1_extract_probe();
         pie_b1(ys, gd, &mut reference);
+        pie_b2(ys, gd, &mut reference);
         pie_fused_family_probe();
 
         report_memory("after_pie");
@@ -3013,4 +3014,28 @@ fn b1_extract_probe() {
         println!("B1EX   low-half would be 49152,40960,24576,6144,2048,4096,8192,16384");
         println!("B1EX   (a*b)>>14 would be     3,    2,    1,   0,   0,   0,   0,    1");
     }
+}
+
+/// B2: `yuyv_to_rgb565`, gated against the oracle on real sensor bytes.
+#[inline(never)]
+fn pie_b2(ys: &[u8], gd: &mut [u8], reference: &mut [u8]) {
+    let px = 1024usize; // 2048 source bytes, 2048 output bytes
+    let src = &ys[..px * 2];
+    let _ = pixel::yuyv_to_rgb565(src, &mut reference[..px * 2]);
+    let _ = rusty_esp_dsp_esp::pie_s3::yuyv_to_rgb565(src, &mut gd[..px * 2]);
+    println!(
+        "PIEKERNEL yuyv_to_rgb565 identical={} src_align={} dst_align={}",
+        reference[..px * 2] == gd[..px * 2],
+        src.as_ptr() as usize % 16,
+        gd.as_ptr() as usize % 16
+    );
+    let n = px as u64;
+    measure("yuyv565_scalar", "px", n, || {
+        let _ = pixel::yuyv_to_rgb565(src, &mut reference[..px * 2]);
+        Work { pixels: n, ..Work::ZERO }
+    });
+    measure("yuyv565_pie", "px", n, || {
+        let _ = rusty_esp_dsp_esp::pie_s3::yuyv_to_rgb565(src, &mut gd[..px * 2]);
+        Work { pixels: n, ..Work::ZERO }
+    });
 }
