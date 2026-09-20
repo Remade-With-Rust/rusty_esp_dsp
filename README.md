@@ -54,6 +54,54 @@ kernel within six parts per million. Placement, proven both ways.
 Every number, with the run that produced it:
 [`docs/LEDGER.md`](https://github.com/Remade-With-Rust/rusty_esp_dsp/blob/main/docs/LEDGER.md).
 
+## The chip's vector unit
+
+The ESP32-S3 has a 128-bit SIMD unit (`ee.*`, Espressif calls it PIE). It is
+reachable from Rust through `core::arch::asm!` on the `esp` toolchain, and
+`rusty_esp_dsp-esp` now carries hand-written twins for it — **every one gated
+byte-identical against the scalar kernel that stays in the tree as the
+oracle.** A twin that is not byte-identical is a bug, not an optimisation.
+
+Measured on a Seeed XIAO ESP32-S3 Sense, same binary, both arms:
+
+| kernel | scalar | vector | |
+|---|---:|---:|---:|
+| `rotate90_gray8` | 201,137 | 9,332 | **−95.4%** |
+| `dot_i16` | 271,354 | 11,745 | **−93.9%** |
+| `sum_sq_i16` | 160,527 | 10,005 | **−93.8%** |
+| Annex-B start-code scan | 119,815 | 7,911 | **−93.4%** |
+| `yuyv_to_gray8` | 52,875 | 6,791 | **−87.2%** |
+| `peak_abs_i16` | 76,707 | 11,005 | **−85.7%** |
+| `downscale2x_rgb565` | 1,330,835 | 458,773 | **−65.5%** |
+| `yuyv_to_rgb565` | 399,135 | 146,995 | **−63.2%** |
+
+(picoseconds per element; lower is better)
+
+Three things are worth knowing before you reach for this.
+
+**The instruction semantics were read off the silicon, not a manual.** Running
+an instruction on known byte patterns and printing every register it could
+have touched settles its behaviour more exactly than prose. Several readings
+contradicted the obvious guess *and would still have returned plausible
+numbers* — the accumulator is 40 bits rather than 64, and one multiply
+instruction is still uncharacterised and therefore used nowhere.
+
+**Not everything pays, and the failures are recorded with their numbers.** A
+4x4 Hadamard twin was built twice and lost both times; the fused load-op
+instruction family is slower than the two instructions it replaces; RGB565
+to RGB888 is impossible on this unit at all, because three bytes a pixel
+needs a 3-way deinterleave the ISA does not have.
+
+**A kernel nobody calls is not an optimisation.** Every twin here is reached
+through the seam, and the probe proves it by comparing the trait call against
+the twin and against the oracle — wired and unwired differ by an order of
+magnitude, so the check cannot be ambiguous.
+
+Every number, with the run that produced it and the reverts:
+[`docs/LEDGER.md`](https://github.com/Remade-With-Rust/rusty_esp_dsp/blob/main/docs/LEDGER.md).
+What is twinned, what is not, and why:
+[`docs/TWIN-BACKLOG.md`](https://github.com/Remade-With-Rust/rusty_esp_dsp/blob/main/docs/TWIN-BACKLOG.md).
+
 ## Using it
 
 ```rust
@@ -64,6 +112,22 @@ ops::yuyv_to_rgb565(&yuyv, &mut rgb565, width, height)?;
 
 // Cheap motion signal: sum of absolute differences over a 16x16 block.
 let score = ops::sad_16x16(&previous, &current, stride);
+```
+
+On an ESP32-S3, take the same kernels through the seam and the vector
+twins run instead — same bytes out, and the scalar is still there for
+every other target:
+
+```toml
+rusty_esp_dsp-esp = { version = "0.1", features = ["pie-s3"] }
+```
+
+```rust
+use rusty_esp_dsp::seam::{PixelKernels, SampleKernels};
+
+let k = rusty_esp_dsp_esp::default_kernels();
+k.yuyv_to_gray8(&yuyv, &mut gray)?;
+let energy = k.sum_sq_i16(&samples);
 ```
 
 ## Two tracks

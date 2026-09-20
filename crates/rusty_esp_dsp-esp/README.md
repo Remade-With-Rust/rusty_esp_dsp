@@ -6,6 +6,34 @@ The chip half of the kernel package: hand-written vector twins of the scalar ker
 
 A twin that is not byte-identical to its oracle is a bug, not an optimisation. The scalar version is never deleted — it is the definition.
 
+## What is twinned today
+
+Enable `pie-s3` and hold `default_kernels()`; on an ESP32-S3 nine of the
+seam's thirteen kernels run `ee.*` code, and everywhere else — a host build,
+a host test, a RISC-V target — every one of them is the scalar oracle, so the
+feature is safe to leave on.
+
+```toml
+rusty_esp_dsp-esp = { version = "0.1", features = ["pie-s3"] }
+```
+
+`yuyv_to_gray8`, `downscale2x_gray8`, `yuyv_to_rgb565`, `downscale2x_rgb565`,
+`dot_i16`, `sum_sq_i16`, `peak_abs_i16`, `sad_8x8`, `sad_16x16`. Beyond the
+seam the crate also carries twins for `rms_dbfs_i16`, `gain_i16`, `mix_i16`,
+the channel converters, the integer `convert` pairs, `rotate90_gray8`,
+`sad_4x4` and the Annex-B start-code scan, which the audio, image and video
+packages reach through their own `pie-s3` features.
+
+The four that are NOT twinned say why in the source rather than by omission:
+`satd_4x4_sum` was built twice and measured worse, and the three RGB888
+conversions are impossible on this unit — three bytes a pixel needs a 3-way
+deinterleave and PIE has only 2-way `zip`/`unzip` with no general byte
+permute.
+
+Misaligned buffers are not a fallback to scalar: the unaligned-load idiom
+(`ee.ld.128.usar.ip` + `ee.src.q`) reaches them too, and a slice starting one
+sample in still runs vector code.
+
 ## Where the evidence is
 
 This crate is part of [`rusty_esp_dsp`](https://crates.io/crates/rusty_esp_dsp). The
