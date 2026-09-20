@@ -1983,3 +1983,123 @@ fn convert_i32_to_i24in32_unaligned_src(src: &[i32], dst: &mut [i32]) -> usize {
     let _ = (ps, pd);
     body
 }
+
+/// `rotate90_gray8`: `dst[x * h + (h - 1 - y)] = src[y * w + x]`.
+///
+/// A transpose with the destination column REVERSED, and the reversal is
+/// free: this unit has no byte-reverse instruction, but loading the eight
+/// source rows of a tile BOTTOM-TO-TOP puts the transposed bytes out in
+/// exactly the order the destination run wants them, so the write is
+/// contiguous and forward. The `h - 1 - y` term never appears in the kernel.
+///
+/// The 8x8 byte transpose is eight instructions. `ee.vzip.8/16/32` perform a
+/// perfect shuffle across the register PAIR, which is precisely the three
+/// stages of a transpose at 1-, 2- and 4-byte granularity:
+///
+/// ```text
+///   stage 1   zip.8  (r0,r1) (r2,r3) (r4,r5) (r6,r7)
+///   stage 2   zip.16 (A,B)   (C,D)
+///   stage 3   zip.32 (A2,C2) (B2,D2)
+/// ```
+///
+/// After stage 3 each register holds two whole destination runs back to
+/// back, so the stores are `ee.vst.l.64` and `ee.vst.h.64` -- one half of a
+/// register each, which is the shape a 64-bit run needs.
+///
+/// **Precondition: `w % 8 == 0`, `h % 8 == 0`, and both bases 16-byte
+/// aligned.** Then every 64-bit access this makes is 8-byte aligned: a
+/// source row starts at `y*w + x0` with `x0` a multiple of 8, and a
+/// destination run at `x*h + (h - 8 - y0)` with `y0` a multiple of 8.
+/// Anything else takes the oracle — and the A/B prints the preconditions
+/// beside the verdict so a buffer that quietly failed them could not be
+/// mistaken for a measurement of this code.
+#[allow(unsafe_code)]
+pub fn rotate90_gray8(src: &[u8], width: u32, height: u32, dst: &mut [u8]) -> Result<(), ()> {
+    let (w, h) = (width as usize, height as usize);
+    if src.len() < w * h || dst.len() < w * h {
+        return Err(());
+    }
+    if w == 0 || h == 0 {
+        return Ok(());
+    }
+    if w % 8 != 0 || h % 8 != 0 || !aligned16(src.as_ptr()) || !aligned16(dst.as_ptr()) {
+        // The oracle's own loop, byte for byte.
+        for x in 0..w {
+            for y in 0..h {
+                dst[x * h + (h - 1 - y)] = src[y * w + x];
+            }
+        }
+        return Ok(());
+    }
+
+    let mut x0 = 0usize;
+    while x0 < w {
+        let mut y0 = 0usize;
+        while y0 < h {
+            // The BOTTOM row of the tile, walked upward.
+            let mut ps = unsafe { src.as_ptr().add((y0 + 7) * w + x0) };
+            let mut pd = unsafe { dst.as_mut_ptr().add(x0 * h + (h - 8 - y0)) };
+            let back = w.wrapping_neg();
+            // SAFETY: `w % 8 == 0` and `h % 8 == 0` with `x0 < w`, `y0 < h`
+            // stepping by 8, so the eight source rows `(y0+7-k)*w + x0` and
+            // the eight destination runs `(x0+x)*h + (h-8-y0)` are all fully
+            // inside the `w * h` bytes checked above. Every address is
+            // 8-byte aligned because both bases are 16-byte aligned and both
+            // strides are multiples of 8. q0-q7 only.
+            unsafe {
+                core::arch::asm!(
+                    // eight rows, bottom to top, into the low half of each
+                    "ee.vld.l.64.ip q0, {ps}, 0",
+                    "add {ps}, {ps}, {back}",
+                    "ee.vld.l.64.ip q1, {ps}, 0",
+                    "add {ps}, {ps}, {back}",
+                    "ee.vld.l.64.ip q2, {ps}, 0",
+                    "add {ps}, {ps}, {back}",
+                    "ee.vld.l.64.ip q3, {ps}, 0",
+                    "add {ps}, {ps}, {back}",
+                    "ee.vld.l.64.ip q4, {ps}, 0",
+                    "add {ps}, {ps}, {back}",
+                    "ee.vld.l.64.ip q5, {ps}, 0",
+                    "add {ps}, {ps}, {back}",
+                    "ee.vld.l.64.ip q6, {ps}, 0",
+                    "add {ps}, {ps}, {back}",
+                    "ee.vld.l.64.ip q7, {ps}, 0",
+                    // the transpose
+                    "ee.vzip.8 q0, q1",
+                    "ee.vzip.8 q2, q3",
+                    "ee.vzip.8 q4, q5",
+                    "ee.vzip.8 q6, q7",
+                    "ee.vzip.16 q0, q2",
+                    "ee.vzip.16 q4, q6",
+                    "ee.vzip.32 q0, q4",   // q0 = cols 0,1   q4 = cols 2,3
+                    "ee.vzip.32 q2, q6",   // q2 = cols 4,5   q6 = cols 6,7
+                    // eight destination runs, one per column, stride h
+                    "ee.vst.l.64.ip q0, {pd}, 0",
+                    "add {pd}, {pd}, {hh}",
+                    "ee.vst.h.64.ip q0, {pd}, 0",
+                    "add {pd}, {pd}, {hh}",
+                    "ee.vst.l.64.ip q4, {pd}, 0",
+                    "add {pd}, {pd}, {hh}",
+                    "ee.vst.h.64.ip q4, {pd}, 0",
+                    "add {pd}, {pd}, {hh}",
+                    "ee.vst.l.64.ip q2, {pd}, 0",
+                    "add {pd}, {pd}, {hh}",
+                    "ee.vst.h.64.ip q2, {pd}, 0",
+                    "add {pd}, {pd}, {hh}",
+                    "ee.vst.l.64.ip q6, {pd}, 0",
+                    "add {pd}, {pd}, {hh}",
+                    "ee.vst.h.64.ip q6, {pd}, 0",
+                    ps = inout(reg) ps,
+                    pd = inout(reg) pd,
+                    back = in(reg) back,
+                    hh = in(reg) h,
+                    options(nostack),
+                );
+            }
+            let _ = (ps, pd);
+            y0 += 8;
+        }
+        x0 += 8;
+    }
+    Ok(())
+}

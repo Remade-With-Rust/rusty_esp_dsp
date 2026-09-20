@@ -1801,6 +1801,8 @@ fn main() -> ! {
             });
         }
 
+        pie_rotate90(gd, ys, &mut reference);
+
         report_memory("after_pie");
     }
 
@@ -2244,4 +2246,42 @@ fn main() -> ! {
         // nothing left to do; the numbers are on the wire
         esp_hal::delay::Delay::new().delay_millis(1000);
     }
+}
+
+/// The `rotate90_gray8` A/B, as its own function.
+///
+/// Not a style choice: `main` had grown past the range of Xtensa's `l32r`
+/// literal load (+-256 KB) and the linker refused it with "dangerous
+/// relocation: l32r: literal target out of range". Every kernel arm added to
+/// this probe from here on goes in a function of its own for the same
+/// reason -- the probe is one `main` with forty inline arms, and the limit is
+/// on the FUNCTION, not the binary.
+#[inline(never)]
+fn pie_rotate90(gd: &[u8], ys: &mut [u8], reference: &mut [u8]) {
+    const RW: u32 = 64;
+    const RH: u32 = 32;
+    let rn = (RW as usize) * (RH as usize);
+    println!(
+        "PIEPRECOND rotate90 w%8={} h%8={} src_align={} dst_align={}",
+        RW % 8,
+        RH % 8,
+        gd.as_ptr() as usize % 16,
+        ys.as_ptr() as usize % 16
+    );
+    let _ = rusty_esp_image_core::ops::rotate90_gray8(&gd[..rn], RW, RH, &mut reference[..rn]);
+    let _ = rusty_esp_dsp_esp::pie_s3::rotate90_gray8(&gd[..rn], RW, RH, &mut ys[..rn]);
+    println!(
+        "PIEKERNEL rotate90_gray8 identical={}",
+        reference[..rn] == ys[..rn]
+    );
+    let rnu = rn as u64;
+    measure("rot90_scalar", "px", rnu, || {
+        let _ =
+            rusty_esp_image_core::ops::rotate90_gray8(&gd[..rn], RW, RH, &mut reference[..rn]);
+        Work { pixels: rnu, ..Work::ZERO }
+    });
+    measure("rot90_pie", "px", rnu, || {
+        let _ = rusty_esp_dsp_esp::pie_s3::rotate90_gray8(&gd[..rn], RW, RH, &mut ys[..rn]);
+        Work { pixels: rnu, ..Work::ZERO }
+    });
 }
