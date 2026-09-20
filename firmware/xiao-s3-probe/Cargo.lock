@@ -1461,6 +1461,7 @@ dependencies = [
  "libm",
  "rusty_esp_core",
  "rusty_esp_dsp",
+ "rusty_esp_dsp-esp",
 ]
 
 [[package]]

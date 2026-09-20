@@ -1803,6 +1803,7 @@ fn main() -> ! {
 
         pie_rotate90(gd, ys, &mut reference);
         pie_seam_reach(iv, gd, ys);
+        pie_audio_reach(ibytes, iv);
         pie_fused_family_probe();
 
         report_memory("after_pie");
@@ -2651,5 +2652,40 @@ fn pie_seam_reach(iv: &[i16], gd: &[u8], ys: &mut [u8]) {
     measure("seam_yuyv_gray8", "px", pxu, || {
         let _ = k.yuyv_to_gray8(&gd[..px], &mut ys[..px / 2]);
         Work { pixels: pxu, ..Work::ZERO }
+    });
+}
+
+/// Does `rusty_esp_audio_core`'s re-export reach the twin? (backlog A1/A6)
+///
+/// The shipping PDM firmware calls `rusty_esp_audio_core::rms_dbfs_i16` once
+/// per captured block. Until the `pie-s3` feature existed that was a plain
+/// re-export of the scalar, with a measured -79.6% twin sitting unreachable
+/// one crate away.
+///
+/// As with the dsp seam, correctness cannot see this -- the scalar is the
+/// oracle -- so the check is the clock: the re-export must cost what the
+/// twin costs, not what the oracle costs.
+#[inline(never)]
+fn pie_audio_reach(ibytes: &[u8], iv: &[i16]) {
+    let n = iv.len() as u64;
+
+    let via_audio = rusty_esp_audio_core::rms_dbfs_i16(ibytes);
+    let direct = rusty_esp_dsp_esp::pie_s3::rms_dbfs_i16(ibytes);
+    let oracle = rusty_esp_dsp::sample::rms_dbfs_i16(ibytes);
+    println!(
+        "PIEAUDIO rms agree={} audio={via_audio} direct={direct} oracle={oracle}",
+        via_audio == direct && via_audio == oracle
+    );
+    let pa = rusty_esp_audio_core::peak_abs_i16(iv);
+    let pd = rusty_esp_dsp_esp::pie_s3::peak_abs_i16(iv);
+    println!("PIEAUDIO peak agree={} audio={pa} direct={pd}", pa == pd);
+
+    measure("audio_rms", "sample", n, || {
+        core::hint::black_box(rusty_esp_audio_core::rms_dbfs_i16(ibytes));
+        Work { samples: n, ..Work::ZERO }
+    });
+    measure("audio_peak", "sample", n, || {
+        core::hint::black_box(rusty_esp_audio_core::peak_abs_i16(iv));
+        Work { samples: n, ..Work::ZERO }
     });
 }
