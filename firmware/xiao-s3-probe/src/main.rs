@@ -1802,6 +1802,7 @@ fn main() -> ! {
         }
 
         pie_rotate90(gd, ys, &mut reference);
+        pie_seam_reach(iv, gd, ys);
         pie_fused_family_probe();
 
         report_memory("after_pie");
@@ -2607,4 +2608,48 @@ fn pie_fused_family_probe() {
         println!("P7 mov.u8.qacc   qacc_lo8={:02x?}", got.0);
     }
     println!("P7 == end ==");
+}
+
+/// Does the SEAM reach the twins?
+///
+/// Every other arm in this probe calls `pie_s3::*` directly. That proves the
+/// kernels are correct and fast; it proves NOTHING about the type a firmware
+/// actually holds. `rusty_esp_dsp_esp::default_kernels()` returns `PieS3`,
+/// and for the whole campaign every one of its methods delegated to the
+/// scalar oracle -- a fully-delegating seam in front of a module full of
+/// working twins, with every correctness gate passing.
+///
+/// A correctness gate cannot see this, because the oracle is correct. What
+/// sees it is the CLOCK: if the seam is wired, the trait call costs what the
+/// direct call costs; if it is not, it costs what the scalar costs. Those
+/// differ by an order of magnitude, so the comparison is unambiguous.
+#[inline(never)]
+fn pie_seam_reach(iv: &[i16], gd: &[u8], ys: &mut [u8]) {
+    use rusty_esp_dsp::seam::{PixelKernels, SampleKernels};
+    let k = rusty_esp_dsp_esp::default_kernels();
+    let n = iv.len() as u64;
+
+    // Agreement first -- the seam must still be correct.
+    let direct = rusty_esp_dsp_esp::pie_s3::sum_sq_i16(iv);
+    let via_seam = k.sum_sq_i16(iv);
+    let oracle = rusty_esp_dsp::sample::sum_sq_i16(iv);
+    println!(
+        "PIESEAM sum_sq agree={} seam={via_seam} direct={direct} oracle={oracle}",
+        via_seam == direct && via_seam == oracle
+    );
+
+    measure("seam_sumsq", "sample", n, || {
+        core::hint::black_box(k.sum_sq_i16(iv));
+        Work { samples: n, ..Work::ZERO }
+    });
+    measure("seam_peak", "sample", n, || {
+        core::hint::black_box(k.peak_abs_i16(iv));
+        Work { samples: n, ..Work::ZERO }
+    });
+    let px = gd.len().min(ys.len() / 1) / 2 * 2;
+    let pxu = (px / 2) as u64;
+    measure("seam_yuyv_gray8", "px", pxu, || {
+        let _ = k.yuyv_to_gray8(&gd[..px], &mut ys[..px / 2]);
+        Work { pixels: pxu, ..Work::ZERO }
+    });
 }

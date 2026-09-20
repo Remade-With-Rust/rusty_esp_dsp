@@ -12,11 +12,19 @@
 //! the intrinsics stubbed to scalar, and on the board with them live (D2's
 //! board row).
 //!
-//! **Today no twin exists** (D2 waits for an S3 on the bench): both types
-//! delegate everything to the scalar oracle, the crate is `deny(unsafe_code)`
-//! with no fenced block yet, and it compiles for `xtensa-esp32s3-none-elf`
-//! and `riscv32imafc-unknown-none-elf` so the first twin lands in a crate
-//! that already builds for its chip.
+//! **Seven of the seam's thirteen kernels now run real `ee.*` twins on an
+//! ESP32-S3** -- `yuyv_to_gray8`, `downscale2x_gray8`, `dot_i16`,
+//! `sum_sq_i16`, `peak_abs_i16`, `sad_8x8` and `sad_16x16`. The rest
+//! delegate to the oracle, either because no twin exists yet or because one
+//! was built and MEASURED WORSE (`satd_4x4_sum`; see the ledger's P4 and P6
+//! entries) or is impossible on this unit (`rgb565_to_rgb888` and
+//! `rgb888_to_rgb565` need a 3-way byte deinterleave the ISA does not have).
+//!
+//! The twins are `cfg(target_arch = "xtensa")`. Off-chip -- a host build, a
+//! host test, a RISC-V target -- every method is the scalar oracle, so this
+//! crate builds everywhere and needs nightly only for the Xtensa build.
+//!
+//! `PieP4` still delegates everything: D4 has no board yet.
 
 // `ee.*` reaches Rust only through inline asm, and Xtensa asm is still
 // experimental; the `esp` toolchain is nightly, so this is available. Gated
@@ -39,7 +47,9 @@ use rusty_esp_dsp::seam::Scalar;
 #[cfg(any(feature = "pie-s3", feature = "pie-p4"))]
 use rusty_esp_dsp::seam::{BlockKernels, PixelKernels, SampleKernels};
 
-#[cfg(any(feature = "pie-s3", feature = "pie-p4"))]
+// Only `PieP4` is generated now; `PieS3` writes its impls out so that
+// which kernels are accelerated is readable rather than inferred.
+#[cfg(feature = "pie-p4")]
 macro_rules! delegate_to_scalar {
     ($ty:ident) => {
         impl PixelKernels for $ty {
@@ -114,15 +124,167 @@ macro_rules! delegate_to_scalar {
     };
 }
 
-/// The ESP32-S3 kernel set (`ee.*`, 128-bit PIE). Every kernel is the
-/// scalar oracle until its twin lands; the first candidates, by the D1
-/// share table, are `yuyv_to_rgb888`, `yuyv_to_rgb565` and `satd_4x4_sum`.
+/// The ESP32-S3 kernel set (`ee.*`, 128-bit PIE). Seven of the thirteen
+/// seam kernels run a real twin on an S3; the impls below say which, and
+/// why each of the rest does not.
 #[cfg(feature = "pie-s3")]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PieS3;
 
+/// `PieS3` does NOT use `delegate_to_scalar!`: each method either calls its
+/// twin or states that it is deliberately the oracle. Written out rather
+/// than generated so that "which kernels are actually accelerated" is
+/// readable in one place -- the defect this crate previously had was a
+/// fully-delegating seam sitting in front of a module full of working
+/// twins, where every gate passed and no caller ever reached one.
 #[cfg(feature = "pie-s3")]
-delegate_to_scalar!(PieS3);
+impl PixelKernels for PieS3 {
+    /// Oracle: no twin. 3 bytes a pixel needs a 3-way deinterleave and the
+    /// PIE unit has only 2-way `zip`/`unzip` with no general byte permute.
+    fn yuyv_to_rgb888(&self, src: &[u8], dst: &mut [u8]) -> Result<usize> {
+        Scalar.yuyv_to_rgb888(src, dst)
+    }
+
+    /// Oracle: no twin yet. The last untwinned kernel with high arithmetic
+    /// intensity, and the one place with headroom left.
+    fn yuyv_to_rgb565(&self, src: &[u8], dst: &mut [u8]) -> Result<usize> {
+        Scalar.yuyv_to_rgb565(src, dst)
+    }
+
+    /// TWIN.
+    fn yuyv_to_gray8(&self, src: &[u8], dst: &mut [u8]) -> Result<usize> {
+        #[cfg(target_arch = "xtensa")]
+        {
+            pie_s3::yuyv_to_gray8(src, dst)
+        }
+        #[cfg(not(target_arch = "xtensa"))]
+        {
+            Scalar.yuyv_to_gray8(src, dst)
+        }
+    }
+
+    /// Oracle: impossible on this unit, as for `yuyv_to_rgb888`.
+    fn rgb565_to_rgb888(&self, src: &[u8], dst: &mut [u8]) -> Result<usize> {
+        Scalar.rgb565_to_rgb888(src, dst)
+    }
+
+    /// Oracle: impossible on this unit, as for `yuyv_to_rgb888`.
+    fn rgb888_to_rgb565(&self, src: &[u8], dst: &mut [u8]) -> Result<usize> {
+        Scalar.rgb888_to_rgb565(src, dst)
+    }
+
+    /// TWIN. The twin reports only success or a length failure, so the
+    /// geometry the seam owes its caller is built here; a length failure
+    /// goes to the oracle, which produces the exact error.
+    fn downscale2x_gray8(
+        &self,
+        src: &[u8],
+        width: u32,
+        height: u32,
+        dst: &mut [u8],
+    ) -> Result<Geometry> {
+        #[cfg(target_arch = "xtensa")]
+        {
+            match pie_s3::downscale2x_gray8(src, width, height, dst) {
+                Ok(()) => Geometry::new(
+                    width / 2,
+                    height / 2,
+                    rusty_esp_core::frame::PixelFormat::Gray8,
+                ),
+                Err(()) => Scalar.downscale2x_gray8(src, width, height, dst),
+            }
+        }
+        #[cfg(not(target_arch = "xtensa"))]
+        {
+            Scalar.downscale2x_gray8(src, width, height, dst)
+        }
+    }
+
+    /// Oracle: no twin yet.
+    fn downscale2x_rgb565(
+        &self,
+        src: &[u8],
+        width: u32,
+        height: u32,
+        dst: &mut [u8],
+    ) -> Result<Geometry> {
+        Scalar.downscale2x_rgb565(src, width, height, dst)
+    }
+}
+
+#[cfg(feature = "pie-s3")]
+impl SampleKernels for PieS3 {
+    /// TWIN.
+    fn dot_i16(&self, a: &[i16], b: &[i16]) -> i64 {
+        #[cfg(target_arch = "xtensa")]
+        {
+            pie_s3::dot_i16(a, b)
+        }
+        #[cfg(not(target_arch = "xtensa"))]
+        {
+            Scalar.dot_i16(a, b)
+        }
+    }
+
+    /// TWIN.
+    fn sum_sq_i16(&self, a: &[i16]) -> i64 {
+        #[cfg(target_arch = "xtensa")]
+        {
+            pie_s3::sum_sq_i16(a)
+        }
+        #[cfg(not(target_arch = "xtensa"))]
+        {
+            Scalar.sum_sq_i16(a)
+        }
+    }
+
+    /// TWIN.
+    fn peak_abs_i16(&self, a: &[i16]) -> u16 {
+        #[cfg(target_arch = "xtensa")]
+        {
+            pie_s3::peak_abs_i16(a)
+        }
+        #[cfg(not(target_arch = "xtensa"))]
+        {
+            Scalar.peak_abs_i16(a)
+        }
+    }
+}
+
+#[cfg(feature = "pie-s3")]
+impl BlockKernels for PieS3 {
+    /// TWIN.
+    fn sad_8x8(&self, a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
+        #[cfg(target_arch = "xtensa")]
+        {
+            pie_s3::sad_8x8(a, sa, b, sb)
+        }
+        #[cfg(not(target_arch = "xtensa"))]
+        {
+            Scalar.sad_8x8(a, sa, b, sb)
+        }
+    }
+
+    /// TWIN.
+    fn sad_16x16(&self, a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
+        #[cfg(target_arch = "xtensa")]
+        {
+            pie_s3::sad_16x16(a, sa, b, sb)
+        }
+        #[cfg(not(target_arch = "xtensa"))]
+        {
+            Scalar.sad_16x16(a, sa, b, sb)
+        }
+    }
+
+    /// ORACLE BY MEASUREMENT, not by omission. A twin was built twice --
+    /// once with the 4x4 transpose going through memory (+25.4%) and once
+    /// with it entirely in registers (+7.6%) -- and lost both times. Ledger
+    /// P4 and P6.
+    fn satd_4x4_sum(&self, blocks: &[[i32; 16]]) -> i64 {
+        Scalar.satd_4x4_sum(blocks)
+    }
+}
 
 /// The ESP32-P4 kernel set (`esp.*`, 128-bit). Every kernel is the scalar
 /// oracle until D4.
