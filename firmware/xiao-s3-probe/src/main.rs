@@ -546,6 +546,18 @@ fn main() -> ! {
             Work { blocks: 1, ..Work::ZERO }
         });
 
+        let qref = rusty_esp_dsp::sample::sum_sq_i16(iv);
+        let qpie = rusty_esp_dsp_esp::pie_s3::sum_sq_i16(iv);
+        println!("PIEKERNEL sum_sq_i16 identical={} scalar={qref} pie={qpie}", qref == qpie);
+        measure("sumsq_scalar", "sample", npx, || {
+            core::hint::black_box(rusty_esp_dsp::sample::sum_sq_i16(iv));
+            Work { samples: npx, ..Work::ZERO }
+        });
+        measure("sumsq_pie", "sample", npx, || {
+            core::hint::black_box(rusty_esp_dsp_esp::pie_s3::sum_sq_i16(iv));
+            Work { samples: npx, ..Work::ZERO }
+        });
+
         report_memory("after_pie");
     }
 

@@ -341,3 +341,65 @@ pub fn sad_8x8(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
     }
     Ok(total)
 }
+
+/// `sum_sq_i16` on the PIE unit.
+///
+/// `ee.vmulas.s16.accx` sums the products of **all eight** `s16` lanes into a
+/// single accumulator — the probe fed it lanes `1..=8` against ones and read
+/// back `36`, which is `1+2+..+8` and not `1+2+3+4`. That makes it the
+/// instruction this kernel is shaped like: one load and one multiply-
+/// accumulate per eight samples, where the scalar version needs four
+/// widening multiplies and four adds.
+///
+/// **The accumulator is finite, so the sum is FLUSHED.** A square is at most
+/// `32768^2 = 2^30` and one instruction adds eight of them, so sixteen of
+/// them can reach `2^37`. Draining into an `i64` every sixteen keeps every
+/// partial well inside the accumulator, and integer addition is associative,
+/// so the total is the same `i64` the oracle computes.
+#[allow(unsafe_code)]
+#[must_use]
+pub fn sum_sq_i16(a: &[i16]) -> i64 {
+    let body = a.len() / 8 * 8;
+    if body == 0 || !aligned16(a.as_ptr().cast::<u8>()) {
+        return rusty_esp_dsp::sample::sum_sq_i16(a);
+    }
+
+    let mut total: i64 = 0;
+    let mut p = a.as_ptr().cast::<u8>();
+    let mut left = body / 8; // multiply-accumulates still to do
+    while left > 0 {
+        let batch = left.min(16);
+        left -= batch;
+        let (lo, hi): (u32, u32);
+        // SAFETY: `batch <= left` and the loop advances `p` by 16 per trip,
+        // so the reads stay inside the first `body` elements of `a`. `p` is
+        // 16-byte aligned as `ee.vld.128` requires. q0 and ACCX only.
+        unsafe {
+            core::arch::asm!(
+                "ee.zero.accx",
+                "2:",
+                "ee.vld.128.ip q0, {p}, 16",
+                "ee.vmulas.s16.accx q0, q0",
+                "addi {n}, {n}, -1",
+                "bnez {n}, 2b",
+                "rur.accx_0 {l}",
+                "rur.accx_1 {h}",
+                p = inout(reg) p,
+                n = inout(reg) batch => _,
+                l = out(reg) lo,
+                h = out(reg) hi,
+                options(nostack),
+            );
+        }
+        // A sum of squares is never negative, so the two halves compose
+        // without sign extension.
+        total += ((u64::from(hi) << 32) | u64::from(lo)) as i64;
+    }
+
+    // The tail the vector body did not cover, by the oracle's own arithmetic.
+    for &x in &a[body..] {
+        let v = i32::from(x);
+        total += i64::from(v * v);
+    }
+    total
+}
