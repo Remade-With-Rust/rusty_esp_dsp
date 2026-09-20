@@ -59,9 +59,23 @@ destination its chip arm declines by precondition.
 | B1 | `downscale2x_rgb565` | `rusty_esp_dsp` | the highest arithmetic intensity left (~40 ops per output pixel on 4 loads) — and P6 showed the remaining headroom is in compute-bound kernels, not more unrolling |
 | B2 | `yuyv_to_rgb565` | `rusty_esp_dsp` | colour conversion, 2 bytes out; QACC handles the coefficients |
 | B3 | `find_start_code` / `nal_spans` / `access_units` | `rusty_esp_video-core` | scanning for `00 00 01` is a byte compare — `ee.vcmp.eq.s8` |
-| B4 | `jpeg::find_eoi` | `rusty_esp_image-core` | scanning for `FF D9`, same shape as B3 |
+| ~~B4~~ | ~~`jpeg::find_eoi`~~ | `rusty_esp_image-core` | **DROPPED on inspection.** It scans BACKWARDS from the end and a well-formed JPEG has `FF D9` as its last two bytes, so it exits on the first iteration. Its recorded 175,274 ps/byte is a pathological-input number, not the production cost. Vectorising an O(1)-in-practice loop buys nothing. |
 | B5 | `csi::amplitudes` | `rusty_esp_signal-core` | i8 IQ pairs; `ee.vmulas.s8.accx` exists — but `isqrt` per subcarrier may dominate, so price that first |
 | B6 | `sad_4x4` | `rusty_esp_dsp` | low expectation: the 4x4 geometry was refuted twice |
+
+### The constraint every byte-scan candidate (B3) has to work around
+
+PIE has `ee.vcmp.eq.s8` but **no movemask** — nothing turns a lane mask into
+a scalar bitfield. So "which lane matched" costs a store and a scalar walk,
+which is what the scan already was.
+
+What IS cheap is "did ANY lane match", entirely in registers:
+`ee.zero.accx`, `ee.vmulas.s8.accx` of the mask against a broadcast one, then
+`ee.srs.accx` into a general register and branch on it. The mask lanes are 0
+or −1, so the accumulator is −(match count) and non-zero iff there was a hit.
+That makes a scanner that skips 16 bytes per ~6 instructions and drops to
+scalar only inside a block that hit — the right shape for B3, where the
+common case is no match.
 
 ## Tier C — ruled out, with the reason
 
