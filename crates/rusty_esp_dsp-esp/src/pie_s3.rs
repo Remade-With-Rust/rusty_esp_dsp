@@ -2320,3 +2320,77 @@ pub fn rotate90_gray8(src: &[u8], width: u32, height: u32, dst: &mut [u8]) -> Re
     }
     Ok(())
 }
+
+/// `sad_4x4` on the PIE unit — backlog B6, and a LOW expectation going in:
+/// the 4x4 geometry has been refuted twice (`residual_4x4` +17.8%,
+/// `satd_4x4` +25.4% then +7.6%), because four bytes a row is a poor fit for
+/// a sixteen-byte register. It is here because it costs almost nothing to
+/// try — the body is `sad_8x8`'s with four rows — and a backlog item closed
+/// by a measurement beats one closed by an assumption.
+///
+/// Only the first four lanes of each widened row carry data; lanes 4..=7
+/// hold whatever followed the row in memory and accumulate garbage that is
+/// simply never read. That costs one instruction of widening and no
+/// correctness.
+///
+/// **Requires 16 bytes of slack past the oracle's bound**, because the row
+/// load reads sixteen bytes to use four.
+#[allow(unsafe_code)]
+pub fn sad_4x4(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
+    expect_len(a, 3 * sa + 4)?;
+    expect_len(b, 3 * sb + 4)?;
+    if a.len() < 3 * sa + 16
+        || b.len() < 3 * sb + 16
+        || sa % 16 != 0
+        || sb % 16 != 0
+        || !aligned16(a.as_ptr())
+        || !aligned16(b.as_ptr())
+    {
+        return rusty_esp_dsp::block::sad_4x4(a, sa, b, sb);
+    }
+
+    #[repr(align(16))]
+    struct Q([i16; 8]);
+    let mut acc = Q([0; 8]);
+    let mut pa = a.as_ptr();
+    let mut pb = b.as_ptr();
+    let mut rows = 4u32;
+    // SAFETY: the bound checked above guarantees `3*stride + 16` readable
+    // bytes from each base, and the loop reads exactly 16 at
+    // `base + r*stride` for r in 0..4. Both bases and strides are 16-byte
+    // aligned. q0-q4 and q6 only.
+    unsafe {
+        core::arch::asm!(
+            "ee.zero.q q4",
+            "ee.zero.q q6",
+            "28:",
+            "ee.vld.128.xp q0, {pa}, {sa}",
+            "ee.vld.128.xp q1, {pb}, {sb}",
+            "ee.zero.q q2",
+            "ee.vzip.8 q0, q2",          // lanes 0..=3 are the row
+            "ee.zero.q q3",
+            "ee.vzip.8 q1, q3",
+            "ee.vsubs.s16 q0, q0, q1",
+            "ee.vsubs.s16 q1, q6, q0",
+            "ee.vmax.s16 q0, q0, q1",
+            "ee.vadds.s16 q4, q4, q0",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 28b",
+            "ee.vst.128.ip q4, {lo}, 0",
+            pa = inout(reg) pa,
+            pb = inout(reg) pb,
+            sa = in(reg) sa,
+            sb = in(reg) sb,
+            n = inout(reg) rows,
+            lo = inout(reg) acc.0.as_mut_ptr() => _,
+            options(nostack),
+        );
+    }
+    let _ = (pa, pb, rows);
+    // FOUR lanes, not eight: the rest accumulated bytes past the row.
+    let mut total = 0u32;
+    for k in 0..4 {
+        total += u32::from(acc.0[k] as u16);
+    }
+    Ok(total)
+}

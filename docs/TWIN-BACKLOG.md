@@ -60,8 +60,25 @@ destination its chip arm declines by precondition.
 | B2 | `yuyv_to_rgb565` | `rusty_esp_dsp` | colour conversion, 2 bytes out; QACC handles the coefficients |
 | B3 | `find_start_code` / `nal_spans` / `access_units` | `rusty_esp_video-core` | scanning for `00 00 01` is a byte compare — `ee.vcmp.eq.s8` |
 | ~~B4~~ | ~~`jpeg::find_eoi`~~ | `rusty_esp_image-core` | **DROPPED on inspection.** It scans BACKWARDS from the end and a well-formed JPEG has `FF D9` as its last two bytes, so it exits on the first iteration. Its recorded 175,274 ps/byte is a pathological-input number, not the production cost. Vectorising an O(1)-in-practice loop buys nothing. |
-| B5 | `csi::amplitudes` | `rusty_esp_signal-core` | i8 IQ pairs; `ee.vmulas.s8.accx` exists — but `isqrt` per subcarrier may dominate, so price that first |
-| B6 | `sad_4x4` | `rusty_esp_dsp` | low expectation: the 4x4 geometry was refuted twice |
+| ~~B5~~ | ~~`csi::amplitudes`~~ | `rusty_esp_signal-core` | **PRUNED on arithmetic, no kernel written.** Two arms: the full loop 1,319,368 ps/subcarrier, the same loop without the `isqrt` 217,933. **`isqrt` is 83.5%** — it is Newton's method over 32-bit DIVIDES, sequential, and PIE has no divide. Making the whole vectorisable remainder FREE caps a twin at 16.5%. |
+| ~~B6~~ | ~~`sad_4x4`~~ | `rusty_esp_dsp` | **DONE, −11.8%** (4,053,875 → 3,576,993). See below — it pays where the other 4x4 kernels did not. |
+
+### ★ B6 pays where the other 4x4 kernels did not, and the difference is nameable
+
+`residual_4x4` (+17.8%) and `satd_4x4` (+25.4%, then +7.6% rebuilt) were
+refuted with "four bytes a row is a poor fit for a sixteen-byte register".
+`sad_4x4` has exactly that geometry and came in at **−11.8%**.
+
+The distinguishing feature is not the block size. It is that **`sad_4x4` has
+no transpose.** The two that lost both had to recombine 64-bit halves — one
+through memory, one in registers — and that was the cost the P6 entry named.
+`sad_4x4` streams rows, widens against zero, subtracts and accumulates, with
+nothing crossing lanes at all.
+
+Read the old refutation as "a 4x4 TRANSPOSE does not pay here", not "4x4 does
+not pay here". The `.xp` register-strided load does the row walk in one
+instruction, and only the first four lanes of each widened row carry data —
+the rest accumulate bytes that follow the row and are simply never read.
 
 ### The constraint every byte-scan candidate (B3) has to work around
 

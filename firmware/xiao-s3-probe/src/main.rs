@@ -1833,6 +1833,7 @@ fn main() -> ! {
         pie_seam_reach(iv, gd, ys);
         pie_audio_reach(ibytes, iv);
         pie_convert_reach(ibytes);
+        pie_tier_b();
         pie_fused_family_probe();
 
         report_memory("after_pie");
@@ -2770,4 +2771,73 @@ fn pie_convert_reach(ibytes: &[u8]) {
         let _ = c.process(blk, &mut oracle[1..]);
         Work { samples: cnu, ..Work::ZERO }
     });
+}
+
+/// Tier B: the `sad_4x4` twin (B6), and the PRUNE for `csi::amplitudes` (B5).
+///
+/// B5's loop is `isqrt(16 * (im*im + re*re))` per subcarrier. Only the
+/// multiply-and-add half is vectorisable; `isqrt` is Newton's method over
+/// 32-bit DIVIDES and is sequential. So the ceiling on any twin is the share
+/// that is NOT isqrt, and that is two arms to measure rather than a kernel to
+/// write (`codec-measurement` §11: prune on arithmetic before building).
+#[inline(never)]
+fn pie_tier_b() {
+    // ---- B6 -----------------------------------------------------------
+    {
+        let mut sbuf: alloc::vec::Vec<u128> = alloc::vec![0; 64];
+        // SAFETY: a `Vec<u128>` is 16-byte aligned and initialised.
+        let sb = unsafe {
+            core::slice::from_raw_parts_mut(sbuf.as_mut_ptr().cast::<u8>(), 1024)
+        };
+        for (k, v) in sb.iter_mut().enumerate() {
+            *v = (k.wrapping_mul(173) ^ (k >> 2)) as u8;
+        }
+        let (ba, bb) = sb.split_at(512);
+        const ST: usize = 16;
+        let r4 = rusty_esp_dsp::block::sad_4x4(ba, ST, bb, ST).unwrap_or(0);
+        let p4 = rusty_esp_dsp_esp::pie_s3::sad_4x4(ba, ST, bb, ST).unwrap_or(0);
+        println!("PIEKERNEL sad_4x4 identical={} scalar={r4} pie={p4}", r4 == p4);
+        measure("sad4_scalar", "block", 1, || {
+            core::hint::black_box(rusty_esp_dsp::block::sad_4x4(ba, ST, bb, ST).ok());
+            Work { blocks: 1, ..Work::ZERO }
+        });
+        measure("sad4_pie", "block", 1, || {
+            core::hint::black_box(rusty_esp_dsp_esp::pie_s3::sad_4x4(ba, ST, bb, ST).ok());
+            Work { blocks: 1, ..Work::ZERO }
+        });
+    }
+
+    // ---- B5's prune ----------------------------------------------------
+    {
+        const NS: usize = 512; // subcarriers
+        let mut iq = alloc::vec![0i8; NS * 2];
+        for (k, v) in iq.iter_mut().enumerate() {
+            *v = ((k.wrapping_mul(97) % 255) as i32 - 128) as i8;
+        }
+        let nsu = NS as u64;
+        // the whole loop, as `amplitudes` runs it
+        measure("csi_full", "sample", nsu, || {
+            let mut acc = 0u32;
+            for p in iq.chunks_exact(2) {
+                let im = i32::from(p[0]);
+                let re = i32::from(p[1]);
+                acc = acc.wrapping_add(rusty_esp_dsp::int::isqrt(
+                    (16 * (im * im + re * re)) as u32,
+                ));
+            }
+            core::hint::black_box(acc);
+            Work { samples: nsu, ..Work::ZERO }
+        });
+        // the vectorisable half ALONE: everything but the isqrt
+        measure("csi_no_isqrt", "sample", nsu, || {
+            let mut acc = 0u32;
+            for p in iq.chunks_exact(2) {
+                let im = i32::from(p[0]);
+                let re = i32::from(p[1]);
+                acc = acc.wrapping_add((16 * (im * im + re * re)) as u32);
+            }
+            core::hint::black_box(acc);
+            Work { samples: nsu, ..Work::ZERO }
+        });
+    }
 }
