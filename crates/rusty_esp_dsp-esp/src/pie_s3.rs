@@ -83,6 +83,17 @@ pub fn yuyv_to_gray8(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     let done = if use_simd {
         simd_even_bytes(&src[..body * 2], &mut dst[..body]);
         body
+    } else if aligned16(dst.as_ptr()) && pixels >= 32 {
+        // The SOURCE may sit at any offset -- a cropped sub-region of a
+        // frame starts wherever its left edge does -- while the destination
+        // is a buffer this code allocated and so is aligned. That case used
+        // to take the oracle in full; the unaligned idiom reaches it.
+        //
+        // Sixteen pixels short of the end, because producing the last
+        // window reads the aligned block containing its last byte.
+        let ub = (pixels - 16) / 16 * 16;
+        simd_even_bytes_unaligned_src(&src[..ub * 2], &mut dst[..ub]);
+        ub
     } else {
         0
     };
@@ -242,7 +253,9 @@ pub fn sad_16x16(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
         || !aligned16(a.as_ptr())
         || !aligned16(b.as_ptr())
     {
-        return rusty_esp_dsp::block::sad_16x16(a, sa, b, sb);
+        // Not the oracle any more: the unaligned idiom reaches a block at
+        // ANY position, which in a motion search is all of them.
+        return Ok(sad_16x16_unaligned(a, sa, b, sb));
     }
 
     #[repr(align(16))]
@@ -327,7 +340,9 @@ pub fn sad_8x8(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
         || a.len() < 7 * sa + 16
         || b.len() < 7 * sb + 16
     {
-        return rusty_esp_dsp::block::sad_8x8(a, sa, b, sb);
+        // Not the oracle any more: the unaligned idiom reaches a block at
+        // ANY position, which in a motion search is all of them.
+        return Ok(sad_8x8_unaligned(a, sa, b, sb));
     }
 
     #[repr(align(16))]
@@ -523,9 +538,11 @@ pub fn dot_i16(a: &[i16], b: &[i16]) -> i64 {
 /// [`sum_sq_i16`] and nothing else.
 #[must_use]
 pub fn sum_sq_i16_le(samples: &[u8]) -> (i64, usize) {
+    // No alignment test: `sum_sq_i16` now has an unaligned arm of its own,
+    // so the only question left is whether the bytes ARE samples.
     match rusty_esp_core::pcm::as_i16(samples) {
-        Some(v) if aligned16(samples.as_ptr()) => (sum_sq_i16(v), v.len()),
-        _ => rusty_esp_dsp::sample::sum_sq_i16_le(samples),
+        Some(v) => (sum_sq_i16(v), v.len()),
+        None => rusty_esp_dsp::sample::sum_sq_i16_le(samples),
     }
 }
 
@@ -1051,4 +1068,217 @@ fn dot_i16_unaligned(a: &[i16], b: &[i16]) -> i64 {
         total += i64::from(i32::from(a[k]) * i32::from(b[k]));
     }
     total
+}
+
+/// `sad_16x16` for blocks at ARBITRARY positions -- which, in a motion
+/// search, is all of them.
+///
+/// The aligned twin demands `stride % 16 == 0` and both bases 16-byte
+/// aligned. A current block at a macroblock boundary usually satisfies that;
+/// a reference block at a candidate motion vector essentially never does, so
+/// the search half of the work has been taking the oracle in full.
+///
+/// Each row is one unaligned window: two `ee.ld.128.usar.ip` and one
+/// `ee.src.q`, then the pointer steps by `stride - 16` because the loads
+/// already advanced it by 16. The two streams interleave safely because
+/// every `ee.src.q` sits immediately after its own stream's load, and so
+/// funnels by its own SAR_BYTE.
+///
+/// The arithmetic is the aligned twin's, unchanged: widen against zero with
+/// `ee.vzip.8` (exact for `0..=255`), subtract in `s16` where the difference
+/// cannot saturate, and take the magnitude as `max(d, 0 - d)` where `-255..=255`
+/// cannot saturate either.
+///
+/// **Requires 16 bytes of slack past the oracle's bound.** Producing the
+/// last row's window reads the aligned block CONTAINING its last byte, which
+/// can end 15 bytes beyond it. Reading past a slice is undefined behaviour
+/// however the hardware behaves, so a block without that slack -- the last
+/// one in a buffer sized exactly to the oracle's bound -- takes the scalar
+/// arm.
+#[allow(unsafe_code)]
+fn sad_16x16_unaligned(a: &[u8], sa: usize, b: &[u8], sb: usize) -> u32 {
+    if a.len() < 15 * sa + 32 || b.len() < 15 * sb + 32 {
+        return rusty_esp_dsp::block::sad_16x16(a, sa, b, sb).unwrap_or(0);
+    }
+    #[repr(align(16))]
+    struct Q([i16; 8]);
+    let mut acc_lo = Q([0; 8]);
+    let mut acc_hi = Q([0; 8]);
+    let mut pa = a.as_ptr();
+    let mut pb = b.as_ptr();
+    let adja = sa.wrapping_sub(16);
+    let adjb = sb.wrapping_sub(16);
+    let mut rows = 16u32;
+    // SAFETY: the bound checked above guarantees `15*stride + 32` readable
+    // bytes from each base, and the loop touches at most `15*stride + 31`.
+    // The unaligned idiom needs no alignment of either base or stride.
+    // q0-q7 are the only vector registers used, and SAR is restored.
+    unsafe {
+        core::arch::asm!(
+            "rsr.sar {sar}",
+            "ee.zero.q q4",                  // accumulator, low eight lanes
+            "ee.zero.q q5",                  // accumulator, high eight lanes
+            "10:",
+            "ee.ld.128.usar.ip q0, {pa}, 16",
+            "ee.ld.128.usar.ip q1, {pa}, 0",
+            "ee.src.q q6, q0, q1",           // sixteen bytes of a, any offset
+            "add {pa}, {pa}, {adja}",
+            "ee.ld.128.usar.ip q0, {pb}, 16",
+            "ee.ld.128.usar.ip q1, {pb}, 0",
+            "ee.src.q q7, q0, q1",           // and of b, at its own offset
+            "add {pb}, {pb}, {adjb}",
+            "ee.zero.q q2",
+            "ee.vzip.8 q6, q2",              // a widened: low eight, high eight
+            "ee.zero.q q3",
+            "ee.vzip.8 q7, q3",
+            "ee.vsubs.s16 q6, q6, q7",       // exact: 0..=255 minus 0..=255
+            "ee.vsubs.s16 q2, q2, q3",
+            "ee.zero.q q7",
+            "ee.vsubs.s16 q1, q7, q6",       // -d, exact on -255..=255
+            "ee.vmax.s16 q6, q6, q1",
+            "ee.vsubs.s16 q3, q7, q2",
+            "ee.vmax.s16 q2, q2, q3",
+            "ee.vadds.s16 q4, q4, q6",       // 16 rows x 255 = 4080, fits s16
+            "ee.vadds.s16 q5, q5, q2",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 10b",
+            "ee.vst.128.ip q4, {lo}, 0",
+            "ee.vst.128.ip q5, {hi}, 0",
+            "wsr.sar {sar}",
+            pa = inout(reg) pa,
+            pb = inout(reg) pb,
+            adja = in(reg) adja,
+            adjb = in(reg) adjb,
+            n = inout(reg) rows,
+            lo = inout(reg) acc_lo.0.as_mut_ptr() => _,
+            hi = inout(reg) acc_hi.0.as_mut_ptr() => _,
+            sar = out(reg) _,
+            options(nostack),
+        );
+    }
+    let _ = (pa, pb, rows);
+    let mut total = 0u32;
+    for k in 0..8 {
+        total += u32::from(acc_lo.0[k] as u16) + u32::from(acc_hi.0[k] as u16);
+    }
+    total
+}
+
+/// `sad_8x8` at an arbitrary position, by the same idiom.
+///
+/// Eight bytes a row, so only the LOW half of each widened window carries
+/// data: `ee.vzip.8 q6, q2` puts the first eight bytes in `q6` and the eight
+/// that were read past the row in `q2`, and `q2` is simply never read. The
+/// junk costs one instruction and no correctness.
+#[allow(unsafe_code)]
+fn sad_8x8_unaligned(a: &[u8], sa: usize, b: &[u8], sb: usize) -> u32 {
+    if a.len() < 7 * sa + 32 || b.len() < 7 * sb + 32 {
+        return rusty_esp_dsp::block::sad_8x8(a, sa, b, sb).unwrap_or(0);
+    }
+    #[repr(align(16))]
+    struct Q([i16; 8]);
+    let mut acc = Q([0; 8]);
+    let mut pa = a.as_ptr();
+    let mut pb = b.as_ptr();
+    let adja = sa.wrapping_sub(16);
+    let adjb = sb.wrapping_sub(16);
+    let mut rows = 8u32;
+    // SAFETY: the bound checked above guarantees `7*stride + 32` readable
+    // bytes from each base; the loop touches at most `7*stride + 31`.
+    // q0-q7 only, and SAR is restored.
+    unsafe {
+        core::arch::asm!(
+            "rsr.sar {sar}",
+            "ee.zero.q q4",
+            "11:",
+            "ee.ld.128.usar.ip q0, {pa}, 16",
+            "ee.ld.128.usar.ip q1, {pa}, 0",
+            "ee.src.q q6, q0, q1",
+            "add {pa}, {pa}, {adja}",
+            "ee.ld.128.usar.ip q0, {pb}, 16",
+            "ee.ld.128.usar.ip q1, {pb}, 0",
+            "ee.src.q q7, q0, q1",
+            "add {pb}, {pb}, {adjb}",
+            "ee.zero.q q2",
+            "ee.vzip.8 q6, q2",              // q2 holds the bytes past the row
+            "ee.zero.q q3",
+            "ee.vzip.8 q7, q3",
+            "ee.vsubs.s16 q6, q6, q7",
+            "ee.zero.q q7",
+            "ee.vsubs.s16 q1, q7, q6",
+            "ee.vmax.s16 q6, q6, q1",
+            "ee.vadds.s16 q4, q4, q6",       // 8 rows x 255 = 2040, fits s16
+            "addi {n}, {n}, -1",
+            "bnez {n}, 11b",
+            "ee.vst.128.ip q4, {lo}, 0",
+            "wsr.sar {sar}",
+            pa = inout(reg) pa,
+            pb = inout(reg) pb,
+            adja = in(reg) adja,
+            adjb = in(reg) adjb,
+            n = inout(reg) rows,
+            lo = inout(reg) acc.0.as_mut_ptr() => _,
+            sar = out(reg) _,
+            options(nostack),
+        );
+    }
+    let _ = (pa, pb, rows);
+    let mut total = 0u32;
+    for k in 0..8 {
+        total += u32::from(acc.0[k] as u16);
+    }
+    total
+}
+
+/// Gather the even bytes of an UNALIGNED `src` into an aligned `dst`.
+///
+/// The load side is the unaligned idiom and the store side is unchanged,
+/// which is the shape every kernel in this module can take: `ee.src.q`
+/// reaches any source offset for three instructions per window, while an
+/// unaligned STORE has no equivalent on this unit -- `ee.vst.128` requires
+/// alignment and the alternatives are a lane extract and a byte store each.
+/// So a kernel whose destination is misaligned still belongs to the oracle;
+/// one whose source alone is misaligned does not.
+///
+/// The caller has already reserved sixteen pixels of tail. Two windows a
+/// trip, which is what `ee.vunzip.8` needs to fill a whole 16-byte store.
+#[allow(unsafe_code)]
+fn simd_even_bytes_unaligned_src(src: &[u8], dst: &mut [u8]) {
+    debug_assert_eq!(src.len(), dst.len() * 2);
+    debug_assert_eq!(dst.len() % 16, 0);
+    debug_assert!(aligned16(dst.as_mut_ptr()));
+
+    let mut s = src.as_ptr();
+    let mut d = dst.as_mut_ptr();
+    let mut left = dst.len() / 16;
+    if left == 0 {
+        return;
+    }
+    // SAFETY: each trip consumes 32 source bytes and writes 16, `left`
+    // times. The caller sliced `src` to exactly `2 * dst.len()` and reserved
+    // sixteen pixels beyond it, which covers the one aligned block this
+    // idiom reads past the last byte consumed. `dst` is 16-byte aligned.
+    // q0-q3 only, and SAR is restored.
+    unsafe {
+        core::arch::asm!(
+            "rsr.sar {sar}",
+            "ee.ld.128.usar.ip q0, {s}, 16",
+            "12:",
+            "ee.ld.128.usar.ip q1, {s}, 16",
+            "ee.src.q q2, q0, q1",        // source bytes 0..=15 of the trip
+            "ee.ld.128.usar.ip q0, {s}, 16",
+            "ee.src.q q3, q1, q0",        // and 16..=31
+            "ee.vunzip.8 q2, q3",         // q2 = the sixteen even bytes: luma
+            "ee.vst.128.ip q2, {d}, 16",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 12b",
+            "wsr.sar {sar}",
+            s = inout(reg) s,
+            d = inout(reg) d,
+            n = inout(reg) left => _,
+            sar = out(reg) _,
+            options(nostack),
+        );
+    }
+    let _ = (s, d);
 }

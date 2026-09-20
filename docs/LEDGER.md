@@ -1101,3 +1101,104 @@ applied, which prices the change at zero where it does not matter.
 **A dependency appended to the end of a `Cargo.toml` lands under `[lints]`.**
 `libm` for the dBFS tail went in with a blind `>>` and became a lint key. It
 did not fail the build; it would have failed to be a dependency.
+
+## P3 — ten more, and the alignment check was hiding most of them
+
+| kernel | scalar | PIE | |
+|---|---:|---:|---:|
+| `sum_sq_i16_le` unaligned | 187,453 | 15,392 | **−91.8%** |
+| `sum_sq_i16` unaligned | 166,830 | 14,279 | **−91.4%** |
+| `dot_i16` unaligned | 262,536 | 26,389 | **−89.9%** |
+| `peak_abs_i16` unaligned | 76,672 | 13,735 | **−82.1%** |
+| `downscale2x_gray8` | 235,696 | 46,192 | **−80.4%** |
+| `rms_dbfs_i16` unaligned | 215,282 | 43,272 | **−79.9%** |
+| `yuyv_to_gray8` unaligned src | 45,500 | 12,276 | **−73.0%** |
+| `sad_16x16` unaligned | 34,045,268 | 9,468,093 | **−72.2%** |
+| `stereo_to_mono` | 96,008 | 37,962 | **−60.5%** |
+| `sad_8x8` unaligned | 11,569,412 | 5,279,206 | **−54.4%** |
+
+### ★★ Eight of the ten were work the instrument could not see
+
+P1 and P2 each opened by asking "which kernel next?". The better question
+turned out to be "which PATH is not being measured?" Every twin ended its
+preamble with `!aligned16(p) => return the_oracle(...)`, so a slice one
+sample in got no SIMD at all — and nothing anywhere reported that, because
+the gate still read `identical=true` and the A/B still read a number. It
+read the SCALAR number twice.
+
+That is the reachability defect from `codec-vectorize-kernel/REACHABILITY.md`
+in its purest form, committed by me, in code I had written that week. The
+kernel was not slow. It was **invisible**: work that never runs cannot
+appear in a profile of the work that does.
+
+**`sad_16x16` is where it cost the most.** Its aligned arm requires
+`stride % 16 == 0` AND both bases 16-byte aligned. A current block at a
+macroblock boundary usually qualifies; a reference block at a candidate
+motion vector essentially never does. So the half of block matching that
+a search actually spends its time in was taking the oracle every time, and
+the −77.1% recorded in P1 was measured on the one case that is not the hot
+one.
+
+**The guard that makes this reading honest is one `println!`.** Each new
+A/B prints the offset and stride beside its verdict — `off_a=3 off_b=5
+stride=17`. A buffer that turned out to be aligned after all would have
+measured the aligned path and read as a win that was not there. Do not
+gate an alignment-sensitive kernel without printing the alignment.
+
+### The unaligned idiom
+
+    ee.ld.128.usar.ip   loads the 16-byte-ALIGNED BLOCK containing the
+                        address, and sets SAR_BYTE from its low four bits
+    ee.src.q            funnels the register pair by SAR_BYTE
+
+Read off the part: offset 3 yields bytes 3..=18, offset 7 yields 7..=22.
+The loop unrolls by two so the block loaded for one window is the low half
+of the next and the two block registers swap roles — no register move,
+which this unit does not appear to have. Two streams at DIFFERENT offsets
+work with no extra cost, because every load sets SAR_BYTE and each
+`ee.src.q` sits immediately after its own stream's load.
+
+**It costs a tail, and the tail is a safety property, not a tuning knob.**
+Producing the last window reads the aligned block containing its last byte,
+which can end 15 bytes past it. Reading beyond a slice is undefined
+behaviour whatever the silicon does, so every unaligned body stops short —
+8 samples for the reductions, 16 pixels for the luma gather, 32 bytes of
+slack for the block kernels — and the scalar loop finishes.
+
+**The asymmetry that decides which kernels can take it:** there is no
+unaligned STORE. `ee.vst.128` requires alignment and the alternatives cost
+a lane extract and a byte store each. So a kernel whose SOURCE alone is
+misaligned is reachable — `yuyv_to_gray8` gains −73.0% with a misaligned
+frame and its own aligned output buffer — and a kernel whose destination is
+misaligned still belongs to the oracle.
+
+### The two that were ordinary kernel work
+
+`stereo_to_mono` would have been silently wrong the obvious way. `(l + r) >> 1`
+through `ee.vadds.s16` clamps two near-full-scale samples to 32767 and
+reports half the right answer — **only on loud input**, which a quiet test
+corpus never reaches. The sum has to happen in 32-bit lanes.
+
+`downscale2x_gray8` has no 16-bit shift available, so its sums widen to
+32-bit lanes to divide by four, against ZERO rather than a sign mask since
+a sum of four bytes is never negative. Sixteen output pixels a trip so the
+tail is a full 16-byte store. The round term 2 is BUILT in registers rather
+than loaded (`ee.vcmp.eq.s16 q,q,q` is all-ones, `0 - (-1)` is one, one
+left shift makes two), which avoids depending on `ee.vldbc.32` — an
+instruction this module has still not measured and therefore does not use.
+
+### Also measured, and recorded before anything needs them
+
+`ee.vmul.s16` **wraps** rather than saturates (32767 x 3 reads 32765), so
+it cannot stand in anywhere the scalar clamps — which is why `Gain` has no
+twin yet. `ee.srcmb.s16.qacc` **truncates** rather than rounds (6, 10, 14,
+18 shifted right by two come back 1, 2, 3, 4). `ee.vld.l.64.ip` and
+`ee.vld.h.64.ip` load one half and PRESERVE the other. `ee.movi.32.q`
+inserts a general register into a chosen lane.
+
+### Ruled OUT, with the reason
+
+**RGB565 <-> RGB888 cannot be done on this unit.** Three bytes a pixel needs
+a 3-way deinterleave and PIE has only 2-way `zip`/`unzip` with no general
+byte permute. This is a refutation about the INSTRUCTION SET, not about the
+kernel, and it does not expire when the surrounding code changes.

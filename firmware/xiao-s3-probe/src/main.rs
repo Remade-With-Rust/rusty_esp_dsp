@@ -1084,6 +1084,141 @@ fn main() -> ! {
             });
         }
 
+        // --- SAD at an ARBITRARY position, which is what a search does ---
+        //
+        // The aligned arm needs `stride % 16 == 0` and both bases aligned.
+        // A reference block at a candidate motion vector satisfies neither,
+        // so this arm is the one a real search would take. Stride 17 and
+        // bases at 3 and 5 mod 16 are chosen to fail every condition the
+        // aligned path tests, and all three are printed so that a buffer
+        // which happened to qualify could not be mistaken for a win.
+        {
+            let mut ubuf: alloc::vec::Vec<u128> = alloc::vec![0; 48];
+            // SAFETY: a `Vec<u128>` is 16-byte aligned and initialised;
+            // viewing its 768 bytes as `u8` is a reinterpretation of POD.
+            let ub = unsafe {
+                core::slice::from_raw_parts_mut(ubuf.as_mut_ptr().cast::<u8>(), 768)
+            };
+            for (k, v) in ub.iter_mut().enumerate() {
+                *v = (k.wrapping_mul(131) ^ (k >> 2)) as u8;
+            }
+            const US: usize = 17; // deliberately not a multiple of 16
+            let (ua_blk, ub_blk) = (&ub[3..343], &ub[405..745]);
+            println!(
+                "PIEUNALIGNED sad stride={US} off_a={} off_b={} len={}",
+                ua_blk.as_ptr() as usize % 16,
+                ub_blk.as_ptr() as usize % 16,
+                ua_blk.len()
+            );
+
+            let uref = rusty_esp_dsp::block::sad_16x16(ua_blk, US, ub_blk, US).unwrap_or(0);
+            let upie =
+                rusty_esp_dsp_esp::pie_s3::sad_16x16(ua_blk, US, ub_blk, US).unwrap_or(0);
+            println!(
+                "PIEKERNEL sad_16x16_unaligned identical={} scalar={uref} pie={upie}",
+                uref == upie
+            );
+            measure("sad16_un_scalar", "block", 1, || {
+                core::hint::black_box(
+                    rusty_esp_dsp::block::sad_16x16(ua_blk, US, ub_blk, US).ok(),
+                );
+                Work { blocks: 1, ..Work::ZERO }
+            });
+            measure("sad16_un_pie", "block", 1, || {
+                core::hint::black_box(
+                    rusty_esp_dsp_esp::pie_s3::sad_16x16(ua_blk, US, ub_blk, US).ok(),
+                );
+                Work { blocks: 1, ..Work::ZERO }
+            });
+
+            let u8ref = rusty_esp_dsp::block::sad_8x8(ua_blk, US, ub_blk, US).unwrap_or(0);
+            let u8pie = rusty_esp_dsp_esp::pie_s3::sad_8x8(ua_blk, US, ub_blk, US).unwrap_or(0);
+            println!(
+                "PIEKERNEL sad_8x8_unaligned identical={} scalar={u8ref} pie={u8pie}",
+                u8ref == u8pie
+            );
+            measure("sad8_un_scalar", "block", 1, || {
+                core::hint::black_box(rusty_esp_dsp::block::sad_8x8(ua_blk, US, ub_blk, US).ok());
+                Work { blocks: 1, ..Work::ZERO }
+            });
+            measure("sad8_un_pie", "block", 1, || {
+                core::hint::black_box(
+                    rusty_esp_dsp_esp::pie_s3::sad_8x8(ua_blk, US, ub_blk, US).ok(),
+                );
+                Work { blocks: 1, ..Work::ZERO }
+            });
+        }
+
+        // --- sum_sq_i16_le and rms_dbfs_i16 on an unaligned byte slice ----
+        //
+        // Both used to test 16-byte alignment themselves and hand anything
+        // else to the oracle. They no longer do: the only question left is
+        // whether the bytes ARE samples, and the reduction handles the rest.
+        {
+            let ubytes = &ibytes[2..];
+            println!("PIEUNALIGNED le off={}", ubytes.as_ptr() as usize % 16);
+            let nb = (ubytes.len() / 2) as u64;
+            let lref = rusty_esp_dsp::sample::sum_sq_i16_le(ubytes);
+            let lpie = rusty_esp_dsp_esp::pie_s3::sum_sq_i16_le(ubytes);
+            println!(
+                "PIEKERNEL sum_sq_i16_le_unaligned identical={} scalar={lref:?} pie={lpie:?}",
+                lref == lpie
+            );
+            measure("sumsqle_un_scalar", "sample", nb, || {
+                core::hint::black_box(rusty_esp_dsp::sample::sum_sq_i16_le(ubytes));
+                Work { samples: nb, ..Work::ZERO }
+            });
+            measure("sumsqle_un_pie", "sample", nb, || {
+                core::hint::black_box(rusty_esp_dsp_esp::pie_s3::sum_sq_i16_le(ubytes));
+                Work { samples: nb, ..Work::ZERO }
+            });
+
+            let rref = rusty_esp_dsp::sample::rms_dbfs_i16(ubytes);
+            let rpie = rusty_esp_dsp_esp::pie_s3::rms_dbfs_i16(ubytes);
+            println!(
+                "PIEKERNEL rms_dbfs_i16_unaligned identical={} scalar={rref} pie={rpie}",
+                rref == rpie
+            );
+            measure("rms_un_scalar", "sample", nb, || {
+                core::hint::black_box(rusty_esp_dsp::sample::rms_dbfs_i16(ubytes));
+                Work { samples: nb, ..Work::ZERO }
+            });
+            measure("rms_un_pie", "sample", nb, || {
+                core::hint::black_box(rusty_esp_dsp_esp::pie_s3::rms_dbfs_i16(ubytes));
+                Work { samples: nb, ..Work::ZERO }
+            });
+        }
+
+        // --- yuyv_to_gray8 from an UNALIGNED source, aligned destination -
+        //
+        // A cropped sub-region of a frame begins wherever its left edge
+        // does; the gray buffer it is written into was allocated here and
+        // so is aligned. `&ys[2..]` is that case exactly.
+        {
+            let usrc = &ys[2..];
+            let upx = usrc.len() / 2;
+            println!(
+                "PIEUNALIGNED yuyv src_off={} dst_off={} px={upx}",
+                usrc.as_ptr() as usize % 16,
+                gd.as_ptr() as usize % 16
+            );
+            let _ = pixel::yuyv_to_gray8(usrc, &mut reference[..upx]);
+            let _ = rusty_esp_dsp_esp::pie_s3::yuyv_to_gray8(usrc, &mut gd[..upx]);
+            println!(
+                "PIEKERNEL yuyv_to_gray8_unaligned identical={}",
+                reference[..upx] == gd[..upx]
+            );
+            let u = upx as u64;
+            measure("yuyv_un_scalar", "px", u, || {
+                let _ = pixel::yuyv_to_gray8(usrc, &mut reference[..upx]);
+                Work { pixels: u, ..Work::ZERO }
+            });
+            measure("yuyv_un_pie", "px", u, || {
+                let _ = rusty_esp_dsp_esp::pie_s3::yuyv_to_gray8(usrc, &mut gd[..upx]);
+                Work { pixels: u, ..Work::ZERO }
+            });
+        }
+
         report_memory("after_pie");
     }
 
