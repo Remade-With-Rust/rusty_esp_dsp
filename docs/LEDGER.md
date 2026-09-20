@@ -957,3 +957,73 @@ counting it.** "Production-reachable" is the right question for a kernel
 meant to ship, and the wrong question for one deliberately kept as an oracle
 or a fixture. A census that does not separate them reports a gap where there
 is a design.
+
+## P1 — the ESP32-S3 PIE twins, with semantics read off the silicon (2026-09-19)
+
+D2 waited three sessions for "an S3 on the bench and the TRM". The bench was
+here all along and **the TRM turned out not to be needed**: an instruction run
+on known byte patterns reports its own semantics more exactly than prose can.
+
+The probe loads two 16-byte patterns into q0/q1, runs one `ee.*`, and prints
+q0, q1 AND q2 — because several PIE instructions write their operands in
+place, and which ones do is exactly what is being measured.
+
+### What the silicon said
+
+| instruction | behaviour |
+|---|---|
+| `ee.vunzip.8 qa, qb` | `qa` <- the **even** bytes of `[qa‖qb]`, `qb` <- the **odd** ones, both in place |
+| `ee.vzip.8 qa, qb` | the interleave — so **zipping with zero IS a zero-extending widen**, 16 bytes to two vectors of eight `u16` |
+| `ee.vadds/vsubs.s8/.s16` | signed saturating, little-endian lanes |
+| `ee.vmax/vmin.s8/.s16` | lane-wise, signed |
+| `QACC` | **FOUR** lanes of 40 bits, **BIT-packed**: lane 1 starts at byte 5, not byte 4 |
+| `ee.vmulas.s16.qacc` | accumulates the first **four** lanes only |
+
+And by assembling candidates, what is NOT there: **q0-q7 only; no
+`ee.vabs.*`; no unsigned max, min or subtract; no SAD instruction; no 16-bit
+shift.** Every one of those absences changed a kernel's design.
+
+### Four twins, every one byte-identical, same-binary A/B
+
+| kernel | scalar | PIE | |
+|---|---:|---:|---:|
+| `yuyv_to_gray8` | 52 875 | 9 131 | **−82.7%** (5.8×) |
+| `peak_abs_i16` | 82 915 | 16 288 | **−80.4%** (5.1×) |
+| `sad_16x16` | 34 134 129 | 7 817 854 | **−77.1%** (4.4×) |
+| `sad_8x8` | 11 732 871 | 4 916 568 | **−58.1%** |
+
+**`yuyv_to_gray8` is the shape PIE was made for.** YUYV is `Y0 U Y1 V`, so the
+luma bytes ARE the even indices, and one `ee.vunzip.8` turns 32 source bytes
+into 16 luma bytes where the scalar kernel needs sixteen byte loads and
+sixteen byte stores.
+
+**`peak_abs_i16` needed care at exactly one input.** With no `ee.vabs.*` the
+magnitude must be built, and negating via `ee.vsubs.s16` from zero SATURATES:
+`-32768` negates to `32767` where the oracle reports `32768`. Carrying the
+lane-wise MINIMUM beside the maximum settles it for one instruction a trip.
+
+**The SAD twins are built entirely from signed ops**, because the unsigned
+ones do not exist: widen with `ee.vzip.8` against zero, subtract in `s16`
+where `0..=255` minus `0..=255` cannot saturate, and take the magnitude with
+`ee.vmax.s16(d, 0 - d)` where `-255..=255` cannot saturate either. Each step
+is exact rather than approximately right, which is why the gate passes.
+
+### ★★ Read the semantics off the chip, not the manual
+
+Two of the facts above would have been guessed wrong, and both would have
+produced silently plausible results: that the accumulator holds four lanes
+rather than eight, and that its lanes are **bit**-packed rather than
+byte-aligned. A kernel written from either guess would have summed the wrong
+products into the wrong places and still returned a number.
+
+**The prober costs one firmware arm and settles a whole instruction set.**
+Print every register the instruction could have touched, not just the one you
+expect it to write.
+
+### The alignment work was the enabling step
+
+`ee.vld/vst.128` require 16-byte alignment, which was half of why this was
+parked. Every twin checks it once and hands anything else to the oracle — the
+same two-arm shape I13 put through the audio elements. And the probe's own
+buffers come from a `Vec<u128>`, because a `Vec<u8>` does not promise it and
+the twin would otherwise take its fallback silently and read FLAT.

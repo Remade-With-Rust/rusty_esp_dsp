@@ -160,6 +160,65 @@ mod pie {
             println!("PIE {:<18} qacc_l={:02x?}", "", lo.0);
             println!("PIE {:<18} qacc_h={:02x?}", "", hi.0);
         }
+        // The lane-shift and accumulator-readback forms. `ee.vmulas.*.qacc`
+        // reaches only the first four lanes, so using all eight needs a way
+        // to bring lanes 4-7 down; and an averaging kernel needs the
+        // shift-round-clamp that reads the accumulator back.
+        probe!("srci.2q 8", "ee.srci.2q q0, q1, 8", RAMP, RAMP2);
+        probe!("slci.2q 8", "ee.slci.2q q0, q1, 8", RAMP, RAMP2);
+        {
+            // qacc <- lanes 0..4 of a, times one; then read back with a
+            // shift of 2, which is what `(sum + 2) / 4` would need.
+            let a = Q([0x10, 0, 0x20, 0, 0x30, 0, 0x40, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+            let b = Q([1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]);
+            let mut o = Q([0u8; 16]);
+            // SAFETY: two aligned inputs read, one written; q0/q1 and the
+            // accumulator only.
+            unsafe {
+                core::arch::asm!(
+                    "ee.vld.128.ip q0, {pa}, 0",
+                    "ee.vld.128.ip q1, {pb}, 0",
+                    "ee.zero.qacc",
+                    "ee.vmulas.s16.qacc q0, q1",
+                    "ee.srcmb.s16.qacc q2, {sh}, 0",
+                    "ee.vst.128.ip q2, {po}, 0",
+                    pa = inout(reg) a.0.as_ptr() => _,
+                    pb = inout(reg) b.0.as_ptr() => _,
+                    sh = in(reg) 2usize,
+                    po = inout(reg) o.0.as_mut_ptr() => _,
+                    options(nostack),
+                );
+            }
+            println!("PIE srcmb.s16 in={:02x?}", a.0);
+            println!("PIE {:<18} out(shift 2)={:02x?}", "", o.0);
+        }
+        {
+            // ACCX: a separate accumulator from QACC. If `ee.vmulas.s16.accx`
+            // sums ALL EIGHT lane products into one scalar it is exactly the
+            // dot-product instruction; if it sums four it is not.
+            // a = lanes 1..=8, b = all ones, so a full horizontal MAC reads
+            // 36 and a four-lane one reads 10.
+            let a = Q([1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0]);
+            let b = Q([1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0]);
+            let (mut lo, mut hi): (u32, u32) = (0, 0);
+            // SAFETY: two aligned inputs read; q0/q1 and ACCX only.
+            unsafe {
+                core::arch::asm!(
+                    "ee.vld.128.ip q0, {pa}, 0",
+                    "ee.vld.128.ip q1, {pb}, 0",
+                    "ee.zero.accx",
+                    "ee.vmulas.s16.accx q0, q1",
+                    "rur.accx_0 {l}",
+                    "rur.accx_1 {h}",
+                    pa = inout(reg) a.0.as_ptr() => _,
+                    pb = inout(reg) b.0.as_ptr() => _,
+                    l = out(reg) lo,
+                    h = out(reg) hi,
+                    options(nostack),
+                );
+            }
+            println!("PIE accx.s16 lanes=1..8 xone -> accx_0={lo} accx_1={hi} (36=all eight, 10=four)");
+        }
         println!("PIE == end ==");
     }
 }
