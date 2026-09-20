@@ -1219,6 +1219,132 @@ fn main() -> ! {
             });
         }
 
+        // --- element-wise kernels with UNALIGNED sources, aligned output -
+        //
+        // The destination is a block this code allocated, so it is aligned;
+        // the inputs are whatever the pipeline handed over, and a PcmBlock
+        // pointing part-way into a ring buffer is aligned to nothing. That
+        // asymmetry is the one this unit allows: `ee.src.q` reaches any
+        // source offset, and there is no unaligned store at all.
+        {
+            let ua = &iv[1..];
+            let ub = &jv[1..];
+            let uabytes = &ibytes[2..];
+            let ubbytes = &jbytes[2..];
+            println!(
+                "PIEUNALIGNED elemwise src_a={} src_b={} dst={}",
+                ua.as_ptr() as usize % 16,
+                ub.as_ptr() as usize % 16,
+                msrc.as_ptr() as usize % 16
+            );
+
+            // SAFETY: byte views of the two aligned scratch buffers.
+            let (dref, dpie) = unsafe {
+                (
+                    core::slice::from_raw_parts_mut(msrc.as_mut_ptr().cast::<u8>(), NMIX * 2),
+                    core::slice::from_raw_parts_mut(psrc.as_mut_ptr().cast::<u8>(), NMIX * 2),
+                )
+            };
+
+            // mix_i16
+            let mn = NMIX - 8;
+            let mnu = mn as u64;
+            rusty_esp_audio_core::elements::mix_i16(
+                &uabytes[..mn * 2],
+                &ubbytes[..mn * 2],
+                &mut dref[..mn * 2],
+            )
+            .expect("mix scalar");
+            rusty_esp_dsp_esp::pie_s3::mix_i16(&ua[..mn], &ub[..mn], unsafe {
+                // SAFETY: `dpie` is the byte view of an aligned `Vec<u128>`.
+                core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
+            });
+            println!(
+                "PIEKERNEL mix_i16_unaligned identical={}",
+                dref[..mn * 2] == dpie[..mn * 2]
+            );
+            measure("mix_un_scalar", "sample", mnu, || {
+                let _ = rusty_esp_audio_core::elements::mix_i16(
+                    &uabytes[..mn * 2],
+                    &ubbytes[..mn * 2],
+                    &mut dref[..mn * 2],
+                );
+                Work { samples: mnu, ..Work::ZERO }
+            });
+            measure("mix_un_pie", "sample", mnu, || {
+                // SAFETY: as above.
+                let o = unsafe {
+                    core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
+                };
+                rusty_esp_dsp_esp::pie_s3::mix_i16(&ua[..mn], &ub[..mn], o);
+                Work { samples: mnu, ..Work::ZERO }
+            });
+
+            // mono_to_stereo and stereo_to_mono, against their elements
+            {
+                use rusty_esp_audio_core::elements::{MonoToStereo, StereoToMono};
+                use rusty_esp_audio_core::pipeline::Element;
+                use rusty_esp_dsp::esp_core::pcm::{PcmBlock, PcmFormat, SampleFormat};
+                use rusty_esp_dsp::esp_core::time::Micros;
+                let f_mono = PcmFormat::new(16_000, 1, SampleFormat::I16).expect("fmt");
+                let f_stereo = PcmFormat::new(16_000, 2, SampleFormat::I16).expect("fmt");
+                let hn = 248usize;
+                let hnu = hn as u64;
+
+                let mut up = MonoToStereo;
+                let blk = PcmBlock::new(f_mono, Micros(0), &uabytes[..hn * 2]).expect("blk");
+                let _ = up.process(blk, dref).expect("upmix scalar");
+                rusty_esp_dsp_esp::pie_s3::mono_to_stereo_i16(&ua[..hn], unsafe {
+                    // SAFETY: `dpie` is the byte view of an aligned buffer.
+                    core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
+                });
+                println!(
+                    "PIEKERNEL mono_to_stereo_unaligned identical={}",
+                    dref[..hn * 4] == dpie[..hn * 4]
+                );
+                measure("upmix_un_scalar", "sample", hnu, || {
+                    let blk =
+                        PcmBlock::new(f_mono, Micros(0), &uabytes[..hn * 2]).expect("blk");
+                    let _ = up.process(blk, dref);
+                    Work { samples: hnu, ..Work::ZERO }
+                });
+                measure("upmix_un_pie", "sample", hnu, || {
+                    // SAFETY: as above.
+                    let o = unsafe {
+                        core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
+                    };
+                    rusty_esp_dsp_esp::pie_s3::mono_to_stereo_i16(&ua[..hn], o);
+                    Work { samples: hnu, ..Work::ZERO }
+                });
+
+                let mut dn = StereoToMono;
+                let blk = PcmBlock::new(f_stereo, Micros(0), &uabytes[..hn * 4]).expect("blk");
+                let _ = dn.process(blk, dref).expect("downmix scalar");
+                rusty_esp_dsp_esp::pie_s3::stereo_to_mono_i16(&ua[..hn * 2], unsafe {
+                    // SAFETY: as above.
+                    core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
+                });
+                println!(
+                    "PIEKERNEL stereo_to_mono_unaligned identical={}",
+                    dref[..hn * 2] == dpie[..hn * 2]
+                );
+                measure("downmix_un_scalar", "sample", hnu, || {
+                    let blk =
+                        PcmBlock::new(f_stereo, Micros(0), &uabytes[..hn * 4]).expect("blk");
+                    let _ = dn.process(blk, dref);
+                    Work { samples: hnu, ..Work::ZERO }
+                });
+                measure("downmix_un_pie", "sample", hnu, || {
+                    // SAFETY: as above.
+                    let o = unsafe {
+                        core::slice::from_raw_parts_mut(dpie.as_mut_ptr().cast::<i16>(), NMIX)
+                    };
+                    rusty_esp_dsp_esp::pie_s3::stereo_to_mono_i16(&ua[..hn * 2], o);
+                    Work { samples: hnu, ..Work::ZERO }
+                });
+            }
+        }
+
         report_memory("after_pie");
     }
 

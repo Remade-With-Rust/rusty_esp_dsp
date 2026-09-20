@@ -588,7 +588,13 @@ pub fn mix_i16(a: &[i16], b: &[i16], out: &mut [i16]) {
         let _ = (pa, pb, po);
     }
 
-    let start = if vectorable { body } else { 0 };
+    let start = if vectorable {
+        body
+    } else {
+        // Sources at any offset, destination aligned -- the shape a block
+        // handed over by a pipeline or a ring buffer actually has.
+        mix_i16_unaligned_src(a, b, out)
+    };
     for k in start..n {
         let s = i32::from(a[k]) + i32::from(b[k]);
         out[k] = s.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
@@ -636,7 +642,13 @@ pub fn mono_to_stereo_i16(src: &[i16], dst: &mut [i16]) {
         let _ = (ps, pd);
     }
 
-    let start = if vectorable { body } else { 0 };
+    let start = if vectorable {
+        body
+    } else {
+        // Sources at any offset, destination aligned -- the shape a block
+        // handed over by a pipeline or a ring buffer actually has.
+        mono_to_stereo_i16_unaligned_src(src, dst)
+    };
     for k in start..n {
         dst[k * 2] = src[k];
         dst[k * 2 + 1] = src[k];
@@ -725,7 +737,13 @@ pub fn stereo_to_mono_i16(src: &[i16], dst: &mut [i16]) {
         let _ = (ps, pd);
     }
 
-    let start = if vectorable { body } else { 0 };
+    let start = if vectorable {
+        body
+    } else {
+        // Sources at any offset, destination aligned -- the shape a block
+        // handed over by a pipeline or a ring buffer actually has.
+        stereo_to_mono_i16_unaligned_src(src, dst)
+    };
     for k in start..frames {
         let l = i32::from(src[k * 2]);
         let r = i32::from(src[k * 2 + 1]);
@@ -1281,4 +1299,156 @@ fn simd_even_bytes_unaligned_src(src: &[u8], dst: &mut [u8]) {
         );
     }
     let _ = (s, d);
+}
+
+/// `mix_i16` with UNALIGNED sources and an aligned destination.
+///
+/// The destination is the caller's output block, which is allocated and so
+/// aligned; the two inputs are whatever the pipeline handed over, and a
+/// `PcmBlock` pointing part-way into a ring buffer is not aligned to
+/// anything. Two streams at two different offsets, each `ee.src.q` placed
+/// immediately after its own stream's load so each funnels by its own
+/// SAR_BYTE.
+#[allow(unsafe_code)]
+fn mix_i16_unaligned_src(a: &[i16], b: &[i16], out: &mut [i16]) -> usize {
+    let n = a.len().min(b.len()).min(out.len());
+    if n < UNALIGNED_TAIL + 8 || !aligned16(out.as_ptr().cast::<u8>()) {
+        return 0;
+    }
+    let body = (n - UNALIGNED_TAIL) / 8 * 8;
+    let mut pa = a.as_ptr().cast::<u8>();
+    let mut pb = b.as_ptr().cast::<u8>();
+    let mut po = out.as_mut_ptr().cast::<u8>();
+    let mut left = body / 8;
+    // SAFETY: each trip consumes 16 bytes of each source and writes 16, and
+    // reads at most one 16-byte block beyond what it consumes -- which is
+    // what `UNALIGNED_TAIL` reserves in both inputs. `out` is 16-byte
+    // aligned and `body <= out.len()`. q0-q5 only; SAR is restored.
+    unsafe {
+        core::arch::asm!(
+            "rsr.sar {sar}",
+            "ee.ld.128.usar.ip q0, {pa}, 16",
+            "ee.ld.128.usar.ip q2, {pb}, 16",
+            "13:",
+            "ee.ld.128.usar.ip q1, {pa}, 0",
+            "ee.src.q q4, q0, q1",           // a's window, at a's offset
+            "ee.ld.128.usar.ip q3, {pb}, 0",
+            "ee.src.q q5, q2, q3",           // b's window, at b's offset
+            "ee.vadds.s16 q4, q4, q5",
+            "ee.vst.128.ip q4, {po}, 16",
+            "ee.ld.128.usar.ip q0, {pa}, 16",
+            "ee.ld.128.usar.ip q2, {pb}, 16",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 13b",
+            "wsr.sar {sar}",
+            pa = inout(reg) pa,
+            pb = inout(reg) pb,
+            po = inout(reg) po,
+            n = inout(reg) left => _,
+            sar = out(reg) _,
+            options(nostack),
+        );
+    }
+    let _ = (pa, pb, po);
+    body
+}
+
+/// `mono_to_stereo_i16` from an UNALIGNED source.
+///
+/// `ee.vzip.16` needs the same data in both halves of the pair, and this
+/// unit has no register-move instruction -- so the copy is made by running
+/// `ee.src.q` **twice on the same pair**, which recomputes the identical
+/// window into a second register for one instruction. Cheaper than a
+/// round trip through memory and it needs no scratch.
+#[allow(unsafe_code)]
+fn mono_to_stereo_i16_unaligned_src(src: &[i16], dst: &mut [i16]) -> usize {
+    let n = src.len().min(dst.len() / 2);
+    if n < UNALIGNED_TAIL + 8 || !aligned16(dst.as_ptr().cast::<u8>()) {
+        return 0;
+    }
+    let body = (n - UNALIGNED_TAIL) / 8 * 8;
+    let mut ps = src.as_ptr().cast::<u8>();
+    let mut pd = dst.as_mut_ptr().cast::<u8>();
+    let mut left = body / 8;
+    // SAFETY: each trip consumes 16 source bytes and writes 32, reading at
+    // most one block beyond -- reserved by `UNALIGNED_TAIL`. `dst` holds
+    // `2 * n` samples and is 16-byte aligned. q0-q3 only; SAR is restored.
+    unsafe {
+        core::arch::asm!(
+            "rsr.sar {sar}",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "14:",
+            "ee.ld.128.usar.ip q1, {ps}, 0",
+            "ee.src.q q2, q0, q1",
+            "ee.src.q q3, q0, q1",           // the same window again: a copy
+            "ee.vzip.16 q2, q3",             // every lane twice
+            "ee.vst.128.ip q2, {pd}, 16",
+            "ee.vst.128.ip q3, {pd}, 16",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 14b",
+            "wsr.sar {sar}",
+            ps = inout(reg) ps,
+            pd = inout(reg) pd,
+            n = inout(reg) left => _,
+            sar = out(reg) _,
+            options(nostack),
+        );
+    }
+    let _ = (ps, pd);
+    body
+}
+
+/// `stereo_to_mono_i16` from an UNALIGNED source.
+///
+/// Two windows a trip because a frame is two samples, then the same
+/// 32-bit-lane downmix the aligned twin uses -- `ee.vadds.s16` would clamp
+/// two near-full-scale samples and report half the right answer.
+#[allow(unsafe_code)]
+fn stereo_to_mono_i16_unaligned_src(src: &[i16], dst: &mut [i16]) -> usize {
+    let frames = (src.len() / 2).min(dst.len());
+    if frames < UNALIGNED_TAIL + 8 || !aligned16(dst.as_ptr().cast::<u8>()) {
+        return 0;
+    }
+    let body = (frames - UNALIGNED_TAIL) / 8 * 8;
+    let mut ps = src.as_ptr().cast::<u8>();
+    let mut pd = dst.as_mut_ptr().cast::<u8>();
+    let mut left = body / 8;
+    // SAFETY: each trip consumes 32 source bytes (8 frames) and writes 16,
+    // reading at most one block beyond -- reserved by `UNALIGNED_TAIL`.
+    // `dst` is 16-byte aligned. q0-q6 only; SAR is restored.
+    unsafe {
+        core::arch::asm!(
+            "rsr.sar {sar}",
+            "ee.zero.q q6",
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "15:",
+            "ee.ld.128.usar.ip q1, {ps}, 16",
+            "ee.src.q q2, q0, q1",           // frames 0..=3 interleaved
+            "ee.ld.128.usar.ip q0, {ps}, 16",
+            "ee.src.q q3, q1, q0",           // frames 4..=7
+            "ee.vunzip.16 q2, q3",           // q2 = the eight L, q3 = the eight R
+            "ee.vcmp.lt.s16 q4, q2, q6",
+            "ee.vcmp.lt.s16 q5, q3, q6",
+            "ee.vzip.16 q2, q4",             // L sign-extended into i32 lanes
+            "ee.vzip.16 q3, q5",
+            "ee.vadds.s32 q2, q2, q3",
+            "ee.vadds.s32 q4, q4, q5",
+            "ssai 1",
+            "ee.vsr.32 q2, q2",              // arithmetic: floors like `>>`
+            "ee.vsr.32 q4, q4",
+            "ee.vunzip.16 q2, q4",           // low halves: eight mono samples
+            "ee.vst.128.ip q2, {pd}, 16",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 15b",
+            "wsr.sar {sar}",
+            ps = inout(reg) ps,
+            pd = inout(reg) pd,
+            n = inout(reg) left => _,
+            sar = out(reg) _,
+            options(nostack),
+        );
+    }
+    let _ = (ps, pd);
+    body
 }
