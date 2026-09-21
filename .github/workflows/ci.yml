@@ -74,3 +74,44 @@ jobs:
       # need the esp toolchain (xtensa-esp32s3-none-elf, build-std) and are
       # checked locally, ledger row D2.
       - run: cargo check -p rusty_esp_dsp-esp --no-default-features --features pie-p4 --target ${{ matrix.target }}
+
+  # ---------------------------------------------------------------------
+  # The firmware actually builds.
+  #
+  # This job exists because "nothing builds this" is a state that persists
+  # SILENTLY. On 2026-09-21 two firmwares in this family were found to have
+  # been uncompilable for long enough that a security decision -- moving the
+  # device key out of the owner's NVS partition, taken 2026-09-05 -- never
+  # reached them, and a struct they initialise had gained two fields. Nobody
+  # was careless; there was simply no signal, because a compile error only
+  # helps if something compiles.
+  #
+  # Xtensa bare metal: espup's toolchain and NO ESP-IDF. These are esp-hal
+  # firmwares, so the slow half of an ESP build never happens and this is
+  # cheap enough to run on every push. The ESP-IDF firmwares in this family
+  # are minutes each and belong on a schedule instead.
+  firmware:
+    name: firmware (${{ matrix.project }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project:
+          - xiao-s3-probe
+    steps:
+      - uses: actions/checkout@v4
+      - name: Authorise private sibling fetches
+        if: ${{ env.JANUS_GIT_TOKEN != '' }}
+        shell: bash
+        run: git config --global url."https://x-access-token:${JANUS_GIT_TOKEN}@github.com/".insteadOf "https://github.com/"
+      - uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          default: true
+          buildtargets: esp32s3
+          # ldproxy links an ESP-IDF app. These are bare metal and do not
+          # need it; installing it would only cost time.
+          ldproxy: false
+      # `build-std = ["core", "alloc"]` in the firmware's .cargo/config.toml
+      # needs rust-src, which the action above installs.
+      - run: cargo build --release
+        working-directory: firmware/${{ matrix.project }}
