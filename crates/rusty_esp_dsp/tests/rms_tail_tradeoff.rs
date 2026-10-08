@@ -72,13 +72,22 @@ fn the_two_cheaper_tails_are_within_a_millionth_of_a_decibel() {
             at_ns = (acc, n);
         }
     }
-    println!("TRADEOFF f32 max_err={worst32:e} dB at acc={} n={}", at32.0, at32.1);
-    println!("TRADEOFF nosqrt max_err={worst_ns:e} dB at acc={} n={}", at_ns.0, at_ns.1);
+    println!(
+        "TRADEOFF f32 max_err={worst32:e} dB at acc={} n={}",
+        at32.0, at32.1
+    );
+    println!(
+        "TRADEOFF nosqrt max_err={worst_ns:e} dB at acc={} n={}",
+        at_ns.0, at_ns.1
+    );
 
     // A VAD threshold is set in whole decibels and a log line prints one
     // decimal. Both forms must be orders of magnitude inside that.
     assert!(worst32 < 1e-3, "f32 tail error {worst32:e} dB is too large");
-    assert!(worst_ns < 1e-3, "no-sqrt tail error {worst_ns:e} dB is too large");
+    assert!(
+        worst_ns < 1e-3,
+        "no-sqrt tail error {worst_ns:e} dB is too large"
+    );
 }
 
 /// The published behaviours must survive either form.
@@ -108,7 +117,10 @@ fn the_documented_levels_hold_for_every_form() {
         ("f32", tail_f32(acc, n)),
         ("nosqrt", tail_f64_nosqrt(acc, n)),
     ] {
-        assert!((db + 6.0206).abs() < 0.001, "{name}: half scale is {db} dBFS");
+        assert!(
+            (db + 6.0206).abs() < 0.001,
+            "{name}: half scale is {db} dBFS"
+        );
     }
 }
 
@@ -136,8 +148,13 @@ fn neither_cheaper_tail_is_bit_identical_but_both_are_far_inside_a_millidecibel(
         let a = tail_f64(acc, n);
         Some((a, tail_f64_nosqrt(acc, n), tail_f32(acc, n)))
     };
-    let feed = |acc: i64, n: usize, checked: &mut u64, d_ns: &mut u64, d_32: &mut u64,
-                    w_ns: &mut f64, w_32: &mut f64| {
+    let feed = |acc: i64,
+                n: usize,
+                checked: &mut u64,
+                d_ns: &mut u64,
+                d_32: &mut u64,
+                w_ns: &mut f64,
+                w_32: &mut f64| {
         if let Some((a, ns, f3)) = note(acc, n) {
             *checked += 1;
             if a.to_bits() != ns.to_bits() {
@@ -152,26 +169,64 @@ fn neither_cheaper_tail_is_bit_identical_but_both_are_far_inside_a_millidecibel(
         }
     };
 
-    for &n in &[1usize, 2, 4, 16, 64, 160, 256, 320, 512, 1024, 4096, 8000, 16000, 48000] {
+    for &n in &[
+        1usize, 2, 4, 16, 64, 160, 256, 320, 512, 1024, 4096, 8000, 16000, 48000,
+    ] {
         let max = (n as i64).saturating_mul(32768).saturating_mul(32768);
         let mut acc = 1i64;
         while acc < max {
-            feed(acc, n, &mut checked, &mut d_ns, &mut d_32, &mut w_ns, &mut w_32);
-            feed(max - acc, n, &mut checked, &mut d_ns, &mut d_32, &mut w_ns, &mut w_32);
+            feed(
+                acc,
+                n,
+                &mut checked,
+                &mut d_ns,
+                &mut d_32,
+                &mut w_ns,
+                &mut w_32,
+            );
+            feed(
+                max - acc,
+                n,
+                &mut checked,
+                &mut d_ns,
+                &mut d_32,
+                &mut w_ns,
+                &mut w_32,
+            );
             acc += (acc / 512).max(1);
         }
-        feed(max, n, &mut checked, &mut d_ns, &mut d_32, &mut w_ns, &mut w_32);
+        feed(
+            max,
+            n,
+            &mut checked,
+            &mut d_ns,
+            &mut d_32,
+            &mut w_ns,
+            &mut w_32,
+        );
     }
     let mut lcg: u64 = 0x2545_F491_4F6C_DD1D;
     for _ in 0..3_000_000u32 {
-        lcg = lcg.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        lcg = lcg
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
         let n = ((lcg >> 40) as usize % 48_000) + 1;
         let max = (n as i64).saturating_mul(32768).saturating_mul(32768);
         let acc = ((lcg >> 8) as i64).rem_euclid(max) + 1;
-        feed(acc, n, &mut checked, &mut d_ns, &mut d_32, &mut w_ns, &mut w_32);
+        feed(
+            acc,
+            n,
+            &mut checked,
+            &mut d_ns,
+            &mut d_32,
+            &mut w_ns,
+            &mut w_32,
+        );
     }
 
-    println!("TAILSWEEP checked={checked} nosqrt_differ={d_ns} nosqrt_max={w_ns:e} f32_differ={d_32} f32_max={w_32:e}");
+    println!(
+        "TAILSWEEP checked={checked} nosqrt_differ={d_ns} nosqrt_max={w_ns:e} f32_differ={d_32} f32_max={w_32:e}"
+    );
     assert!(w_ns < 1e-3, "no-sqrt error {w_ns:e} dB");
     assert!(w_32 < 1e-3, "f32 error {w_32:e} dB");
 }

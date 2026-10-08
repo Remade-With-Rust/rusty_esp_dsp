@@ -184,8 +184,7 @@ pub fn convert(input: PcmBlock<'_>, to: SampleFormat, out: &mut [u8]) -> Result<
             o.copy_from_slice(&v.to_le_bytes());
         }),
         (I32, F32) | (I24In32, F32) => each!(|i, o| {
-            let v =
-                (i32::from_le_bytes([i[0], i[1], i[2], i[3]]) as f32) * (1.0 / 2_147_483_648.0);
+            let v = (i32::from_le_bytes([i[0], i[1], i[2], i[3]]) as f32) * (1.0 / 2_147_483_648.0);
             o.copy_from_slice(&v.to_le_bytes());
         }),
         (F32, I16) => each!(|i, o| {

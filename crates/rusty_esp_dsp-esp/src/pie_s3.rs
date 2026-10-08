@@ -56,6 +56,43 @@ fn aligned16(p: *const u8) -> bool {
     (p as usize) % 16 == 0
 }
 
+/// The fewest elements left for the vector arm after a peel. Below this a
+/// peel would buy nothing.
+const PEEL_MIN: usize = 32;
+
+/// How many elements to run through the scalar arm before `dst` reaches a
+/// 16-byte boundary, when stepping `step` bytes per element.
+///
+/// Zero when no peel is wanted: `dst` is already aligned, `step` can never
+/// land on a boundary from where `dst` starts (a stereo frame of two i16
+/// from an address 2 mod 4), or fewer than [`PEEL_MIN`] of the `n` elements
+/// would be left.
+///
+/// **Why this exists (round 2, R1).** Every kernel that calls this needs an
+/// aligned DESTINATION for its vector arm, aligned or `_unaligned_src`
+/// alike, and a destination off a boundary sent the WHOLE call to the scalar
+/// loop: 4 to 11 times slower, decided by where an allocator or a ring
+/// buffer happened to put a block. A peel of at most fifteen elements makes
+/// the speed a property of the length instead of the address. The peeled
+/// head is the oracle's own loop, so the bytes cannot change.
+///
+/// **The shape is measured.** Each kernel is a public function that tests
+/// its destination and calls an always-inlined `_body`; only a destination
+/// off a boundary reaches the out-of-line `_peeled`. Two earlier shapes
+/// cost ALIGNED calls 3-12 %: one that called itself on the rest (a
+/// recursive function is not inlined), and one that computed the peel and
+/// re-sliced on every call (about twenty instructions before the loop).
+#[inline]
+fn peel(dst: *const u8, step: usize, n: usize) -> usize {
+    let to = (dst as usize).wrapping_neg() % 16;
+    let h = to / step;
+    if to % step != 0 || n < h + PEEL_MIN {
+        0
+    } else {
+        h
+    }
+}
+
 /// `yuyv_to_gray8` on the 128-bit PIE unit.
 ///
 /// YUYV is `Y0 U Y1 V`, so the luma bytes are exactly the EVEN indices of the
@@ -68,6 +105,32 @@ fn aligned16(p: *const u8) -> bool {
 /// it selects the same bytes and does no arithmetic. The gate is
 /// `twin_matches_scalar` over a generated corpus, on the board.
 pub fn yuyv_to_gray8(src: &[u8], dst: &mut [u8]) -> Result<usize> {
+    if aligned16(dst.as_ptr()) {
+        yuyv_to_gray8_body(src, dst)
+    } else {
+        yuyv_to_gray8_peeled(src, dst)
+    }
+}
+
+/// R1: a destination off a boundary is brought onto one first.
+#[inline(never)]
+fn yuyv_to_gray8_peeled(src: &[u8], dst: &mut [u8]) -> Result<usize> {
+    let pixels = src.len() / 2;
+    // the body owns the validation and its errors
+    if src.len() % 2 != 0 || dst.len() < pixels {
+        return yuyv_to_gray8_body(src, dst);
+    }
+    let h = peel(dst.as_ptr(), 1, pixels);
+    for k in 0..h {
+        dst[k] = src[k * 2];
+    }
+    yuyv_to_gray8_body(&src[h * 2..pixels * 2], &mut dst[h..pixels])?;
+    Ok(pixels)
+}
+
+/// The kernel proper; see the public function of the same name.
+#[inline(always)]
+fn yuyv_to_gray8_body(src: &[u8], dst: &mut [u8]) -> Result<usize> {
     // The oracle's validation, in the oracle's order, so the errors match.
     if src.len() % 2 != 0 {
         return Err(Error::InvalidGeometry);
@@ -91,7 +154,11 @@ pub fn yuyv_to_gray8(src: &[u8], dst: &mut [u8]) -> Result<usize> {
         //
         // Sixteen pixels short of the end, because producing the last
         // window reads the aligned block containing its last byte.
-        let ub = if pixels < 64 { 0 } else { (pixels - 16) / 48 * 48 };
+        let ub = if pixels < 64 {
+            0
+        } else {
+            (pixels - 16) / 48 * 48
+        };
         simd_even_bytes_unaligned_src(&src[..ub * 2], &mut dst[..ub]);
         ub
     } else {
@@ -135,6 +202,8 @@ fn simd_even_bytes(src: &[u8], dst: &mut [u8]) {
     // `ee.vld/vst.128` require. q0-q3 only.
     unsafe {
         core::arch::asm!(
+            "j 26f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "26:",
             "ee.vld.128.ip q0, {s}, 16",
             "ee.vld.128.ip q1, {s}, 16",
@@ -199,6 +268,8 @@ pub fn peak_abs_i16(a: &[i16]) -> u16 {
             // q1 = running maxima, q2 = running minima.
             "ee.vld.128.ip q1, {hi}, 0",
             "ee.vld.128.ip q2, {lo}, 0",
+            "j 2f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "2:",
             "ee.vld.128.ip q0, {p}, 16",
             "ee.vld.128.ip q3, {p}, 16",
@@ -270,11 +341,7 @@ pub fn sad_16x16(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
     // The oracle's own bounds, in its order.
     expect_len(a, 15 * sa + 16)?;
     expect_len(b, 15 * sb + 16)?;
-    if sa % 16 != 0
-        || sb % 16 != 0
-        || !aligned16(a.as_ptr())
-        || !aligned16(b.as_ptr())
-    {
+    if sa % 16 != 0 || sb % 16 != 0 || !aligned16(a.as_ptr()) || !aligned16(b.as_ptr()) {
         // Not the oracle any more: the unaligned idiom reaches a block at
         // ANY position, which in a motion search is all of them.
         return Ok(sad_16x16_unaligned(a, sa, b, sb));
@@ -295,6 +362,8 @@ pub fn sad_16x16(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
             "ee.zero.q q4",              // accumulator, low eight lanes
             "ee.zero.q q5",              // accumulator, high eight lanes
             "ee.zero.q q6",              // a constant zero, for the negations
+            "j 2f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "2:",
             // `ee.vld.128.xp` loads AND advances by a register-valued
             // stride, which is exactly what a row walk wants -- it replaces
@@ -381,6 +450,8 @@ pub fn sad_8x8(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
         core::arch::asm!(
             "ee.zero.q q4",
             "ee.zero.q q6",
+            "j 2f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "2:",
             // As in `sad_16x16`: load and stride in one instruction.
             "ee.vld.128.xp q0, {pa}, {sa}",
@@ -458,6 +529,8 @@ pub fn sum_sq_i16(a: &[i16]) -> i64 {
         unsafe {
             core::arch::asm!(
                 "ee.zero.accx",
+                "j 2f",               // R2: over the padding, which is not code
+                ".p2align 4",
                 "2:",
                 "ee.vld.128.ip q0, {p}, 16",
                 "ee.vld.128.ip q1, {p}, 16",
@@ -535,6 +608,8 @@ pub fn dot_i16(a: &[i16], b: &[i16]) -> i64 {
         unsafe {
             core::arch::asm!(
                 "ee.zero.accx",
+                "j 2f",               // R2: over the padding, which is not code
+                ".p2align 4",
                 "2:",
                 "ee.vld.128.ip q0, {pa}, 16",
                 "ee.vld.128.ip q1, {pb}, 16",
@@ -591,8 +666,30 @@ pub fn sum_sq_i16_le(samples: &[u8]) -> (i64, usize) {
 /// `ee.vadds.s16` IS this operation: eight lanes, clamped to the i16 range,
 /// one instruction. The scalar arm spends a widen, an add, two compares and
 /// a narrow per sample to reach the same eight values.
-#[allow(unsafe_code)]
 pub fn mix_i16(a: &[i16], b: &[i16], out: &mut [i16]) {
+    if aligned16(out.as_ptr().cast::<u8>()) {
+        mix_i16_body(a, b, out);
+    } else {
+        mix_i16_peeled(a, b, out);
+    }
+}
+
+/// R1: a destination off a boundary is brought onto one first.
+#[inline(never)]
+fn mix_i16_peeled(a: &[i16], b: &[i16], out: &mut [i16]) {
+    let n = a.len().min(b.len()).min(out.len());
+    let h = peel(out.as_ptr().cast::<u8>(), 2, n);
+    for k in 0..h {
+        let s = i32::from(a[k]) + i32::from(b[k]);
+        out[k] = s.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16;
+    }
+    mix_i16_body(&a[h..n], &b[h..n], &mut out[h..n]);
+}
+
+/// The kernel proper; see the public function of the same name.
+#[allow(unsafe_code)]
+#[inline(always)]
+fn mix_i16_body(a: &[i16], b: &[i16], out: &mut [i16]) {
     let n = a.len().min(b.len()).min(out.len());
     // NOT any of the ALU-fused forms. `ee.vadds.s16.ld.incp` measured
     // +64.6% here and `ee.vadds.s16.st.incp` +57% -- the family is slow
@@ -614,6 +711,8 @@ pub fn mix_i16(a: &[i16], b: &[i16], out: &mut [i16]) {
         // aligned. q0/q1/q2 only.
         unsafe {
             core::arch::asm!(
+                "j 3f",               // R2: over the padding, which is not code
+                ".p2align 4",
                 "3:",
                 "ee.vld.128.ip q0, {pa}, 16",
                 "ee.vld.128.ip q1, {pb}, 16",
@@ -655,14 +754,36 @@ pub fn mix_i16(a: &[i16], b: &[i16], out: &mut [i16]) {
 /// itself, which is duplication. Eight input samples become sixteen output
 /// samples in five instructions, against the scalar arm's eight loads and
 /// sixteen stores.
-#[allow(unsafe_code)]
 pub fn mono_to_stereo_i16(src: &[i16], dst: &mut [i16]) {
+    if aligned16(dst.as_ptr().cast::<u8>()) {
+        mono_to_stereo_i16_body(src, dst);
+    } else {
+        mono_to_stereo_i16_peeled(src, dst);
+    }
+}
+
+/// R1: four bytes of destination per sample, so a destination 2 mod 4
+/// can never be peeled onto a boundary and keeps the scalar arm.
+#[inline(never)]
+fn mono_to_stereo_i16_peeled(src: &[i16], dst: &mut [i16]) {
+    let n = src.len().min(dst.len() / 2);
+    let h = peel(dst.as_ptr().cast::<u8>(), 4, n);
+    for k in 0..h {
+        dst[k * 2] = src[k];
+        dst[k * 2 + 1] = src[k];
+    }
+    mono_to_stereo_i16_body(&src[h..n], &mut dst[h * 2..n * 2]);
+}
+
+/// The kernel proper; see the public function of the same name.
+#[allow(unsafe_code)]
+#[inline(always)]
+fn mono_to_stereo_i16_body(src: &[i16], dst: &mut [i16]) {
     let n = src.len().min(dst.len() / 2);
     // SIXTEEN a trip.
     let body = n / 16 * 16;
-    let vectorable = body > 0
-        && aligned16(src.as_ptr().cast::<u8>())
-        && aligned16(dst.as_ptr().cast::<u8>());
+    let vectorable =
+        body > 0 && aligned16(src.as_ptr().cast::<u8>()) && aligned16(dst.as_ptr().cast::<u8>());
 
     if vectorable {
         let mut ps = src.as_ptr().cast::<u8>();
@@ -673,6 +794,8 @@ pub fn mono_to_stereo_i16(src: &[i16], dst: &mut [i16]) {
         // samples, so both stay in bounds. Both are 16-byte aligned.
         unsafe {
             core::arch::asm!(
+                "j 4f",               // R2: over the padding, which is not code
+                ".p2align 4",
                 "4:",
                 "ee.vld.128.ip q0, {ps}, 0",  // the SAME sixteen bytes into
                 "ee.vld.128.ip q1, {ps}, 16", // both halves of the zip pair
@@ -744,13 +867,35 @@ pub fn rms_dbfs_i16(samples: &[u8]) -> f32 {
 /// The block saves and restores SAR. `ssai` writes it, inline `asm!` on
 /// Xtensa has no way to declare it clobbered, and the shift the compiler
 /// emits on the other side of this block is entitled to assume it survived.
-#[allow(unsafe_code)]
 pub fn stereo_to_mono_i16(src: &[i16], dst: &mut [i16]) {
+    if aligned16(dst.as_ptr().cast::<u8>()) {
+        stereo_to_mono_i16_body(src, dst);
+    } else {
+        stereo_to_mono_i16_peeled(src, dst);
+    }
+}
+
+/// R1: a destination off a boundary is brought onto one first.
+#[inline(never)]
+fn stereo_to_mono_i16_peeled(src: &[i16], dst: &mut [i16]) {
+    let frames = (src.len() / 2).min(dst.len());
+    let h = peel(dst.as_ptr().cast::<u8>(), 2, frames);
+    for k in 0..h {
+        let l = i32::from(src[k * 2]);
+        let r = i32::from(src[k * 2 + 1]);
+        dst[k] = ((l + r) >> 1) as i16;
+    }
+    stereo_to_mono_i16_body(&src[h * 2..frames * 2], &mut dst[h..frames]);
+}
+
+/// The kernel proper; see the public function of the same name.
+#[allow(unsafe_code)]
+#[inline(always)]
+fn stereo_to_mono_i16_body(src: &[i16], dst: &mut [i16]) {
     let frames = (src.len() / 2).min(dst.len());
     let body = frames / 8 * 8;
-    let vectorable = body > 0
-        && aligned16(src.as_ptr().cast::<u8>())
-        && aligned16(dst.as_ptr().cast::<u8>());
+    let vectorable =
+        body > 0 && aligned16(src.as_ptr().cast::<u8>()) && aligned16(dst.as_ptr().cast::<u8>());
 
     if vectorable {
         let mut ps = src.as_ptr().cast::<u8>();
@@ -765,6 +910,8 @@ pub fn stereo_to_mono_i16(src: &[i16], dst: &mut [i16]) {
                 "rsr.sar {sar}",
                 "ee.zero.q q6",              // the zero the sign compare needs
                 "ssai 1",
+                "j 5f",               // R2: over the padding, which is not code
+                ".p2align 4",
                 "5:",
                 "ee.vld.128.ip q0, {ps}, 16",
                 "ee.vld.128.ip q1, {ps}, 16",
@@ -842,15 +989,18 @@ pub fn downscale2x_gray8(src: &[u8], width: u32, height: u32, dst: &mut [u8]) ->
         // Per ROW, because a row's alignment depends on the stride and the
         // caller's base together. A row that does not qualify takes the
         // scalar arm; the image does not have to be all one or all the other.
-        let aligned =
-            aligned16(r0.as_ptr()) && aligned16(r1.as_ptr()) && aligned16(drow.as_ptr());
+        let aligned = aligned16(r0.as_ptr()) && aligned16(r1.as_ptr()) && aligned16(drow.as_ptr());
         // A row that is not aligned is no longer the oracle's: the unaligned
         // idiom reaches it, writes into `drow` itself, and reports how far it
         // got so the scalar tail can finish from there.
         let body = if aligned {
             ow / 16 * 16
-        } else {
+        } else if aligned16(drow.as_ptr()) {
             downscale2x_gray8_unaligned_row(r0, r1, drow)
+        } else {
+            // R11: out of line, so the rows that need no peel run the loop
+            // they always ran (measured: the peel inline cost them 17-29 %)
+            downscale2x_gray8_peeled_row(r0, r1, drow)
         };
 
         if aligned && body > 0 {
@@ -873,6 +1023,8 @@ pub fn downscale2x_gray8(src: &[u8], width: u32, height: u32, dst: &mut [u8]) ->
                     "ssai 1",
                     "ee.vsl.32 q7, q7",          // ... and now 2, the round term
                     "ssai 2",
+                    "j 6f",               // R2: over the padding, which is not code
+                    ".p2align 4",
                     "6:",
                     // columns 0..=15 of the row pair -> outputs 0..=7
                     "ee.vld.128.ip q0, {p0}, 16",
@@ -1024,6 +1176,8 @@ fn sum_sq_i16_unaligned(a: &[i16]) -> i64 {
                 "ee.zero.accx",
                 "ee.ld.128.usar.ip q0, {p}, 16",   // sets SAR_BYTE, q0 = block k
                 "ee.vld.128.ip q1, {p}, 16",       // q1 = block k+1
+                "j 7f",               // R2: over the padding, which is not code
+                ".p2align 4",
                 "7:",
                 "ee.src.q.ld.ip q2, {p}, 16, q0, q1", // q0 = window, q2 = next
                 "ee.vmulas.s16.accx q0, q0",
@@ -1091,6 +1245,8 @@ fn peak_abs_i16_unaligned(a: &[i16]) -> u16 {
             "ee.ld.128.usar.ip q0, {p}, 16",
             "ee.ld.128.usar.ip q0, {p}, 16",   // sets SAR_BYTE, q0 = block k
             "ee.vld.128.ip q1, {p}, 16",       // q1 = block k+1
+            "j 8f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "8:",
             "ee.src.q.ld.ip q2, {p}, 16, q0, q1",
             "ee.vmax.s16 q3, q3, q0",
@@ -1159,6 +1315,8 @@ fn dot_i16_unaligned(a: &[i16], b: &[i16]) -> i64 {
                 "ee.zero.accx",
                 "ee.ld.128.usar.ip q0, {pa}, 16",
                 "ee.ld.128.usar.ip q2, {pb}, 16",
+                "j 9f",               // R2: over the padding, which is not code
+                ".p2align 4",
                 "9:",
                 "ee.ld.128.usar.ip q1, {pa}, 0",
                 "ee.src.q q4, q0, q1",       // SAR_BYTE is a's, set just above
@@ -1249,6 +1407,8 @@ fn sad_16x16_unaligned(a: &[u8], sa: usize, b: &[u8], sb: usize) -> u32 {
             "rsr.sar {sar}",
             "ee.zero.q q4",                  // accumulator, low eight lanes
             "ee.zero.q q5",                  // accumulator, high eight lanes
+            "j 10f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "10:",
             "ee.ld.128.usar.ip q0, {pa}, 16",
             "ee.ld.128.usar.ip q1, {pa}, 0",
@@ -1321,6 +1481,8 @@ fn sad_8x8_unaligned(a: &[u8], sa: usize, b: &[u8], sb: usize) -> u32 {
         core::arch::asm!(
             "rsr.sar {sar}",
             "ee.zero.q q4",
+            "j 11f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "11:",
             "ee.ld.128.usar.ip q0, {pa}, 16",
             "ee.ld.128.usar.ip q1, {pa}, 0",
@@ -1405,6 +1567,8 @@ fn simd_even_bytes_unaligned_src(src: &[u8], dst: &mut [u8]) {
             "rsr.sar {sar}",
             "ee.ld.128.usar.ip q0, {s}, 16",
             "ee.vld.128.ip q1, {s}, 16",
+            "j 12f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "12:",
             "ee.src.q.ld.ip q2, {s}, 16, q0, q1",
             "ee.orq q3, q0, q0",                 // window 0, before it rotates
@@ -1463,6 +1627,8 @@ fn mix_i16_unaligned_src(a: &[i16], b: &[i16], out: &mut [i16]) -> usize {
             "rsr.sar {sar}",
             "ee.ld.128.usar.ip q0, {pa}, 16",
             "ee.ld.128.usar.ip q2, {pb}, 16",
+            "j 13f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "13:",
             "ee.ld.128.usar.ip q1, {pa}, 0",
             "ee.src.q q4, q0, q1",           // a's window, at a's offset
@@ -1523,6 +1689,8 @@ fn mono_to_stereo_i16_unaligned_src(src: &[i16], dst: &mut [i16]) -> usize {
         core::arch::asm!(
             "rsr.sar {sar}",
             "ee.ld.128.usar.ip q0, {ps}, 16",
+            "j 14f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "14:",
             "ee.ld.128.usar.ip q1, {ps}, 0",
             "ee.src.q q2, q0, q1",
@@ -1584,6 +1752,8 @@ fn stereo_to_mono_i16_unaligned_src(src: &[i16], dst: &mut [i16]) -> usize {
             "rsr.sar {sar}",
             "ee.zero.q q6",
             "ee.ld.128.usar.ip q0, {ps}, 16",
+            "j 15f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "15:",
             "ee.ld.128.usar.ip q1, {ps}, 16",
             "ee.src.q q2, q0, q1",           // frames 0..=3 interleaved
@@ -1613,6 +1783,23 @@ fn stereo_to_mono_i16_unaligned_src(src: &[i16], dst: &mut [i16]) -> usize {
     }
     let _ = (ps, pd);
     body
+}
+
+/// One output row whose destination is off a boundary (round 2, R11): the
+/// oracle's pixels until it reaches one, then the unaligned-source twin.
+/// Returns how far the row got, as the twin does.
+#[inline(never)]
+fn downscale2x_gray8_peeled_row(r0: &[u8], r1: &[u8], drow: &mut [u8]) -> usize {
+    let ow = drow.len();
+    let h = peel(drow.as_ptr(), 1, ow);
+    for ox in 0..h {
+        let s = u32::from(r0[2 * ox])
+            + u32::from(r0[2 * ox + 1])
+            + u32::from(r1[2 * ox])
+            + u32::from(r1[2 * ox + 1]);
+        drow[ox] = ((s + 2) / 4) as u8;
+    }
+    h + downscale2x_gray8_unaligned_row(&r0[2 * h..], &r1[2 * h..], &mut drow[h..])
 }
 
 /// `downscale2x_gray8` for source rows at ANY offset, destination aligned.
@@ -1654,6 +1841,8 @@ fn downscale2x_gray8_unaligned_row(r0: &[u8], r1: &[u8], drow: &mut [u8]) -> usi
             "ee.vsubs.s32 q7, q6, q7",   // one per 32-bit lane
             "ssai 1",
             "ee.vsl.32 q7, q7",          // two: the round term
+            "j 16f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "16:",
             // ---- columns 0..=15 -> outputs 0..=7 ----
             "ee.ld.128.usar.ip q0, {p0}, 16",
@@ -1741,8 +1930,32 @@ fn downscale2x_gray8_unaligned_row(r0: &[u8], r1: &[u8], drow: &mut [u8]) -> usi
 /// In-domain no clamp can ever fire: `|x| <= 32768` and `|g| <= 32767` give
 /// `|x*g| <= 2^30`, and `(2^30 + 2^14) >> 15 < 32768`. The clamp is kept
 /// because it is free — `ee.srcmb` does it as part of the shift.
-#[allow(unsafe_code)]
 pub fn gain_i16(src: &[i16], q15: i32, dst: &mut [i16]) {
+    if aligned16(dst.as_ptr().cast::<u8>()) {
+        gain_i16_body(src, q15, dst);
+    } else {
+        gain_i16_peeled(src, q15, dst);
+    }
+}
+
+/// R1: a destination off a boundary is brought onto one first. Out of the
+/// vector domain the body is scalar throughout, so peeling first is the
+/// same bytes there too.
+#[inline(never)]
+fn gain_i16_peeled(src: &[i16], q15: i32, dst: &mut [i16]) {
+    let n = src.len().min(dst.len());
+    let h = peel(dst.as_ptr().cast::<u8>(), 2, n);
+    for k in 0..h {
+        let y = (i32::from(src[k]) * q15 + (1 << 14)) >> 15;
+        dst[k] = y.clamp(-32768, 32767) as i16;
+    }
+    gain_i16_body(&src[h..n], q15, &mut dst[h..n]);
+}
+
+/// The kernel proper; see the public function of the same name.
+#[allow(unsafe_code)]
+#[inline(always)]
+fn gain_i16_body(src: &[i16], q15: i32, dst: &mut [i16]) {
     let n = src.len().min(dst.len());
     if q15.unsigned_abs() > 32767 {
         for k in 0..n {
@@ -1765,9 +1978,8 @@ pub fn gain_i16(src: &[i16], q15: i32, dst: &mut [i16]) {
     // instructions of loop. The unrolling that paid in seven other kernels
     // does not pay where the body is a chain through one accumulator.
     let body = n / 8 * 8;
-    let aligned = body > 0
-        && aligned16(src.as_ptr().cast::<u8>())
-        && aligned16(dst.as_ptr().cast::<u8>());
+    let aligned =
+        body > 0 && aligned16(src.as_ptr().cast::<u8>()) && aligned16(dst.as_ptr().cast::<u8>());
 
     let done = if aligned {
         let mut ps = src.as_ptr().cast::<u8>();
@@ -1784,6 +1996,8 @@ pub fn gain_i16(src: &[i16], q15: i32, dst: &mut [i16]) {
                 "ee.vldbc.16 q6, {pg}",       // 16384, the rounding term
                 "addi {pg}, {pg}, 2",
                 "ee.vldbc.16 q7, {pg}",       // 1, its multiplicand
+                "j 17f",               // R2: over the padding, which is not code
+                ".p2align 4",
                 "17:",
                 "ee.zero.qacc",
                 "ee.vld.128.ip q0, {ps}, 16",
@@ -1838,6 +2052,8 @@ fn gain_i16_unaligned_src(src: &[i16], c: &[i16; 4], dst: &mut [i16]) -> usize {
             "addi {pg}, {pg}, 2",
             "ee.vldbc.16 q7, {pg}",
             "ee.ld.128.usar.ip q0, {ps}, 16",
+            "j 18f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "18:",
             "ee.zero.qacc",
             "ee.ld.128.usar.ip q1, {ps}, 0",
@@ -1875,17 +2091,37 @@ fn gain_i16_unaligned_src(src: &[i16], c: &[i16; 4], dst: &mut [i16]) -> usize {
 /// eight results: the zeroed register comes back holding the first four and
 /// the source register the second four. Five instructions for eight samples,
 /// against a scalar arm that marshals two bytes in and four bytes out each.
-#[allow(unsafe_code)]
 pub fn convert_i16_to_i32(src: &[i16], dst: &mut [i32]) {
+    if aligned16(dst.as_ptr().cast::<u8>()) {
+        convert_i16_to_i32_body(src, dst);
+    } else {
+        convert_i16_to_i32_peeled(src, dst);
+    }
+}
+
+/// R1: a destination off a boundary is brought onto one first.
+#[inline(never)]
+fn convert_i16_to_i32_peeled(src: &[i16], dst: &mut [i32]) {
+    let n = src.len().min(dst.len());
+    let h = peel(dst.as_ptr().cast::<u8>(), 4, n);
+    for k in 0..h {
+        dst[k] = i32::from(src[k]) << 16;
+    }
+    convert_i16_to_i32_body(&src[h..n], &mut dst[h..n]);
+}
+
+/// The kernel proper; see the public function of the same name.
+#[allow(unsafe_code)]
+#[inline(always)]
+fn convert_i16_to_i32_body(src: &[i16], dst: &mut [i32]) {
     let n = src.len().min(dst.len());
     // SIXTEEN a trip, not the width this was first written at. The body was
     // mostly LOOP: see the `sum_sq_i16` note and `codec-measurement` 2b --
     // the unaligned arms had been written wider and were measuring faster
     // despite doing more work per element.
     let body = n / 16 * 16;
-    let vectorable = body > 0
-        && aligned16(src.as_ptr().cast::<u8>())
-        && aligned16(dst.as_ptr().cast::<u8>());
+    let vectorable =
+        body > 0 && aligned16(src.as_ptr().cast::<u8>()) && aligned16(dst.as_ptr().cast::<u8>());
 
     if vectorable {
         let mut ps = src.as_ptr().cast::<u8>();
@@ -1896,6 +2132,8 @@ pub fn convert_i16_to_i32(src: &[i16], dst: &mut [i32]) {
         // 16-byte aligned. q0 and q1 only.
         unsafe {
             core::arch::asm!(
+                "j 19f",               // R2: over the padding, which is not code
+                ".p2align 4",
                 "19:",
                 "ee.vld.128.ip q0, {ps}, 16",
                 "ee.vld.128.ip q2, {ps}, 16",
@@ -1937,17 +2175,37 @@ pub fn convert_i16_to_i32(src: &[i16], dst: &mut [i32]) {
 /// on a little-endian machine the odd lanes ARE the high halves. One
 /// instruction, no shift, and the sign comes along because it was never
 /// separated from the value.
-#[allow(unsafe_code)]
 pub fn convert_i32_to_i16(src: &[i32], dst: &mut [i16]) {
+    if aligned16(dst.as_ptr().cast::<u8>()) {
+        convert_i32_to_i16_body(src, dst);
+    } else {
+        convert_i32_to_i16_peeled(src, dst);
+    }
+}
+
+/// R1: a destination off a boundary is brought onto one first.
+#[inline(never)]
+fn convert_i32_to_i16_peeled(src: &[i32], dst: &mut [i16]) {
+    let n = src.len().min(dst.len());
+    let h = peel(dst.as_ptr().cast::<u8>(), 2, n);
+    for k in 0..h {
+        dst[k] = (src[k] >> 16) as i16;
+    }
+    convert_i32_to_i16_body(&src[h..n], &mut dst[h..n]);
+}
+
+/// The kernel proper; see the public function of the same name.
+#[allow(unsafe_code)]
+#[inline(always)]
+fn convert_i32_to_i16_body(src: &[i32], dst: &mut [i16]) {
     let n = src.len().min(dst.len());
     // SIXTEEN a trip, not the width this was first written at. The body was
     // mostly LOOP: see the `sum_sq_i16` note and `codec-measurement` 2b --
     // the unaligned arms had been written wider and were measuring faster
     // despite doing more work per element.
     let body = n / 16 * 16;
-    let vectorable = body > 0
-        && aligned16(src.as_ptr().cast::<u8>())
-        && aligned16(dst.as_ptr().cast::<u8>());
+    let vectorable =
+        body > 0 && aligned16(src.as_ptr().cast::<u8>()) && aligned16(dst.as_ptr().cast::<u8>());
 
     if vectorable {
         let mut ps = src.as_ptr().cast::<u8>();
@@ -1958,6 +2216,8 @@ pub fn convert_i32_to_i16(src: &[i32], dst: &mut [i16]) {
         // q0 and q1 only.
         unsafe {
             core::arch::asm!(
+                "j 20f",               // R2: over the padding, which is not code
+                ".p2align 4",
                 "20:",
                 "ee.vld.128.ip q0, {ps}, 16",
                 "ee.vld.128.ip q1, {ps}, 16",
@@ -2019,8 +2279,30 @@ pub fn convert_i32_to_i16(src: &[i32], dst: &mut [i16]) {
 /// itself is BUILT rather than loaded: all-ones shifted left by eight in
 /// 32-bit lanes is `0xffff_ff00`, and both halves of that are instructions
 /// this module has measured.
-#[allow(unsafe_code)]
 pub fn convert_i32_to_i24in32(src: &[i32], dst: &mut [i32]) {
+    if aligned16(dst.as_ptr().cast::<u8>()) {
+        convert_i32_to_i24in32_body(src, dst);
+    } else {
+        convert_i32_to_i24in32_peeled(src, dst);
+    }
+}
+
+/// R1: a destination off a boundary is brought onto one first.
+#[inline(never)]
+fn convert_i32_to_i24in32_peeled(src: &[i32], dst: &mut [i32]) {
+    let n = src.len().min(dst.len());
+    let h = peel(dst.as_ptr().cast::<u8>(), 4, n);
+    for k in 0..h {
+        let b = src[k].to_le_bytes();
+        dst[k] = i32::from_le_bytes([0, b[1], b[2], b[3]]);
+    }
+    convert_i32_to_i24in32_body(&src[h..n], &mut dst[h..n]);
+}
+
+/// The kernel proper; see the public function of the same name.
+#[allow(unsafe_code)]
+#[inline(always)]
+fn convert_i32_to_i24in32_body(src: &[i32], dst: &mut [i32]) {
     let n = src.len().min(dst.len());
     // SIXTEEN a trip, not the width this was first written at. The body was
     // mostly LOOP: see the `sum_sq_i16` note and `codec-measurement` 2b --
@@ -2029,9 +2311,8 @@ pub fn convert_i32_to_i24in32(src: &[i32], dst: &mut [i32]) {
     // This one was the narrowest of all at FOUR: a load, an and and a
     // store against two instructions of loop -- forty per cent overhead.
     let body = n / 16 * 16;
-    let vectorable = body > 0
-        && aligned16(src.as_ptr().cast::<u8>())
-        && aligned16(dst.as_ptr().cast::<u8>());
+    let vectorable =
+        body > 0 && aligned16(src.as_ptr().cast::<u8>()) && aligned16(dst.as_ptr().cast::<u8>());
 
     if vectorable {
         let mut ps = src.as_ptr().cast::<u8>();
@@ -2047,6 +2328,8 @@ pub fn convert_i32_to_i24in32(src: &[i32], dst: &mut [i32]) {
                 "ee.vcmp.eq.s16 q7, q6, q6", // all ones
                 "ssai 8",
                 "ee.vsl.32 q7, q7",          // 0xffff_ff00 per 32-bit lane
+                "j 21f",               // R2: over the padding, which is not code
+                ".p2align 4",
                 "21:",
                 "ee.vld.128.ip q0, {ps}, 16",
                 "ee.vld.128.ip q1, {ps}, 16",
@@ -2116,6 +2399,8 @@ fn convert_i16_to_i32_unaligned_src(src: &[i16], dst: &mut [i32]) -> usize {
         core::arch::asm!(
             "rsr.sar {sar}",
             "ee.ld.128.usar.ip q0, {ps}, 16",
+            "j 22f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "22:",
             "ee.ld.128.usar.ip q1, {ps}, 0",
             "ee.src.q q2, q0, q1",
@@ -2184,6 +2469,8 @@ fn convert_i32_to_i16_unaligned_src(src: &[i32], dst: &mut [i16]) -> usize {
         core::arch::asm!(
             "rsr.sar {sar}",
             "ee.ld.128.usar.ip q0, {ps}, 16",
+            "j 23f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "23:",
             "ee.ld.128.usar.ip q1, {ps}, 16",
             "ee.src.q q2, q0, q1",
@@ -2272,6 +2559,8 @@ fn convert_i32_to_i16_unaligned_src_fused(src: &[i32], dst: &mut [i16]) -> usize
             "rsr.sar {sar}",
             "ee.ld.128.usar.ip q0, {ps}, 16",  // block k, and set SAR_BYTE
             "ee.vld.128.ip q1, {ps}, 16",      // block k+1
+            "j 33f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "33:",
             // ---- rotation one: windows into q0, q1, q2 ----
             "ee.src.q.ld.ip q2, {ps}, 16, q0, q1",  // q0 = W0, q2 = blk+2
@@ -2358,6 +2647,8 @@ fn convert_i32_to_i24in32_unaligned_src(src: &[i32], dst: &mut [i32]) -> usize {
             "ee.vsl.32 q7, q7",          // 0xffff_ff00 per 32-bit lane
             "ee.ld.128.usar.ip q0, {ps}, 16",
             "ee.vld.128.ip q1, {ps}, 16",      // q1 = block k+1
+            "j 24f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "24:",
             "ee.src.q.ld.ip q2, {ps}, 16, q0, q1",
             "ee.andq q0, q0, q7",
@@ -2668,12 +2959,7 @@ pub fn sad_4x4(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
 ///
 /// Four output pixels a trip, stored with `ee.vst.l.64`.
 #[allow(unsafe_code)]
-pub fn downscale2x_rgb565(
-    src: &[u8],
-    width: u32,
-    height: u32,
-    dst: &mut [u8],
-) -> Result<(), ()> {
+pub fn downscale2x_rgb565(src: &[u8], width: u32, height: u32, dst: &mut [u8]) -> Result<(), ()> {
     let (w, h) = (width as usize, height as usize);
     let (ow, oh) = (w / 2, h / 2);
     if src.len() < w * h * 2 || dst.len() < ow * oh * 2 {
@@ -2690,8 +2976,7 @@ pub fn downscale2x_rgb565(
         let r1 = &src[(2 * oy + 1) * w * 2..(2 * oy + 1) * w * 2 + ow * 4];
         let drow = &mut dst[oy * ow * 2..oy * ow * 2 + ow * 2];
 
-        let body = if aligned16(r0.as_ptr()) && aligned16(r1.as_ptr()) && aligned16(drow.as_ptr())
-        {
+        let body = if aligned16(r0.as_ptr()) && aligned16(r1.as_ptr()) && aligned16(drow.as_ptr()) {
             ow / 4 * 4
         } else {
             0
@@ -2712,6 +2997,8 @@ pub fn downscale2x_rgb565(
             unsafe {
                 core::arch::asm!(
                     "rsr.sar {sar}",
+                    "j 29f",               // R2: over the padding, which is not code
+                    ".p2align 4",
                     "29:",
                     "ee.vld.128.ip q0, {p0}, 16",
                     "ee.vld.128.ip q1, {p1}, 16",
@@ -2876,9 +3163,8 @@ pub fn downscale2x_rgb565(
             let r = ((ex5(a, 11) + ex5(b, 11) + ex5(cc, 11) + ex5(d, 11) + 2) / 4) as u8;
             let g = ((ex6(a) + ex6(b) + ex6(cc) + ex6(d) + 2) / 4) as u8;
             let bl = ((ex5(a, 0) + ex5(b, 0) + ex5(cc, 0) + ex5(d, 0) + 2) / 4) as u8;
-            let packed = ((u16::from(r) & 0xf8) << 8)
-                | ((u16::from(g) & 0xfc) << 3)
-                | (u16::from(bl) >> 3);
+            let packed =
+                ((u16::from(r) & 0xf8) << 8) | ((u16::from(g) & 0xfc) << 3) | (u16::from(bl) >> 3);
             drow[ox * 2..ox * 2 + 2].copy_from_slice(&packed.to_le_bytes());
         }
     }
@@ -2917,7 +3203,9 @@ pub fn yuyv_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize> {
 
     #[repr(align(16))]
     struct C([i16; 16]);
-    let c = C([128, 359, 88, 183, 454, 255, 1, 2048, 32, 0, 0, 0, 0, 0, 0, 0]);
+    let c = C([
+        128, 359, 88, 183, 454, 255, 1, 2048, 32, 0, 0, 0, 0, 0, 0, 0,
+    ]);
 
     let body = pixels / 8 * 8;
     let vectorable = body > 0 && aligned16(src.as_ptr()) && aligned16(dst.as_ptr());
@@ -2934,6 +3222,8 @@ pub fn yuyv_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize> {
         unsafe {
             core::arch::asm!(
                 "rsr.sar {sar}",
+                    "j 30f",               // R2: over the padding, which is not code
+                    ".p2align 4",
                     "30:",
                     "ee.vld.128.ip q0, {ps}, 16",
                     // deinterleave: evens are Y, odds are the chroma pairs
@@ -3048,9 +3338,8 @@ pub fn yuyv_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize> {
         let m = k / 2 * 4;
         let y = src[m + if k % 2 == 0 { 0 } else { 2 }];
         let [r, g, b] = rusty_esp_dsp::pixel::yuv_to_rgb(y, src[m + 1], src[m + 3]);
-        let packed = ((u16::from(r) & 0xf8) << 8)
-            | ((u16::from(g) & 0xfc) << 3)
-            | (u16::from(b) >> 3);
+        let packed =
+            ((u16::from(r) & 0xf8) << 8) | ((u16::from(g) & 0xfc) << 3) | (u16::from(b) >> 3);
         dst[k * 2..k * 2 + 2].copy_from_slice(&packed.to_le_bytes());
     }
     Ok(pixels)
@@ -3082,6 +3371,8 @@ fn first_zero_block(bytes: &[u8], from: usize, nblocks: usize) -> usize {
             "ee.zero.q q1",
             "ee.vcmp.eq.s8 q2, q1, q1",   // all ones
             "ee.vsubs.s8 q2, q1, q2",     // 0 - (-1) = +1 per s8 lane
+            "j 31f",               // R2: over the padding, which is not code
+            ".p2align 4",
             "31:",
             "ee.vld.128.ip q0, {p}, 16",
             "ee.vcmp.eq.s8 q3, q0, q1",   // -1 in every lane that is zero
@@ -3178,4 +3469,616 @@ pub fn find_start_code3(bytes: &[u8]) -> Option<usize> {
         }
     }
     aligned_scan(&bytes[off..]).map(|i| i + off)
+}
+
+/// The first `FF` lane of the aligned word at `p`: `!x` turns every `FF` into
+/// a zero byte, and the classic zero-byte test marks the LOWEST zero byte
+/// exactly (its borrow can only mark lanes above a real one). Little-endian,
+/// so the lowest lane is the first byte.
+///
+/// # Safety
+/// `p` is 4-byte aligned and four bytes from it are readable.
+#[allow(unsafe_code)]
+#[inline(always)]
+unsafe fn word_ff(p: *const u8) -> Option<usize> {
+    // SAFETY: the caller's contract.
+    let x = !unsafe { p.cast::<u32>().read() };
+    let z = x.wrapping_sub(0x0101_0101) & !x & 0x8080_8080;
+    if z == 0 {
+        None
+    } else {
+        Some(z.trailing_zeros() as usize / 8)
+    }
+}
+
+/// The first index at or after `from` holding `0xFF`, or `bytes.len()` when
+/// none does (round 2, R4).
+///
+/// The JPEG cut (`rusty_esp_image-core::cut`) and the end-of-image search
+/// spend their time looking for the next `FF`: entropy-coded data holds one
+/// every few hundred bytes, and between pictures the DMA hands over runs of
+/// padding. The portable scan steps eight bytes a trip on their maximum.
+/// This one tests sixteen bytes in eight instructions: `ee.vcmp.eq.s8`
+/// against an all-ones register marks every `FF` lane with -1, and a MAC of
+/// those lanes against +1 into ACCX is non-zero exactly when one was there
+/// -- the same reduction [`find_start_code3`]'s zero scan uses. ACCX is
+/// zeroed once: it stays zero until the trip that ends the loop.
+///
+/// Around the blocks the scan is WORDS, not bytes: up to three bytes to a
+/// 4-byte boundary, up to three aligned words to a 16-byte one, the four
+/// words of the block the loop stopped in, and the words of the tail. Two
+/// blocks a trip was measured and lost: the block it stops in is then 32
+/// bytes to search (ledger, R4).
+#[allow(unsafe_code)]
+#[must_use]
+pub fn find_ff(bytes: &[u8], from: usize) -> usize {
+    let n = bytes.len();
+    if from >= n {
+        return n;
+    }
+    if n - from < 48 {
+        return bytes[from..]
+            .iter()
+            .position(|&b| b == 0xFF)
+            .map_or(n, |k| from + k);
+    }
+    let base = bytes.as_ptr();
+    let mut i = from;
+    // bytes to a 4-byte boundary
+    while (base as usize + i) % 4 != 0 {
+        if bytes[i] == 0xFF {
+            return i;
+        }
+        i += 1;
+    }
+    // aligned words to a 16-byte boundary; `n - from >= 48`, so they exist
+    while (base as usize + i) % 16 != 0 {
+        // SAFETY: `base + i` is 4-aligned and `i + 4 <= from + 15 < n`.
+        if let Some(k) = unsafe { word_ff(base.add(i)) } {
+            return i + k;
+        }
+        i += 4;
+    }
+    let start = i;
+    let nblocks = (n - start) / 16;
+    let mut p = unsafe { base.add(start) };
+    let mut left = nblocks as u32;
+    let r: u32;
+    // SAFETY: `start` is on a 16-byte boundary and the loop reads at most
+    // `nblocks * 16 <= n - start` bytes from it, sixteen at a time.
+    // `nblocks >= 2` because `n - start >= 48 - 15`. q0-q3 and ACCX only.
+    unsafe {
+        core::arch::asm!(
+            "ee.zero.q q1",
+            "ee.vcmp.eq.s8 q1, q1, q1",   // all ones: 0xFF in every lane
+            "ee.zero.q q2",
+            "ee.vsubs.s8 q2, q2, q1",     // 0 - (-1) = +1 per s8 lane
+            "ee.zero.accx",
+            // block 0, outside the loop: from here each trip loads and
+            // compares block k + 1 while block k's sum is tested, so no
+            // instruction waits on the one before it (round 3)
+            "ee.vld.128.ip q0, {p}, 16",
+            "ee.vcmp.eq.s8 q3, q0, q1",   // -1 in every lane holding FF
+            "ee.vmulas.s8.accx q3, q2",   // ACCX = -(FF bytes so far)
+            "addi {n}, {n}, -1",          // blocks still to load
+            "beqz {n}, 43f",
+            "j 41f",               // R2: over the padding, which is not code
+            ".p2align 4",
+            "41:",
+            "ee.vld.128.ip q0, {p}, 16",  // block k + 1
+            "ee.srs.accx {r}, {sh0}, 0",  // blocks up to k
+            "ee.vcmp.eq.s8 q3, q0, q1",
+            "bnez {r}, 42f",
+            "ee.vmulas.s8.accx q3, q2",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 41b",
+            "43:",
+            "ee.srs.accx {r}, {sh0}, 0",  // the last block
+            "42:",
+            p = inout(reg) p,
+            n = inout(reg) left,
+            r = out(reg) r,
+            sh0 = in(reg) 0u32,
+            options(nostack),
+        );
+    }
+    let _ = p;
+    if r != 0 {
+        // the trip that found it had loaded one block past it
+        let at = start + (nblocks - left as usize - 1) * 16;
+        for w in 0..4 {
+            // SAFETY: the block at `at` is whole, aligned, inside `bytes`.
+            if let Some(k) = unsafe { word_ff(base.add(at + 4 * w)) } {
+                return at + 4 * w + k;
+            }
+        }
+        // the vector test saw an FF the words did not: not reachable, but
+        // the bytewise answer is never wrong
+        return bytes[at..]
+            .iter()
+            .position(|&b| b == 0xFF)
+            .map_or(n, |k| at + k);
+    }
+    // the tail: whole words, then bytes
+    let mut t = start + nblocks * 16;
+    while t + 4 <= n {
+        // SAFETY: `t` stays 4-aligned from the block boundary; `t + 4 <= n`.
+        if let Some(k) = unsafe { word_ff(base.add(t)) } {
+            return t + k;
+        }
+        t += 4;
+    }
+    bytes[t..]
+        .iter()
+        .position(|&b| b == 0xFF)
+        .map_or(n, |k| t + k)
+}
+
+/// The first lane of the aligned word at `p` holding `needle`: the word
+/// XORed with the needle in every lane turns each match into a zero byte,
+/// and the classic zero-byte test marks the LOWEST zero byte exactly (its
+/// borrow can only mark lanes above a real one). Little-endian, so the
+/// lowest lane is the first byte.
+///
+/// # Safety
+/// `p` is 4-byte aligned and four bytes from it are readable.
+#[allow(unsafe_code)]
+#[inline(always)]
+unsafe fn word_eq(p: *const u8, rep: u32) -> Option<usize> {
+    // SAFETY: the caller's contract.
+    let x = unsafe { p.cast::<u32>().read() } ^ rep;
+    let z = x.wrapping_sub(0x0101_0101) & !x & 0x8080_8080;
+    if z == 0 {
+        None
+    } else {
+        Some(z.trailing_zeros() as usize / 8)
+    }
+}
+
+/// The first index at or after `from` holding `needle`, or `bytes.len()`
+/// when none does (round 2, R4 and R12).
+///
+/// Sixteen bytes a test: `ee.vcmp.eq.s8` against a register holding the
+/// needle in every lane marks each match with -1, and a MAC of those lanes
+/// against +1 into ACCX is non-zero exactly when one was there -- the same
+/// reduction [`find_start_code3`]'s zero scan uses. ACCX is zeroed once: it
+/// stays zero until the trip that ends the loop. [`find_ff`] is this for
+/// `0xFF`, kept as its own body: through this one it measured 4.7 % slower
+/// (the needle loaded and XORed where `FF` needs neither).
+///
+/// Around the blocks the scan is WORDS, not bytes: up to three bytes to a
+/// 4-byte boundary, up to three aligned words to a 16-byte one, the four
+/// words of the block the loop stopped in, and the words of the tail. Two
+/// blocks a trip was measured and lost: the block it stops in is then 32
+/// bytes to search (ledger, R4). Short scans (under 48 bytes) are bytewise
+/// throughout.
+#[allow(unsafe_code)]
+#[must_use]
+pub fn find_byte(bytes: &[u8], from: usize, needle: u8) -> usize {
+    let n = bytes.len();
+    if from >= n {
+        return n;
+    }
+    if n - from < 48 {
+        return bytes[from..]
+            .iter()
+            .position(|&b| b == needle)
+            .map_or(n, |k| from + k);
+    }
+    let rep = u32::from(needle) * 0x0101_0101;
+    let base = bytes.as_ptr();
+    let mut i = from;
+    // bytes to a 4-byte boundary
+    while (base as usize + i) % 4 != 0 {
+        if bytes[i] == needle {
+            return i;
+        }
+        i += 1;
+    }
+    // aligned words to a 16-byte boundary; `n - from >= 48`, so they exist
+    while (base as usize + i) % 16 != 0 {
+        // SAFETY: `base + i` is 4-aligned and `i + 4 <= from + 15 < n`.
+        if let Some(k) = unsafe { word_eq(base.add(i), rep) } {
+            return i + k;
+        }
+        i += 4;
+    }
+    let start = i;
+    let nblocks = (n - start) / 16;
+    #[repr(align(16))]
+    struct Lanes([u8; 16]);
+    let pattern = Lanes([needle; 16]);
+    let mut p = unsafe { base.add(start) };
+    let mut left = nblocks as u32;
+    let r: u32;
+    // SAFETY: `start` is on a 16-byte boundary and the loop reads at most
+    // `nblocks * 16 <= n - start` bytes from it, sixteen at a time.
+    // `nblocks >= 2` because `n - start >= 48 - 15`. `pattern` is a live,
+    // aligned local. q0-q3 and ACCX only.
+    unsafe {
+        core::arch::asm!(
+            "ee.vld.128.ip q1, {pat}, 0",  // the needle in every lane
+            "ee.zero.q q2",
+            "ee.vcmp.eq.s8 q3, q2, q2",   // all ones
+            "ee.vsubs.s8 q2, q2, q3",     // 0 - (-1) = +1 per s8 lane
+            "ee.zero.accx",
+            // pipelined as `find_ff` is (round 3): block k + 1 loaded and
+            // compared while block k's sum is tested
+            "ee.vld.128.ip q0, {p}, 16",
+            "ee.vcmp.eq.s8 q3, q0, q1",   // -1 in every lane holding the needle
+            "ee.vmulas.s8.accx q3, q2",   // ACCX = -(matches so far)
+            "addi {n}, {n}, -1",
+            "beqz {n}, 43f",
+            "j 41f",               // R2: over the padding, which is not code
+            ".p2align 4",
+            "41:",
+            "ee.vld.128.ip q0, {p}, 16",
+            "ee.srs.accx {r}, {sh0}, 0",
+            "ee.vcmp.eq.s8 q3, q0, q1",
+            "bnez {r}, 42f",
+            "ee.vmulas.s8.accx q3, q2",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 41b",
+            "43:",
+            "ee.srs.accx {r}, {sh0}, 0",
+            "42:",
+            pat = inout(reg) pattern.0.as_ptr() => _,
+            p = inout(reg) p,
+            n = inout(reg) left,
+            r = out(reg) r,
+            sh0 = in(reg) 0u32,
+            options(nostack),
+        );
+    }
+    let _ = p;
+    if r != 0 {
+        // the trip that found it had loaded one block past it
+        let at = start + (nblocks - left as usize - 1) * 16;
+        for w in 0..4 {
+            // SAFETY: the block at `at` is whole, aligned, inside `bytes`.
+            if let Some(k) = unsafe { word_eq(base.add(at + 4 * w), rep) } {
+                return at + 4 * w + k;
+            }
+        }
+        // the vector test saw a match the words did not: not reachable, but
+        // the bytewise answer is never wrong
+        return bytes[at..]
+            .iter()
+            .position(|&b| b == needle)
+            .map_or(n, |k| at + k);
+    }
+    // the tail: whole words, then bytes
+    let mut t = start + nblocks * 16;
+    while t + 4 <= n {
+        // SAFETY: `t` stays 4-aligned from the block boundary; `t + 4 <= n`.
+        if let Some(k) = unsafe { word_eq(base.add(t), rep) } {
+            return t + k;
+        }
+        t += 4;
+    }
+    bytes[t..]
+        .iter()
+        .position(|&b| b == needle)
+        .map_or(n, |k| t + k)
+}
+
+/// Copy `src` into `dst` up to the first `0xFF`, which is not copied, or up
+/// to the shorter length; returns the bytes copied (round 2, R6).
+///
+/// The camera cut's inner step: a run of entropy-coded bytes with no `FF`
+/// goes into the picture slot. As two passes, [`find_ff`] then a block
+/// copy, every byte is read twice and the copy is a call per run. This is
+/// one pass: sixteen bytes through the unaligned-load funnel
+/// (`ee.ld.128.usar.ip` + `ee.src.q`), tested for `FF` the way `find_ff`
+/// tests them, and stored with one aligned `ee.vst.128` when clean.
+///
+/// `dst` is brought onto a 16-byte boundary byte by byte first (the slot
+/// fills from wherever the last run ended); the source may sit anywhere.
+/// The window that holds the `FF`, and the last bytes (sixteen are kept
+/// back for the funnel's read-ahead), are copied byte by byte, so nothing
+/// past the returned length is ever written.
+#[allow(unsafe_code)]
+#[must_use]
+pub fn copy_until_ff(src: &[u8], dst: &mut [u8]) -> usize {
+    let m = src.len().min(dst.len());
+    let head = ((dst.as_ptr() as usize).wrapping_neg() % 16).min(m);
+    let mut k = 0usize;
+    while k < head {
+        let b = src[k];
+        if b == 0xFF {
+            return k;
+        }
+        dst[k] = b;
+        k += 1;
+    }
+    if m - k >= 48 {
+        // sixteen bytes of source are kept back: the funnel reads the
+        // aligned block after the one it consumes
+        let trips = (m - k - 16) / 16;
+        let mut ps = src[k..].as_ptr();
+        let pd0 = dst[k..].as_mut_ptr();
+        let mut pd = pd0;
+        let mut left = (trips - 1) as u32; // windows after the first
+        let r: u32;
+        // SAFETY: as before round 3's pipelining: `pd` is 16-byte aligned,
+        // a window is stored only after it tested clean, at most `trips`
+        // windows (`trips * 16 <= m - k - 16`); the highest block read is
+        // the one after the last window, inside the sixteen kept back.
+        // Pipelined (round 3): window k + 1 is formed and compared while
+        // window k's sum is tested; two window registers, q2 and q6, take
+        // turns because the unit has no register move. q0-q6 and ACCX;
+        // SAR is restored.
+        unsafe {
+            core::arch::asm!(
+                "rsr.sar {sar}",
+                "ee.zero.q q4",
+                "ee.vcmp.eq.s8 q4, q4, q4",   // all ones: 0xFF in every lane
+                "ee.zero.q q5",
+                "ee.vsubs.s8 q5, q5, q4",     // +1 in every lane
+                "ee.zero.accx",
+                "ee.ld.128.usar.ip q0, {ps}, 16",
+                "ee.ld.128.usar.ip q1, {ps}, 0",
+                "ee.src.q q2, q0, q1",        // window 0
+                "ee.vcmp.eq.s8 q3, q2, q4",
+                "ee.vmulas.s8.accx q3, q5",
+                "ee.ld.128.usar.ip q0, {ps}, 16",
+                "beqz {n}, 54f",
+                "j 51f",               // R2: over the padding, which is not code
+                ".p2align 4",
+                "51:",
+                "ee.ld.128.usar.ip q1, {ps}, 0",
+                "ee.src.q q6, q0, q1",        // the next window
+                "ee.srs.accx {r}, {sh0}, 0",  // the windows up to q2's
+                "ee.vcmp.eq.s8 q3, q6, q4",
+                "bnez {r}, 59f",
+                "ee.vst.128.ip q2, {pd}, 16",
+                "ee.vmulas.s8.accx q3, q5",
+                "ee.ld.128.usar.ip q0, {ps}, 16",
+                "addi {n}, {n}, -1",
+                "beqz {n}, 55f",
+                "ee.ld.128.usar.ip q1, {ps}, 0",
+                "ee.src.q q2, q0, q1",
+                "ee.srs.accx {r}, {sh0}, 0",  // the windows up to q6's
+                "ee.vcmp.eq.s8 q3, q2, q4",
+                "bnez {r}, 59f",
+                "ee.vst.128.ip q6, {pd}, 16",
+                "ee.vmulas.s8.accx q3, q5",
+                "ee.ld.128.usar.ip q0, {ps}, 16",
+                "addi {n}, {n}, -1",
+                "bnez {n}, 51b",
+                "54:",                        // q2 holds the last window
+                "ee.srs.accx {r}, {sh0}, 0",
+                "bnez {r}, 59f",
+                "ee.vst.128.ip q2, {pd}, 16",
+                "j 59f",
+                "55:",                        // q6 holds the last window
+                "ee.srs.accx {r}, {sh0}, 0",
+                "bnez {r}, 59f",
+                "ee.vst.128.ip q6, {pd}, 16",
+                "59:",
+                "wsr.sar {sar}",
+                ps = inout(reg) ps,
+                pd = inout(reg) pd,
+                n = inout(reg) left,
+                r = out(reg) r,
+                sh0 = in(reg) 0u32,
+                sar = out(reg) _,
+                options(nostack),
+            );
+        }
+        let _ = (ps, left, r);
+        // the windows stored, from how far the destination moved
+        k += pd as usize - pd0 as usize;
+    }
+    while k < m {
+        let b = src[k];
+        if b == 0xFF {
+            return k;
+        }
+        dst[k] = b;
+        k += 1;
+    }
+    m
+}
+
+/// The first index `i` at or after `from` with `bytes[i] == a` and
+/// `bytes[i + 1] == b`, or `bytes.len()` when there is none (round 2, R13).
+///
+/// Built for the HTTP head's blank line: `\n\r` occurs in a well-formed head
+/// only where the blank line starts, so one pass for the pair replaces a
+/// stop at every newline. Each sixteen-byte block is compared with `a`, the
+/// same block seen one byte later (the unaligned-load funnel with SAR_BYTE
+/// 1) is compared with `b`, the two masks are ANDed, and the `find_ff`
+/// reduction says whether any lane holds the pair.
+///
+/// Bytes before the first 16-byte boundary, the block the loop stops in and
+/// the tail are looked at byte by byte; scans under 64 bytes are bytewise
+/// throughout.
+#[allow(unsafe_code)]
+#[must_use]
+pub fn find_pair(bytes: &[u8], from: usize, a: u8, b: u8) -> usize {
+    let n = bytes.len();
+    if n < 2 || from + 1 >= n {
+        return n;
+    }
+    let last = n - 1; // a pair starts below here
+    let hit = |i: usize| bytes[i] == a && bytes[i + 1] == b;
+    if last - from < 64 {
+        return (from..last).find(|&i| hit(i)).unwrap_or(n);
+    }
+    let base = bytes.as_ptr();
+    let mut i = from;
+    while (base as usize + i) % 16 != 0 {
+        if hit(i) {
+            return i;
+        }
+        i += 1;
+    }
+    // sixteen bytes kept back: each trip reads the block after its own
+    let nblocks = (n - i - 16) / 16;
+    #[repr(align(16))]
+    struct Lanes([u8; 32]);
+    let mut lanes = Lanes([a; 32]);
+    lanes.0[16..].fill(b);
+    // `+ 1`: the funnel's address, so the first load sets SAR_BYTE to 1
+    let mut p1 = unsafe { base.add(i + 1) };
+    let mut left = nblocks as u32;
+    let r: u32;
+    // SAFETY: `base + i` is 16-byte aligned; trip t reads the aligned
+    // blocks at `i + 16t` and `i + 16(t + 1)`, the last of them ending at
+    // `i + 16 * nblocks + 15 <= n - 1`. `lanes` is a live, aligned local.
+    // All eight q registers and ACCX; SAR is restored.
+    unsafe {
+        core::arch::asm!(
+            "rsr.sar {sar}",
+            "ee.vld.128.ip q5, {pl}, 16",  // a in every lane
+            "ee.vld.128.ip q6, {pl}, 0",   // b in every lane
+            "ee.zero.q q7",
+            "ee.vcmp.eq.s8 q3, q7, q7",   // all ones
+            "ee.vsubs.s8 q7, q7, q3",     // +1 in every lane
+            "ee.zero.accx",
+            "ee.ld.128.usar.ip q0, {p1}, 16",  // the block at i; SAR_BYTE = 1
+            "j 61f",               // R2: over the padding, which is not code
+            ".p2align 4",
+            "61:",
+            "ee.ld.128.usar.ip q1, {p1}, 0",   // the block after it
+            "ee.src.q q2, q0, q1",        // the same sixteen, one byte on
+            "ee.vcmp.eq.s8 q3, q0, q5",   // lane == a
+            "ee.vcmp.eq.s8 q4, q2, q6",   // next byte == b
+            "ee.andq q3, q3, q4",
+            "ee.vmulas.s8.accx q3, q7",   // ACCX = -(pairs so far)
+            "ee.srs.accx {r}, {sh0}, 0",
+            "bnez {r}, 62f",
+            "ee.ld.128.usar.ip q0, {p1}, 16",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 61b",
+            "62:",
+            "wsr.sar {sar}",
+            pl = inout(reg) lanes.0.as_mut_ptr() => _,
+            p1 = inout(reg) p1,
+            n = inout(reg) left,
+            r = out(reg) r,
+            sh0 = in(reg) 0u32,
+            sar = out(reg) _,
+            options(nostack),
+        );
+    }
+    let _ = p1;
+    let at = i + (nblocks - left as usize) * 16;
+    let end = if r != 0 { (at + 16).min(last) } else { last };
+    (at..end).find(|&k| hit(k)).unwrap_or(n)
+}
+
+/// Counting down from the block at `top` (16-byte aligned), how many whole
+/// blocks are passed before one holding `needle`: `nblocks` when none of
+/// the `nblocks` blocks at `top`, `top - 16`, ... does.
+///
+/// # Safety
+/// `top` is 16-byte aligned and the `nblocks` blocks ending at `top + 16`
+/// are readable; `nblocks >= 1`.
+#[allow(unsafe_code)]
+unsafe fn blocks_down_to(top: *const u8, nblocks: usize, needle: u8) -> usize {
+    #[repr(align(16))]
+    struct Lanes([u8; 16]);
+    let pattern = Lanes([needle; 16]);
+    let mut p = top;
+    let mut left = nblocks as u32;
+    let r: u32;
+    // SAFETY: the caller's contract; `pattern` is a live, aligned local.
+    // q0-q3 and ACCX only.
+    unsafe {
+        core::arch::asm!(
+            "ee.vld.128.ip q1, {pat}, 0",  // the needle in every lane
+            "ee.zero.q q2",
+            "ee.vcmp.eq.s8 q3, q2, q2",   // all ones
+            "ee.vsubs.s8 q2, q2, q3",     // +1 in every lane
+            "ee.zero.accx",
+            // pipelined as `find_ff` is (round 3)
+            "ee.vld.128.ip q0, {p}, -16",
+            "ee.vcmp.eq.s8 q3, q0, q1",
+            "ee.vmulas.s8.accx q3, q2",   // ACCX = -(matches so far)
+            "addi {n}, {n}, -1",
+            "beqz {n}, 73f",
+            "j 71f",               // R2: over the padding, which is not code
+            ".p2align 4",
+            "71:",
+            "ee.vld.128.ip q0, {p}, -16",
+            "ee.srs.accx {r}, {sh0}, 0",
+            "ee.vcmp.eq.s8 q3, q0, q1",
+            "bnez {r}, 72f",
+            "ee.vmulas.s8.accx q3, q2",
+            "addi {n}, {n}, -1",
+            "bnez {n}, 71b",
+            "73:",
+            "ee.srs.accx {r}, {sh0}, 0",
+            "72:",
+            pat = inout(reg) pattern.0.as_ptr() => _,
+            p = inout(reg) p,
+            n = inout(reg) left,
+            r = out(reg) r,
+            sh0 = in(reg) 0u32,
+            options(nostack),
+        );
+    }
+    let _ = p;
+    // a hit was found one trip after its block was loaded
+    if r == 0 {
+        nblocks
+    } else {
+        nblocks - left as usize - 1
+    }
+}
+
+/// The LAST index `i` with `bytes[i] == a` and `bytes[i + 1] == b`, or
+/// `None` (round 3, B2).
+///
+/// Built for `find_eoi`, which looks for the last `FF D9` from the end of a
+/// DMA buffer and, on a buffer with no image end, scans all of it. The
+/// second byte is searched sixteen at a time from the top down
+/// (`ee.vld.128.ip` with a negative step, the `find_ff` reduction), and the
+/// block holding one is checked byte by byte, top down, for the first byte
+/// before it; a block whose matches are not preceded by `a` sends the
+/// vector scan on below it. The bytes above the last 16-byte boundary and
+/// below the first are checked one by one; buffers under 64 bytes are
+/// bytewise throughout.
+#[allow(unsafe_code)]
+#[must_use]
+pub fn rfind_pair(bytes: &[u8], a: u8, b: u8) -> Option<usize> {
+    let n = bytes.len();
+    if n < 2 {
+        return None;
+    }
+    // `q` is the second byte's index, 1..n
+    let at = |q: usize| bytes[q] == b && bytes[q - 1] == a;
+    if n < 64 {
+        return (1..n).rev().find(|&q| at(q)).map(|q| q - 1);
+    }
+    let base = bytes.as_ptr() as usize;
+    // [lo, hi) is the span of whole aligned blocks, lo >= 1
+    let hi = (base + n) / 16 * 16 - base;
+    let lo = (base + 1).div_ceil(16) * 16 - base;
+    for q in (hi..n).rev() {
+        if at(q) {
+            return Some(q - 1);
+        }
+    }
+    let mut top = hi; // blocks below `top` not yet scanned
+    while top >= lo + 16 {
+        let nblocks = (top - lo) / 16;
+        // SAFETY: `bytes[top - 16 .. top]` is an aligned block inside the
+        // slice, and the `nblocks` blocks below it reach down to `lo >= 1`.
+        let k = unsafe { blocks_down_to(bytes.as_ptr().add(top - 16), nblocks, b) };
+        if k == nblocks {
+            top = lo;
+            break;
+        }
+        let block = top - 16 * (k + 1);
+        for q in (block..block + 16).rev() {
+            if at(q) {
+                return Some(q - 1);
+            }
+        }
+        top = block;
+    }
+    (1..top.min(n)).rev().find(|&q| at(q)).map(|q| q - 1)
 }

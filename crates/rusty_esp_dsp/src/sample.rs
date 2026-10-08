@@ -158,11 +158,19 @@ pub fn peak_abs_i16(a: &[i16]) -> u16 {
 /// Ledger R4 has the reasoning and the measurement.
 #[must_use]
 pub fn dbfs_from_mean_square(mean_square: f32) -> f32 {
+    // NOT `mean_square <= 0.0`, which clippy's `neg_cmp_op_on_partial_ord`
+    // asks for: the negated form is also true for NaN, so silence AND a
+    // NaN both leave by this door. `<= 0.0` is FALSE for NaN and would
+    // hand it to log10f.
+    #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(mean_square > 0.0) {
         return -120.0;
     }
-    // 20·log10(32768), rounded once to f32 by the compiler.
-    const K: f32 = 90.308_998_699_194_36;
+    // 20·log10(32768). Written to the digits f32 actually keeps: the longer
+    // 90.308_998_699_194_36 rounds to these same bits (clippy 1.99's
+    // `excessive_precision`), and tests/dbfs_tail_exhaustive.rs walks every
+    // one of the 520,093,697 inputs to say so.
+    const K: f32 = 90.309;
     10.0 * libm::log10f(mean_square) - K
 }
 
