@@ -91,7 +91,11 @@ pub fn yuyv_to_gray8(src: &[u8], dst: &mut [u8]) -> Result<usize> {
         //
         // Sixteen pixels short of the end, because producing the last
         // window reads the aligned block containing its last byte.
-        let ub = if pixels < 64 { 0 } else { (pixels - 16) / 48 * 48 };
+        let ub = if pixels < 64 {
+            0
+        } else {
+            (pixels - 16) / 48 * 48
+        };
         simd_even_bytes_unaligned_src(&src[..ub * 2], &mut dst[..ub]);
         ub
     } else {
@@ -270,11 +274,7 @@ pub fn sad_16x16(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
     // The oracle's own bounds, in its order.
     expect_len(a, 15 * sa + 16)?;
     expect_len(b, 15 * sb + 16)?;
-    if sa % 16 != 0
-        || sb % 16 != 0
-        || !aligned16(a.as_ptr())
-        || !aligned16(b.as_ptr())
-    {
+    if sa % 16 != 0 || sb % 16 != 0 || !aligned16(a.as_ptr()) || !aligned16(b.as_ptr()) {
         // Not the oracle any more: the unaligned idiom reaches a block at
         // ANY position, which in a motion search is all of them.
         return Ok(sad_16x16_unaligned(a, sa, b, sb));
@@ -660,9 +660,8 @@ pub fn mono_to_stereo_i16(src: &[i16], dst: &mut [i16]) {
     let n = src.len().min(dst.len() / 2);
     // SIXTEEN a trip.
     let body = n / 16 * 16;
-    let vectorable = body > 0
-        && aligned16(src.as_ptr().cast::<u8>())
-        && aligned16(dst.as_ptr().cast::<u8>());
+    let vectorable =
+        body > 0 && aligned16(src.as_ptr().cast::<u8>()) && aligned16(dst.as_ptr().cast::<u8>());
 
     if vectorable {
         let mut ps = src.as_ptr().cast::<u8>();
@@ -748,9 +747,8 @@ pub fn rms_dbfs_i16(samples: &[u8]) -> f32 {
 pub fn stereo_to_mono_i16(src: &[i16], dst: &mut [i16]) {
     let frames = (src.len() / 2).min(dst.len());
     let body = frames / 8 * 8;
-    let vectorable = body > 0
-        && aligned16(src.as_ptr().cast::<u8>())
-        && aligned16(dst.as_ptr().cast::<u8>());
+    let vectorable =
+        body > 0 && aligned16(src.as_ptr().cast::<u8>()) && aligned16(dst.as_ptr().cast::<u8>());
 
     if vectorable {
         let mut ps = src.as_ptr().cast::<u8>();
@@ -842,8 +840,7 @@ pub fn downscale2x_gray8(src: &[u8], width: u32, height: u32, dst: &mut [u8]) ->
         // Per ROW, because a row's alignment depends on the stride and the
         // caller's base together. A row that does not qualify takes the
         // scalar arm; the image does not have to be all one or all the other.
-        let aligned =
-            aligned16(r0.as_ptr()) && aligned16(r1.as_ptr()) && aligned16(drow.as_ptr());
+        let aligned = aligned16(r0.as_ptr()) && aligned16(r1.as_ptr()) && aligned16(drow.as_ptr());
         // A row that is not aligned is no longer the oracle's: the unaligned
         // idiom reaches it, writes into `drow` itself, and reports how far it
         // got so the scalar tail can finish from there.
@@ -1765,9 +1762,8 @@ pub fn gain_i16(src: &[i16], q15: i32, dst: &mut [i16]) {
     // instructions of loop. The unrolling that paid in seven other kernels
     // does not pay where the body is a chain through one accumulator.
     let body = n / 8 * 8;
-    let aligned = body > 0
-        && aligned16(src.as_ptr().cast::<u8>())
-        && aligned16(dst.as_ptr().cast::<u8>());
+    let aligned =
+        body > 0 && aligned16(src.as_ptr().cast::<u8>()) && aligned16(dst.as_ptr().cast::<u8>());
 
     let done = if aligned {
         let mut ps = src.as_ptr().cast::<u8>();
@@ -1883,9 +1879,8 @@ pub fn convert_i16_to_i32(src: &[i16], dst: &mut [i32]) {
     // the unaligned arms had been written wider and were measuring faster
     // despite doing more work per element.
     let body = n / 16 * 16;
-    let vectorable = body > 0
-        && aligned16(src.as_ptr().cast::<u8>())
-        && aligned16(dst.as_ptr().cast::<u8>());
+    let vectorable =
+        body > 0 && aligned16(src.as_ptr().cast::<u8>()) && aligned16(dst.as_ptr().cast::<u8>());
 
     if vectorable {
         let mut ps = src.as_ptr().cast::<u8>();
@@ -1945,9 +1940,8 @@ pub fn convert_i32_to_i16(src: &[i32], dst: &mut [i16]) {
     // the unaligned arms had been written wider and were measuring faster
     // despite doing more work per element.
     let body = n / 16 * 16;
-    let vectorable = body > 0
-        && aligned16(src.as_ptr().cast::<u8>())
-        && aligned16(dst.as_ptr().cast::<u8>());
+    let vectorable =
+        body > 0 && aligned16(src.as_ptr().cast::<u8>()) && aligned16(dst.as_ptr().cast::<u8>());
 
     if vectorable {
         let mut ps = src.as_ptr().cast::<u8>();
@@ -2029,9 +2023,8 @@ pub fn convert_i32_to_i24in32(src: &[i32], dst: &mut [i32]) {
     // This one was the narrowest of all at FOUR: a load, an and and a
     // store against two instructions of loop -- forty per cent overhead.
     let body = n / 16 * 16;
-    let vectorable = body > 0
-        && aligned16(src.as_ptr().cast::<u8>())
-        && aligned16(dst.as_ptr().cast::<u8>());
+    let vectorable =
+        body > 0 && aligned16(src.as_ptr().cast::<u8>()) && aligned16(dst.as_ptr().cast::<u8>());
 
     if vectorable {
         let mut ps = src.as_ptr().cast::<u8>();
@@ -2668,12 +2661,7 @@ pub fn sad_4x4(a: &[u8], sa: usize, b: &[u8], sb: usize) -> Result<u32> {
 ///
 /// Four output pixels a trip, stored with `ee.vst.l.64`.
 #[allow(unsafe_code)]
-pub fn downscale2x_rgb565(
-    src: &[u8],
-    width: u32,
-    height: u32,
-    dst: &mut [u8],
-) -> Result<(), ()> {
+pub fn downscale2x_rgb565(src: &[u8], width: u32, height: u32, dst: &mut [u8]) -> Result<(), ()> {
     let (w, h) = (width as usize, height as usize);
     let (ow, oh) = (w / 2, h / 2);
     if src.len() < w * h * 2 || dst.len() < ow * oh * 2 {
@@ -2690,8 +2678,7 @@ pub fn downscale2x_rgb565(
         let r1 = &src[(2 * oy + 1) * w * 2..(2 * oy + 1) * w * 2 + ow * 4];
         let drow = &mut dst[oy * ow * 2..oy * ow * 2 + ow * 2];
 
-        let body = if aligned16(r0.as_ptr()) && aligned16(r1.as_ptr()) && aligned16(drow.as_ptr())
-        {
+        let body = if aligned16(r0.as_ptr()) && aligned16(r1.as_ptr()) && aligned16(drow.as_ptr()) {
             ow / 4 * 4
         } else {
             0
@@ -2876,9 +2863,8 @@ pub fn downscale2x_rgb565(
             let r = ((ex5(a, 11) + ex5(b, 11) + ex5(cc, 11) + ex5(d, 11) + 2) / 4) as u8;
             let g = ((ex6(a) + ex6(b) + ex6(cc) + ex6(d) + 2) / 4) as u8;
             let bl = ((ex5(a, 0) + ex5(b, 0) + ex5(cc, 0) + ex5(d, 0) + 2) / 4) as u8;
-            let packed = ((u16::from(r) & 0xf8) << 8)
-                | ((u16::from(g) & 0xfc) << 3)
-                | (u16::from(bl) >> 3);
+            let packed =
+                ((u16::from(r) & 0xf8) << 8) | ((u16::from(g) & 0xfc) << 3) | (u16::from(bl) >> 3);
             drow[ox * 2..ox * 2 + 2].copy_from_slice(&packed.to_le_bytes());
         }
     }
@@ -2917,7 +2903,9 @@ pub fn yuyv_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize> {
 
     #[repr(align(16))]
     struct C([i16; 16]);
-    let c = C([128, 359, 88, 183, 454, 255, 1, 2048, 32, 0, 0, 0, 0, 0, 0, 0]);
+    let c = C([
+        128, 359, 88, 183, 454, 255, 1, 2048, 32, 0, 0, 0, 0, 0, 0, 0,
+    ]);
 
     let body = pixels / 8 * 8;
     let vectorable = body > 0 && aligned16(src.as_ptr()) && aligned16(dst.as_ptr());
@@ -3048,9 +3036,8 @@ pub fn yuyv_to_rgb565(src: &[u8], dst: &mut [u8]) -> Result<usize> {
         let m = k / 2 * 4;
         let y = src[m + if k % 2 == 0 { 0 } else { 2 }];
         let [r, g, b] = rusty_esp_dsp::pixel::yuv_to_rgb(y, src[m + 1], src[m + 3]);
-        let packed = ((u16::from(r) & 0xf8) << 8)
-            | ((u16::from(g) & 0xfc) << 3)
-            | (u16::from(b) >> 3);
+        let packed =
+            ((u16::from(r) & 0xf8) << 8) | ((u16::from(g) & 0xfc) << 3) | (u16::from(b) >> 3);
         dst[k * 2..k * 2 + 2].copy_from_slice(&packed.to_le_bytes());
     }
     Ok(pixels)
