@@ -33,7 +33,7 @@ source = "git+https://github.com/Remade-With-Rust/rusty_esp_core#7f219a793fefa44
 
 [[package]]
 name = "rusty_esp_dsp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "libm",
  "rusty_esp_core",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "rusty_esp_dsp-esp"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "libm",
  "rusty_esp_core",
