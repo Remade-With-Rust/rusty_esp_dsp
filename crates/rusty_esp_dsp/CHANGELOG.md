@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/Remade-With-Rust/rusty_esp_dsp/compare/rusty_esp_dsp-v0.1.2...rusty_esp_dsp-v0.1.3) - 2026-11-23
+
+### Other
+
+- bump rusty_h264-common to 0.17.4 ([#7](https://github.com/Remade-With-Rust/rusty_esp_dsp/pull/7))
+- 1,094 active installs
+- 970 active installs
+- 761 active installs
+
 ## [0.1.2](https://github.com/Remade-With-Rust/rusty_esp_dsp/compare/rusty_esp_dsp-v0.1.1...rusty_esp_dsp-v0.1.2) - 2026-10-18
 
 ### Other
