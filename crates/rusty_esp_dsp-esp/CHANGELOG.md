@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/Remade-With-Rust/rusty_esp_dsp/compare/rusty_esp_dsp-esp-v0.1.2...rusty_esp_dsp-esp-v0.1.3) - 2026-11-23
+
+### Other
+
+- release v0.1.3 ([#6](https://github.com/Remade-With-Rust/rusty_esp_dsp/pull/6))
+
 ## [0.1.2](https://github.com/Remade-With-Rust/rusty_esp_dsp/compare/rusty_esp_dsp-esp-v0.1.1...rusty_esp_dsp-esp-v0.1.2) - 2026-10-18
 
 ### Other
