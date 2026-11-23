@@ -51,9 +51,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_h264-common"
-version = "0.16.0"
+version = "0.17.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aaf982ae23ecf8f13015ec1c5576fe2935f4e4296b097ebc4233b5872623af2a"
+checksum = "cdde0fe62dd8d912ae1cb4a507df37d487c7d3f09c00225688516f2d577e2af1"
 dependencies = [
  "bytemuck",
  "once_cell",
